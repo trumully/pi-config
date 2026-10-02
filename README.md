@@ -2,6 +2,8 @@
 
 A personal [Pi](https://pi.dev/) setup for [Herdr](https://herdr.dev/), inspired by [Eero Alvar's pi-config](https://github.com/amosblomqvist/pi-config).
 
+https://github.com/user-attachments/assets/2096be3f-fff2-42a2-9fae-401083126e11
+
 ## Install
 
 Requires Node.js 22.19+, the `@earendil-works` Pi distribution, and Herdr.
