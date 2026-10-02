@@ -1,0 +1,13 @@
+{
+    "theme": "dark",
+    "hideThinkingBlock": true,
+    "quietStartup": true,
+    "collapseChangelog": true,
+    "showCacheMissNotices": true,
+    "enableInstallTelemetry": false,
+    "steeringMode": "all",
+    "followUpMode": "all",
+    "tuiMode": "fullscreen",
+    "fullscreenExitOutput": "transcript",
+    "defaultTools": ["read", "edit", "write", "bash", "codemode"]
+}

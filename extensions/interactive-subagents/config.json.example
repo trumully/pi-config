@@ -1,0 +1,9 @@
+{
+  "status": {
+    "enabled": true
+  },
+  "proactiveCompaction": {
+    "enabled": true,
+    "thresholdPercent": 70
+  }
+}
