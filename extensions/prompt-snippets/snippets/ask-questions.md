@@ -4,4 +4,4 @@ description: Ask questions to reach a shared understanding
 placement: append
 order: 10
 ---
-Ask clarifying questions until you are 100% sure you know exactly what to do. Do not act until I confirm we have reached a shared understanding.
+Ask a concise clarifying question only when an unresolved detail materially affects scope, correctness, permissions, or cost. Otherwise use reasonable assumptions within the agreed scope. If Approval before work is enabled, clarification can help define the proposal, but assumptions do not replace the required explicit approval.
