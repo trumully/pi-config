@@ -2,9 +2,11 @@ import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import { convertToLlm } from "@earendil-works/pi-coding-agent";
 import * as subagentsModule from "../pi-extension/subagents/index.ts";
+import { finishRegisteredRun, readNameRegistry, registerName } from "../pi-extension/subagents/session.ts";
 
 function createMockExtensionApi() {
   const registeredTools: any[] = [];
@@ -46,6 +48,160 @@ function createTheme() {
 }
 
 describe("interactive subagents smoke tests", () => {
+  it("resolves package sibling extensions before the classic global fallback", () => {
+    const testApi = (subagentsModule as any).__test__;
+    const bundled = testApi.getBundledSiblingPath("ast-grep/index.ts");
+    assert.equal(testApi.getToolExtensionPath("ast_grep"), bundled);
+    const extensionsDir = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
+    assert.equal(testApi.getBundledSiblingPath("usage-footer/index.ts"), join(extensionsDir, "usage-footer", "index.ts"));
+
+    const directory = mkdtempSync(join(tmpdir(), "subagent-extension-path-"));
+    const absent = join(directory, "missing.ts");
+    const fallback = join(directory, "extensions", "usage-footer.ts");
+    try {
+      assert.equal(testApi.resolveBundledOrGlobalPath(absent, fallback), fallback);
+      writeFileSync(absent, "");
+      assert.equal(testApi.resolveBundledOrGlobalPath(absent, fallback), absent);
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("updates the task brief only after delivery and warns when persistence fails", () => {
+    const testApi = (subagentsModule as any).__test__;
+    const directory = mkdtempSync(join(tmpdir(), "subagent-task-delivery-"));
+    const running: any = { id: "run-1", name: "Worker", task: "old task" };
+    const delivered = { content: [{ type: "text", text: "delivered" }], details: { name: "Worker", status: "steered" } };
+    try {
+      registerName(directory, "Worker", { sessionFile: "worker.jsonl", sessionId: "s1", runId: "run-1", taskBrief: "old task" });
+      const notDelivered = { content: [], details: { error: "send failed" } };
+      testApi.persistDeliveredTaskBrief(running, directory, "not sent", notDelivered, false, {}, () => { throw new Error("must not persist"); });
+      assert.equal(running.task, "old task");
+      assert.equal(readNameRegistry(directory).Worker.taskBrief, "old task");
+
+      const result = testApi.persistDeliveredTaskBrief(running, directory, "new assignment", delivered, true, {}, () => { throw new Error("disk full"); });
+      assert.equal(running.task, "new assignment");
+      assert.equal(result.details.status, "steered");
+      assert.match(result.details.warning, /delivered.*could not be saved.*disk full/i);
+      assert.equal(readNameRegistry(directory).Worker.taskBrief, "old task");
+
+      const unregistered: any = { id: "run-2", name: "Missing", task: "before" };
+      const missing = testApi.persistDeliveredTaskBrief(unregistered, directory, "delivered", delivered, true);
+      assert.match(missing.details.warning, /no registry entry/i);
+      assert.equal(unregistered.task, "delivered");
+    } finally { rmSync(directory, { recursive: true, force: true }); }
+  });
+
+  it("keeps legacy registry records valid and preserves the current brief", () => {
+    const directory = mkdtempSync(join(tmpdir(), "subagent-brief-registry-"));
+    try {
+      registerName(directory, "Legacy", { sessionFile: "legacy.jsonl", sessionId: null });
+      assert.equal(readNameRegistry(directory).Legacy.taskBrief, undefined);
+      registerName(directory, "Explicit", { sessionFile: "explicit.jsonl", sessionId: null, taskBrief: "replacement assignment" });
+      assert.equal(readNameRegistry(directory).Explicit.taskBrief, "replacement assignment");
+    } finally { rmSync(directory, { recursive: true, force: true }); }
+  });
+
+
+  it("does not let a stale run mark a newer registry run finished", () => {
+    const directory = mkdtempSync(join(tmpdir(), "subagent-registry-"));
+    try {
+      registerName(directory, "Worker", {
+        sessionFile: join(directory, "new.jsonl"),
+        sessionId: "new-session",
+        running: true,
+        runId: "new-run",
+      });
+
+      assert.equal(finishRegisteredRun(directory, "Worker", "old-run"), false);
+      assert.equal(readNameRegistry(directory).Worker.running, true);
+      assert.equal(finishRegisteredRun(directory, "Worker", "new-run"), true);
+      assert.equal(readNameRegistry(directory).Worker.running, false);
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+  it("rejects parallel explicit duplicate names before the second launch", async () => {
+    const testApi = (subagentsModule as any).__test__;
+    const name = "parallel-name-test";
+    let release!: () => void;
+    const pendingLaunch = new Promise<void>((resolve) => { release = resolve; });
+    let launches = 0;
+    const launch = async (requestedName: string) => {
+      const reservation = testApi.reserveSubagentName("worker", requestedName, new Set());
+      if ("error" in reservation) throw new Error(reservation.error);
+      try {
+        launches++;
+        await pendingLaunch;
+        return reservation.name;
+      } finally {
+        testApi.reservedNames.delete(reservation.name);
+      }
+    };
+
+    try {
+      const first = launch(` ${name} `);
+      const duplicate = launch(name);
+      assert.equal(launches, 1);
+      assert.ok(testApi.reservedNames.has(name));
+      release();
+      const results = await Promise.allSettled([first, duplicate]);
+      assert.deepEqual(results[0], { status: "fulfilled", value: name });
+      assert.equal(results[1].status, "rejected");
+      if (results[1].status === "rejected") {
+        assert.match(results[1].reason.message, /already in use.*subagent_message/);
+      }
+      assert.equal(testApi.reservedNames.has(name), false);
+    } finally {
+      release();
+      testApi.reservedNames.delete(name);
+    }
+  });
+
+  it("rejects registered names whether running or finished without overwriting them", () => {
+    const testApi = (subagentsModule as any).__test__;
+    const directory = mkdtempSync(join(tmpdir(), "subagent-names-"));
+    const name = "registered-name-test";
+    try {
+      for (const running of [true, false]) {
+        const entry = { sessionFile: join(directory, "original.jsonl"), sessionId: "original-session", running, runId: "original-run" };
+        registerName(directory, name, entry);
+        const result = testApi.reserveSubagentName("worker", name, new Set(Object.keys(readNameRegistry(directory))));
+        assert.match(result.error, /already in use.*subagent_message/);
+        assert.deepEqual(readNameRegistry(directory)[name], entry);
+        assert.equal(testApi.reservedNames.has(name), false);
+      }
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects names held by running agents even without a registry entry", () => {
+    const testApi = (subagentsModule as any).__test__;
+    const id = "running-name-test";
+    testApi.runningSubagents.set(id, { id, name: id });
+    try {
+      const result = testApi.reserveSubagentName("worker", id, new Set());
+      assert.match(result.error, /already in use/);
+      assert.equal(testApi.reservedNames.has(id), false);
+    } finally {
+      testApi.runningSubagents.delete(id);
+    }
+  });
+
+  it("keeps default names unique against explicit reservations and finished names", () => {
+    const testApi = (subagentsModule as any).__test__;
+    const base = "default-name-test";
+    const registryNames = new Set([`${base}-2`]);
+    try {
+      assert.deepEqual(testApi.reserveSubagentName("worker", base, registryNames), { name: base });
+      assert.deepEqual(testApi.reserveSubagentName(base, undefined, registryNames), { name: `${base}-3` });
+      assert.deepEqual(testApi.reserveSubagentName(base, "  ", registryNames), { name: `${base}-4` });
+    } finally {
+      for (const name of [base, `${base}-3`, `${base}-4`]) testApi.reservedNames.delete(name);
+    }
+  });
+
   it("turns /subagent into a spawn request", async () => {
     const { api, registeredCommands, sentUserMessages } = registerSubagents();
     const command = registeredCommands.find((entry) => entry.name === "subagent");
@@ -66,13 +222,30 @@ describe("interactive subagents smoke tests", () => {
     assert.ok(message);
     assert.deepEqual([...spawn.parameters.required].sort(), ["agent", "task"]);
     assert.deepEqual([...message.parameters.required].sort(), ["message", "name"]);
+    assert.ok(message.parameters.properties.intent, "intent is optional but supported");
+    assert.deepEqual((message.parameters.properties.intent as any).anyOf.map((variant: any) => variant.const).sort(), ["context", "reply", "task"]);
+    const testApi = (subagentsModule as any).__test__;
+    assert.equal(testApi.finishedIntentError("context") !== null, true);
+    assert.equal(testApi.finishedIntentError("reply") !== null, true);
+    assert.equal(testApi.finishedIntentError("task"), null);
+    assert.match(testApi.formatSubagentMessage("task", "Worker", "new assignment"), /Complete replacement assignment.*full current task/);
+    assert.match(testApi.formatSubagentMessage(undefined, "Worker", "follow up", "old task"), /background context only, not an instruction to repeat it/);
+    const resumePrompt = testApi.formatResumeTaskPrompt("C:\\tasks\\latest review.md");
+    assert.match(resumePrompt, /Read and execute the instructions.*current follow-up assignment/);
+    assert.match(resumePrompt, /Treat prior conversation as background only/);
+    assert.match(resumePrompt, /@"C:\\tasks\\latest review\.md"/);
   });
 
-  it("rejects a spawn without an agent", async () => {
+  it("rejects a spawn without an agent or a nonblank task", async () => {
     const { api, registeredTools } = registerSubagents();
     const spawn = registeredTools.find((tool) => tool.name === "subagent");
     const result = await spawn.execute("call-1", { name: "worker", task: "do it" });
     assert.equal(result.details.error, "agent required");
+
+    const blankTask = await spawn.execute("call-2", { agent: "worker", task: " \t\n " });
+    assert.equal(blankTask.details.error, "task required");
+    assert.equal(blankTask.isError, true);
+    assert.match(blankTask.content[0].text, /task is required and must not be blank/);
   });
 
   it("keeps usage metrics out of the compact widget while preserving status and profile", () => {
