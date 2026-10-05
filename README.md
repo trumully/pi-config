@@ -23,11 +23,22 @@ Tailor the config with `pi config` or [package filtering](https://github.com/ear
 
 ## Community packages
 
+These packages are pinned dependencies and load with the Git-installed config; no separate `pi install` commands are needed. Use `pi config` to disable any you do not want. If you previously installed one separately, remove that standalone package entry to avoid loading it twice.
+
+After changes have been pushed to this repository, update an existing installation with:
+
+```sh
+pi update git:github.com/trumully/pi-config
+```
+
+Restart Pi after updating. `settings.example.json` is a reference, not a settings file automatically applied by the package.
+
 | Package | Description |
 | --- | --- |
-| [rpiv-ask-user-question](https://www.npmjs.com/package/@juicesharp/rpiv-ask-user-question) | Structured question tool. |
-| [pi-web-access](https://www.npmjs.com/package/pi-web-access) | Web access for researcher profiles. |
-| [pi-codemode-compact](https://www.npmjs.com/package/pi-codemode-compact) | Compaction support for Pi's codemode. |
+| [`rpiv-ask-user-question`](https://www.npmjs.com/package/@juicesharp/rpiv-ask-user-question) | Structured question tool. |
+| [`pi-web-access`](https://www.npmjs.com/package/pi-web-access) | Web access for researcher profiles. |
+| [`pi-codemode-compact`](https://www.npmjs.com/package/pi-codemode-compact) | Compact display of codemode calls and results (not context compaction). |
+| [`rpiv-todo`](https://www.npmjs.com/package/@juicesharp/rpiv-todo) | Session-local task list for multistep work. |
 
 ## Workflow
 

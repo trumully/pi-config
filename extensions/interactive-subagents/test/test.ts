@@ -1,12 +1,19 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { convertToLlm } from "@earendil-works/pi-coding-agent";
 import * as subagentsModule from "../pi-extension/subagents/index.ts";
 import { finishRegisteredRun, readNameRegistry, registerName } from "../pi-extension/subagents/session.ts";
+import {
+  createSubagentActivityRecorder,
+  progressIndicators,
+  readSubagentActivityFile,
+  type SubagentActivityState,
+} from "../pi-extension/subagents/activity.ts";
+import { registerSubagentProgress, replayTodoProgress, summarizeTodoDetails } from "../pi-extension/subagents/progress.ts";
 
 function createMockExtensionApi() {
   const registeredTools: any[] = [];
@@ -47,6 +54,143 @@ function createTheme() {
   };
 }
 
+describe("compact subagent progress", () => {
+  it("validates optional count summaries and keeps old activity files readable", () => {
+    const directory = mkdtempSync(join(tmpdir(), "subagent-progress-schema-"));
+    const file = join(directory, "activity.json");
+    const legacy: SubagentActivityState = {
+      version: 1, runningChildId: "run-1", createdAt: 1, updatedAt: 2, sequence: 3,
+      latestEvent: "agent_start", phase: "active", agentActive: true, turnActive: false,
+      providerActive: false, toolActive: false,
+    };
+    try {
+      writeFileSync(file, JSON.stringify(legacy));
+      assert.equal(readSubagentActivityFile(file, "run-1").ok, true);
+      writeFileSync(file, JSON.stringify({ ...legacy, progress: { updatedAt: 10, activeChildren: 2, todos: { completed: 1, total: 3 } } }));
+      assert.equal(readSubagentActivityFile(file, "run-1").ok, true);
+      writeFileSync(file, JSON.stringify({ ...legacy, progress: { updatedAt: 10, activeChildren: -1 } }));
+      const badSummary = readSubagentActivityFile(file, "run-1");
+      assert.equal(badSummary.ok, true);
+      if (badSummary.ok) {
+        assert.equal(badSummary.activity.phase, "active");
+        assert.equal(badSummary.activity.progress, undefined);
+      }
+      writeFileSync(file, JSON.stringify({ ...legacy, progress: { updatedAt: 10, activeChildren: 1 } }));
+      assert.equal(readSubagentActivityFile(file, "other-run").reason, "wrong-id");
+    } finally { rmSync(directory, { recursive: true, force: true }); }
+  });
+
+  it("summarizes only known, non-deleted todo tasks and clears empty snapshots", () => {
+    assert.deepEqual(summarizeTodoDetails({ tasks: [
+      { status: "completed" }, { status: "pending" }, { status: "in_progress" }, { status: "deleted" },
+    ] }), { completed: 1, total: 3 });
+    assert.deepEqual(summarizeTodoDetails({ tasks: [{ status: "deleted" }] }), { completed: 0, total: 0 });
+    assert.deepEqual(summarizeTodoDetails({ tasks: [] }), { completed: 0, total: 0 });
+    assert.equal(summarizeTodoDetails({ tasks: [{ status: "mystery" }] }), undefined);
+    assert.equal(summarizeTodoDetails({ other: [] }), undefined);
+    assert.equal(summarizeTodoDetails({ tasks: [null] }), undefined);
+    assert.deepEqual(replayTodoProgress([
+      { type: "message", message: { role: "toolResult", toolName: "todo", details: { tasks: [{ status: "completed" }] } } },
+      { type: "message", message: { role: "toolResult", toolName: "todo", details: { tasks: [{ status: "deleted" }] } } },
+    ]), { completed: 0, total: 0 });
+    assert.equal(replayTodoProgress([
+      { type: "message", message: { role: "toolResult", toolName: "todo", details: { tasks: [{ status: "completed" }] } } },
+      { type: "message", message: { role: "toolResult", toolName: "todo", details: {} } },
+    ]), undefined);
+  });
+
+  it("keeps progress heartbeat separate from lifecycle freshness and hides stale counts", () => {
+    const directory = mkdtempSync(join(tmpdir(), "subagent-progress-heartbeat-"));
+    let clock = 100;
+    const file = join(directory, "activity.json");
+    const recorder = createSubagentActivityRecorder({ runningChildId: "run-1", activityFile: file, now: () => clock });
+    try {
+      recorder.sessionStart();
+      recorder.agentStart();
+      const before = readSubagentActivityFile(file, "run-1");
+      assert.equal(before.ok, true);
+      if (!before.ok) return;
+      clock = 200;
+      recorder.reportProgress(2, { completed: 1, total: 4 });
+      const after = readSubagentActivityFile(file, "run-1");
+      assert.equal(after.ok, true);
+      if (!after.ok) return;
+      assert.equal(after.activity.updatedAt, before.activity.updatedAt);
+      assert.equal(after.activity.sequence, before.activity.sequence);
+      assert.equal(after.activity.phase, before.activity.phase);
+      assert.deepEqual(progressIndicators(after.activity.progress, 200), ["↳ 2", "● 1/4"]);
+      assert.deepEqual(progressIndicators(after.activity.progress, 10_201), []);
+      assert.deepEqual(progressIndicators({ updatedAt: 300, activeChildren: 1 }, 200), []);
+    } finally { rmSync(directory, { recursive: true, force: true }); }
+  });
+
+  it("replays branches, bridges tool results, and clears the heartbeat interval at shutdown", () => {
+    const handlers = new Map<string, Function[]>();
+    const api = { on(event: string, handler: Function) { handlers.set(event, [...(handlers.get(event) ?? []), handler]); } } as any;
+    const reports: Array<{ children: number; todos?: unknown }> = [];
+    const recorder = { reportProgress(children: number, todos?: unknown) { reports.push({ children, todos }); } } as any;
+    const originalSetInterval = globalThis.setInterval;
+    const originalClearInterval = globalThis.clearInterval;
+    let timerCallback: (() => void) | undefined;
+    let cleared = 0;
+    (globalThis as any).setInterval = (callback: () => void) => { timerCallback = callback; return 123; };
+    (globalThis as any).clearInterval = (timer: unknown) => { if (timer === 123) cleared++; };
+    try {
+      registerSubagentProgress(api, recorder, () => 2);
+      const ctx = { sessionManager: { getBranch: () => [
+        { type: "message", message: { role: "toolResult", toolName: "todo", details: { tasks: [{ status: "completed" }, { status: "pending" }] } } },
+      ] } };
+      handlers.get("session_start")![0]({}, ctx);
+      assert.deepEqual(reports.at(-1), { children: 2, todos: { completed: 1, total: 2 } });
+      handlers.get("session_tree")![0]({}, { sessionManager: { getBranch: () => [] } });
+      assert.deepEqual(reports.at(-1), { children: 2, todos: undefined });
+      handlers.get("tool_execution_end")![0]({ toolName: "todo", result: { details: { tasks: [{ status: "completed" }] } } });
+      assert.deepEqual(reports.at(-1), { children: 2, todos: { completed: 1, total: 1 } });
+      timerCallback!();
+      assert.equal(reports.length, 4);
+      // A repeated session_start replaces, rather than leaks, the old interval.
+      handlers.get("session_start")![0]({}, ctx);
+      assert.equal(cleared, 1);
+      handlers.get("session_shutdown")![0]();
+      assert.equal(cleared, 2);
+      timerCallback!();
+      assert.equal(reports.length, 5);
+    } finally {
+      globalThis.setInterval = originalSetInterval;
+      globalThis.clearInterval = originalClearInterval;
+    }
+  });
+
+  it("renders fresh indicators only when both fit without displacing status or identity", () => {
+    const testApi = (subagentsModule as any).__test__;
+    const now = Date.now();
+    const base = {
+      id: "widget-progress", name: "WorkerName", agent: "worker", startTime: now - 1000,
+      startEntryCount: 0, sessionFile: "", statusState: {
+        source: "pi", startTimeMs: now - 1000, firstObservationAtMs: now - 1000,
+        lastActivityAtMs: now - 1000, lastActivitySequence: 1, localOverrideAtMs: null,
+        localOverrideSequence: null, activeNow: true, activeSinceMs: now - 1000,
+        activeScope: "agent", waitingSinceMs: null, phase: "active", latestEvent: null,
+        activityLabel: null, snapshotState: "present", snapshotProblemSinceMs: null,
+        snapshotError: null, currentKind: "active",
+      },
+      activityRead: { ok: true }, activity: { phase: "active", progress: { updatedAt: now, activeChildren: 2, todos: { completed: 1, total: 3 } } },
+    };
+    const wide = testApi.renderSubagentWidgetLines([base], 100).join("\n");
+    assert.match(wide, /WorkerName/);
+    assert.match(wide, /↳ 2/);
+    assert.match(wide, /● 1\/3/);
+    assert.match(wide, /active/);
+    const narrow = testApi.renderSubagentWidgetLines([base], 60).join("\n");
+    assert.match(narrow, /WorkerName/);
+    assert.match(narrow, /↳ 2/);
+    assert.doesNotMatch(narrow, /●/);
+    assert.match(narrow, /active/);
+    const stale = { ...base, activity: { phase: "active", progress: { updatedAt: now - 20_000, activeChildren: 2, todos: { completed: 1, total: 3 } } } };
+    assert.doesNotMatch(testApi.renderSubagentWidgetLines([stale], 100).join("\n"), /↳|●/);
+  });
+});
+
 describe("interactive subagents smoke tests", () => {
   it("resolves package sibling extensions before the classic global fallback", () => {
     const testApi = (subagentsModule as any).__test__;
@@ -65,6 +209,27 @@ describe("interactive subagents smoke tests", () => {
     } finally {
       rmSync(directory, { recursive: true, force: true });
     }
+  });
+
+  it("loads bundled community extensions and grants workers the todo tool", () => {
+    const testApi = (subagentsModule as any).__test__;
+    const root = resolve(dirname(fileURLToPath(import.meta.url)), "../../..");
+    const manifest = JSON.parse(readFileSync(join(root, "package.json"), "utf8"));
+    for (const entry of manifest.pi.extensions) {
+      assert.ok(existsSync(resolve(root, entry)), `Missing extension: ${entry}`);
+    }
+    for (const [tool, entry] of Object.entries({
+      todo: "@juicesharp/rpiv-todo/index.ts",
+      ask_user_question: "@juicesharp/rpiv-ask-user-question/index.ts",
+      web_search: "pi-web-access/dist/index.js",
+      source_check: "pi-web-access/dist/index.js",
+      fetch_content: "pi-web-access/dist/index.js",
+      get_search_content: "pi-web-access/dist/index.js",
+    })) {
+      assert.equal(testApi.getToolExtensionPath(tool), join(root, "node_modules", entry));
+    }
+    const worker = readFileSync(join(root, "extensions/interactive-subagents/agents/worker.md"), "utf8");
+    assert.match(worker, /^tools:.*\btodo\b/m);
   });
 
   it("updates the task brief only after delivery and warns when persistence fails", () => {

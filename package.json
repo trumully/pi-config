@@ -12,7 +12,11 @@
     "test:integration": "node --test --test-concurrency=1 extensions/interactive-subagents/test/integration/subagent-lifecycle.test.ts"
   },
   "dependencies": {
-    "@ast-grep/cli": "0.41.0"
+    "@ast-grep/cli": "0.41.0",
+    "@juicesharp/rpiv-ask-user-question": "2.12.0",
+    "@juicesharp/rpiv-todo": "2.12.0",
+    "pi-codemode-compact": "0.1.1",
+    "pi-web-access": "0.36.0"
   },
   "devDependencies": {
     "@earendil-works/pi-coding-agent": "1.0.2",
@@ -20,25 +24,39 @@
     "typebox": "^1.3.27"
   },
   "peerDependencies": {
-    "@earendil-works/pi-ai": "*",
     "@earendil-works/pi-agent-core": "*",
+    "@earendil-works/pi-ai": "*",
     "@earendil-works/pi-coding-agent": "*",
     "@earendil-works/pi-tui": "*",
     "typebox": "*"
   },
   "peerDependenciesMeta": {
-    "@earendil-works/pi-ai": { "optional": true },
-    "@earendil-works/pi-agent-core": { "optional": true },
-    "@earendil-works/pi-coding-agent": { "optional": true },
-    "@earendil-works/pi-tui": { "optional": true },
-    "typebox": { "optional": true }
+    "@earendil-works/pi-ai": {
+      "optional": true
+    },
+    "@earendil-works/pi-agent-core": {
+      "optional": true
+    },
+    "@earendil-works/pi-coding-agent": {
+      "optional": true
+    },
+    "@earendil-works/pi-tui": {
+      "optional": true
+    },
+    "typebox": {
+      "optional": true
+    }
   },
   "pi": {
     "extensions": [
       "./extensions/interactive-subagents/pi-extension/subagents/index.ts",
       "./extensions/ast-grep/index.ts",
       "./extensions/prompt-snippets/index.ts",
-      "./extensions/usage-footer/index.ts"
+      "./extensions/usage-footer/index.ts",
+      "./node_modules/@juicesharp/rpiv-ask-user-question/index.ts",
+      "./node_modules/@juicesharp/rpiv-todo/index.ts",
+      "./node_modules/pi-web-access/dist/index.js",
+      "./node_modules/pi-codemode-compact/index.ts"
     ]
   }
 }

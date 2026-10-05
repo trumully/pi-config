@@ -59,6 +59,7 @@ import {
 } from "./status.ts";
 import {
   getSubagentActivityFile,
+  progressIndicators,
   readSubagentActivityFile,
   type ActivityReadResult,
   type SubagentActivityState,
@@ -241,15 +242,14 @@ function getToolExtensionPath(tool: string): string | undefined {
     return fileURLToPath(import.meta.url);
   }
   const extBase = join(getAgentConfigDir(), "extensions");
-  const webAccessExtension = join(
-    getAgentConfigDir(),
-    "npm",
-    "node_modules",
-    "pi-web-access",
-    "dist",
-    "index.js",
+  const packageExtension = (relativePath: string) => resolveBundledOrGlobalPath(
+    getBundledSiblingPath(`../node_modules/${relativePath}`),
+    join(getAgentConfigDir(), "npm", "node_modules", relativePath),
   );
+  const webAccessExtension = packageExtension("pi-web-access/dist/index.js");
   const map: Record<string, string> = {
+    todo: packageExtension("@juicesharp/rpiv-todo/index.ts"),
+    ask_user_question: packageExtension("@juicesharp/rpiv-ask-user-question/index.ts"),
     web_search: webAccessExtension,
     source_check: webAccessExtension,
     fetch_content: webAccessExtension,
@@ -814,12 +814,19 @@ function renderSubagentWidgetLines(agents: RunningSubagent[], width: number): st
     const agentTag = agent.agent ? ` (${agent.agent})` : "";
     const snapshot = classifyStatus(agent.statusState, Date.now());
     const icon = widgetIcon(snapshot.kind);
-    const left = ` ${icon} ${elapsed}  ${agent.name}${agentTag} `;
+    let left = ` ${icon} ${elapsed}  ${agent.name}${agentTag} `;
     const right = statusConfig.enabled
       ? formatWidgetRightLabel(snapshot)
       : agent.cli === "claude"
         ? " running… "
         : " starting… ";
+    // Optional counts never displace the name/profile or lifecycle status.
+    const progress = agent.activityRead?.ok && agent.activity?.phase !== "done"
+      ? agent.activity?.progress : undefined;
+    for (const indicator of progressIndicators(progress, Date.now())) {
+      const extra = `${indicator} `;
+      if (visibleWidth(left) + visibleWidth(extra) + visibleWidth(right) + 2 <= width) left += extra;
+    }
     lines.push(borderLine(left, right, width));
   }
 
@@ -1348,6 +1355,10 @@ function startWidgetRefresh() {
   if (widgetInterval) return;
   updateWidget(); // immediate first render
   widgetInterval = setInterval(() => {
+    // Counts remain available when lifecycle status notifications are disabled.
+    if (!statusConfig.enabled) {
+      for (const running of runningSubagents.values()) observeRunningSubagent(running);
+    }
     updateWidget();
   }, 1000);
   (globalThis as any)[WIDGET_INTERVAL_KEY] = widgetInterval;

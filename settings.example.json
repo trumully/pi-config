@@ -9,5 +9,5 @@
     "followUpMode": "all",
     "tuiMode": "fullscreen",
     "fullscreenExitOutput": "transcript",
-    "defaultTools": ["read", "edit", "write", "bash", "codemode"]
+    "defaultTools": ["read", "edit", "write", "bash", "codemode", "todo", "ask_user_question", "web_enable"]
 }

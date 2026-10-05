@@ -27,6 +27,20 @@ export type SubagentActivityPhase = (typeof ACTIVITY_PHASES)[number];
 export type SubagentActivityScope = (typeof ACTIVITY_SCOPES)[number];
 export type SubagentActivityEvent = (typeof ACTIVITY_EVENTS)[number];
 
+export interface TodoProgress {
+  completed: number;
+  total: number;
+}
+
+export interface SubagentProgress {
+  updatedAt: number;
+  activeChildren: number;
+  todos?: TodoProgress;
+}
+
+// A separate heartbeat keeps passive counts fresh without resetting stall detection.
+export const SUBAGENT_PROGRESS_STALE_MS = 10_000;
+
 export interface SubagentActivityState {
   version: 1;
   runningChildId: string;
@@ -48,6 +62,7 @@ export interface SubagentActivityState {
   toolName?: string;
   toolStartedAt?: number;
   toolEndedAt?: number;
+  progress?: SubagentProgress;
 }
 
 export type ActivityReadResult =
@@ -57,6 +72,7 @@ export type ActivityReadResult =
 export type SubagentShutdownReason = "quit" | "reload" | "new" | "resume" | "fork";
 
 export interface SubagentActivityRecorder {
+  reportProgress(activeChildren: number, todos?: TodoProgress): void;
   sessionStart(): void;
   input(): void;
   beforeAgentStart(): void;
@@ -165,7 +181,38 @@ function validateActivity(value: unknown, expectedRunningChildId: string): Activ
   ].find((error) => error != null);
   if (validationError) return invalidActivity(validationError);
 
+  // A bad optional summary must not discard otherwise valid lifecycle state.
+  // Readers simply omit indicators until the child publishes a valid snapshot.
+  if (object.progress !== undefined && !isSubagentProgress(object.progress)) {
+    const { progress: _invalidProgress, ...lifecycle } = object;
+    return { ok: true, activity: lifecycle as unknown as SubagentActivityState };
+  }
+
   return { ok: true, activity: object as unknown as SubagentActivityState };
+}
+
+function isCount(value: unknown): value is number {
+  return Number.isSafeInteger(value) && (value as number) >= 0;
+}
+
+export function isTodoProgress(value: unknown): value is TodoProgress {
+  const todos = requireObject(value);
+  return !!todos && isCount(todos.completed) && isCount(todos.total) && todos.completed <= todos.total;
+}
+
+export function isSubagentProgress(value: unknown): value is SubagentProgress {
+  const progress = requireObject(value);
+  return !!progress && Number.isFinite(progress.updatedAt) && isCount(progress.activeChildren)
+    && (progress.todos === undefined || isTodoProgress(progress.todos));
+}
+
+export function progressIndicators(progress: SubagentProgress | undefined, now: number): string[] {
+  if (!isSubagentProgress(progress) || now < progress.updatedAt
+    || now - progress.updatedAt > SUBAGENT_PROGRESS_STALE_MS) return [];
+  const indicators: string[] = [];
+  if (progress.activeChildren > 0) indicators.push(`↳ ${progress.activeChildren}`);
+  if (progress.todos && progress.todos.total > 0) indicators.push(`● ${progress.todos.completed}/${progress.todos.total}`);
+  return indicators;
 }
 
 export function readSubagentActivityFile(
@@ -206,6 +253,7 @@ export function writeSubagentActivityFile(activityFile: string, activity: Subage
 
 function createNoopRecorder(): SubagentActivityRecorder {
   return {
+    reportProgress() {},
     sessionStart() {},
     input() {},
     beforeAgentStart() {},
@@ -365,6 +413,15 @@ export function createSubagentActivityRecorder(params: {
   }
 
   return {
+    reportProgress(activeChildren, todos) {
+      if (disabled) return;
+      const progress = { updatedAt: now(), activeChildren, ...(todos ? { todos: { ...todos } } : {}) };
+      if (!isSubagentProgress(progress)) return;
+      activity.progress = progress;
+      // Do not advance activity.updatedAt, sequence, latestEvent, or phase:
+      // a healthy reporter does not mean the agent itself is making progress.
+      flushNow();
+    },
     sessionStart() {
       record("session_start", (current) => {
         current.phase = "starting";

@@ -18,6 +18,7 @@ import { Type } from "typebox";
 import { writeFileSync } from "node:fs";
 import { randomUUID } from "node:crypto";
 import { createSubagentActivityRecorder } from "./activity.ts";
+import { registerSubagentProgress } from "./progress.ts";
 import {
   advanceThresholdLatch,
   branchHasAssistantAfterResumeToken,
@@ -600,6 +601,10 @@ export default function (pi: ExtensionAPI) {
     extensionActive = false;
     recorder.sessionShutdown((event as any).reason);
   });
+
+  // Register after lifecycle handlers so sessionStart initializes the activity
+  // snapshot before the first progress publication, and shutdown disables it.
+  registerSubagentProgress(pi, recorder, runningChildrenCount);
 
   // Toggle expand/collapse with Ctrl+Alt+O
   pi.registerShortcut("ctrl+alt+o", {
