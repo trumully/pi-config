@@ -30,6 +30,7 @@ import {
 import {
   countSessionEntryLines,
   findLastAssistantMessage,
+  finishRegisteredRun,
   getNewEntries,
   getSessionId,
   readNameRegistry,
@@ -39,6 +40,7 @@ import {
   seedSubagentSessionFile,
   summarizeSessionStats,
   writeSubagentLoadout,
+  type NameRegistryEntry,
   type SessionStats,
   type SubagentLoadout,
 } from "./session.ts";
@@ -108,8 +110,9 @@ const SubagentParams = Type.Object({
   name: Type.Optional(
     Type.String({
       description:
-        "Optional cosmetic label for the subagent's pane and widget row. Defaults to the agent name. " +
-        "Has no effect on which agent runs - use `agent` for that.",
+        "Optional unique name for the subagent's pane, widget row, and follow-up messages. " +
+        "Defaults to an available variant of the agent name. Explicit names cannot be reused in this session; " +
+        "use subagent_message to continue an existing agent. Has no effect on which agent runs - use `agent` for that.",
     }),
   ),
   model: Type.Optional(Type.String({ description: "Model override (overrides agent default)" })),
@@ -174,6 +177,18 @@ const BUILTIN_TOOLS = new Set(["read", "write", "edit", "bash", "grep", "find", 
 /** Resolve the global agent config directory, respecting PI_CODING_AGENT_DIR. */
 function getAgentConfigDir(): string {
   return process.env.PI_CODING_AGENT_DIR ?? join(homedir(), ".pi", "agent");
+}
+
+/** Prefer a sibling bundled in the root Pi package, then use the classic global extension path. */
+function resolveBundledOrGlobalPath(bundledPath: string, globalPath: string): string {
+  return existsSync(bundledPath) ? bundledPath : globalPath;
+}
+
+function getBundledSiblingPath(relativePath: string): string {
+  // This source file is extensions/interactive-subagents/pi-extension/subagents/index.ts.
+  // Resolve from its own location so package installs (including paths with spaces)
+  // do not depend on the current working directory or global agent directory.
+  return resolve(SUBAGENTS_DIR, "../../../", relativePath);
 }
 
 // ── Runtime tool-extension registration ─────────────────────────────────────
@@ -242,7 +257,10 @@ function getToolExtensionPath(tool: string): string | undefined {
     video_extract: join(extBase, "video-extract", "index.ts"),
     youtube_search: join(extBase, "youtube-search", "index.ts"),
     google_image_search: join(extBase, "google-image-search", "index.ts"),
-    ast_grep: join(extBase, "ast-grep", "index.ts"),
+    ast_grep: resolveBundledOrGlobalPath(
+      getBundledSiblingPath("ast-grep/index.ts"),
+      join(extBase, "ast-grep", "index.ts"),
+    ),
     safe_bash: join(SUBAGENTS_DIR, "tools", "safe-bash.ts"),
   };
   // Prefer the built-in path, but fall back to a runtime-registered extension
@@ -571,6 +589,30 @@ function sendSubagentResult(
   );
 }
 
+/** Shared registry/result boundary for fresh spawns and resumed runs. */
+function completeRun(
+  artifactDir: string,
+  running: RunningSubagent,
+  deliver: () => void,
+  terminationConfirmed = true,
+): void {
+  const registryEntry = resolveNameInRegistry(artifactDir, running.name);
+  if (registryEntry?.runId && registryEntry.runId !== running.id) return;
+  updateWidget();
+  if (terminationConfirmed) {
+    try {
+      finishRegisteredRun(artifactDir, running.name, running.id);
+    } catch (err: any) {
+      console.error(`[interactive-subagents] Could not persist completion for "${running.name}" (run ${running.id}): ${err?.message ?? String(err)}`);
+    }
+  }
+  try {
+    deliver();
+  } catch (err: any) {
+    console.error(`[interactive-subagents] Could not deliver result for "${running.name}" (run ${running.id}): ${err?.message ?? String(err)}`);
+  }
+}
+
 function resolveResultPresentation(
   result: Pick<
     SubagentResult,
@@ -625,6 +667,10 @@ interface SubagentResult {
   /** The process exited before a checkpoint handoff resumed and completed. */
   handoffInterrupted?: boolean;
   handoffPhase?: string;
+  /** Watcher was detached; child termination was not confirmed. */
+  detached?: boolean;
+  /** Watcher failed before it could confirm child termination. */
+  terminationConfirmed?: boolean;
   /** Aggregate usage/model/tool stats for this run, not prior resumes. */
   stats?: SessionStats;
 }
@@ -889,7 +935,13 @@ function applySandboxToParts(
   const globalAgentDir = getAgentConfigDir();
   const childAgentDir =
     loadout.agentDir ?? process.env.PI_CODING_AGENT_DIR ?? join(homedir(), ".pi", "agent");
-  const usageFooterPath = join(globalAgentDir, "extensions", "usage-footer.ts");
+  const modernGlobalFooterPath = join(globalAgentDir, "extensions", "usage-footer", "index.ts");
+  const usageFooterPath = resolveBundledOrGlobalPath(
+    getBundledSiblingPath("usage-footer/index.ts"),
+    existsSync(modernGlobalFooterPath)
+      ? modernGlobalFooterPath
+      : join(globalAgentDir, "extensions", "usage-footer.ts"),
+  );
   if (loadout.toolAllowlist) {
     parts.push("--no-extensions");
     parts.push("--tools", loadout.toolAllowlist);
@@ -928,6 +980,14 @@ function applySandboxToParts(
     // footer explicitly when the child would otherwise miss it.
     parts.push("-e", usageFooterPath);
   }
+}
+
+function formatResumeTaskPrompt(path: string): string {
+  return (
+    `Read and execute the instructions in the provided task file as your current follow-up assignment. ` +
+    `Treat prior conversation as background only; do not wait for clarification instead of following that assignment.\n\n` +
+    `@"${path}"`
+  );
 }
 
 function buildPiPromptArgs(params: { effectiveSkills?: string; taskArg: string }): string[] {
@@ -986,9 +1046,9 @@ function observeRunningSubagent(running: RunningSubagent, observedAt = Date.now(
 /**
  * Names claimed by spawns that are mid-launch but not yet registered in
  * `runningSubagents`. Parallel `subagent` tool calls run their synchronous
- * prefix (name defaulting) before any of them finishes `launchSubagent` and
- * registers, so without this they'd all see an empty map and pick the same
- * name. Reserved synchronously when a default name is chosen and released once
+ * prefix (name reservation) before any of them finishes `launchSubagent` and
+ * registers, so without this they'd all see an empty map and claim the same
+ * name. Every name is reserved synchronously and released once
  * the subagent registers (or its launch fails).
  */
 const reservedNames = new Set<string>();
@@ -1012,6 +1072,22 @@ function uniqueRunningName(base: string, registryNames?: Set<string>): string {
   let n = 2;
   while (taken.has(`${base}-${n}`)) n++;
   return `${base}-${n}`;
+}
+
+function reserveSubagentName(
+  agent: string,
+  requestedName: string | undefined,
+  registryNames: Set<string>,
+): { name: string } | { error: string } {
+  const explicitName = requestedName?.trim();
+  const name = uniqueRunningName(explicitName || agent, registryNames);
+  if (explicitName && name !== explicitName) {
+    return {
+      error: `Subagent name "${explicitName}" is already in use. Choose a new name or use subagent_message to continue the existing agent.`,
+    };
+  }
+  reservedNames.add(name);
+  return { name };
 }
 
 function herdrAgentNameFor(name: string, id: string): string {
@@ -1174,6 +1250,59 @@ function resolveResumeLaunchBehavior(): { autoExit: boolean; interactive: boolea
   return { autoExit: true, interactive: false };
 }
 
+function finishedIntentError(intent?: string): string | null {
+  return intent === "context" || intent === "reply"
+    ? `Intent "${intent}" only applies to a running subagent; finished agents are not resumed for context or reply.`
+    : null;
+}
+
+function persistDeliveredTaskBrief(
+  running: RunningSubagent,
+  artifactDir: string,
+  message: string,
+  deliveredResult: any,
+  deliverySucceeded: boolean,
+  metadata: Partial<NameRegistryEntry> = {},
+  writeRegistry: typeof registerName = registerName,
+): any {
+  if (!deliverySucceeded) return deliveredResult;
+  running.task = message;
+  let warning: string | undefined;
+  const current = resolveNameInRegistry(artifactDir, running.name);
+  if (!current) {
+    warning = `The assignment was delivered, but the current brief could not be saved: no registry entry for "${running.name}".`;
+  } else {
+    try {
+      writeRegistry(artifactDir, running.name, { ...current, ...metadata, taskBrief: message });
+    } catch (error: any) {
+      warning = `The assignment was delivered, but the current brief could not be saved: ${error?.message ?? String(error)}`;
+    }
+  }
+  if (!warning) return deliveredResult;
+  return {
+    ...deliveredResult,
+    content: [...(deliveredResult.content ?? []), { type: "text", text: `Warning: ${warning}` }],
+    details: { ...(deliveredResult.details ?? {}), warning },
+  };
+}
+
+function formatSubagentMessage(
+  intent: "task" | "context" | "reply" | undefined,
+  name: string,
+  message: string,
+  priorBrief?: string,
+): string {
+  if (intent === "task") {
+    return `[Complete replacement assignment for subagent "${name}". This is the full current task; do not treat earlier task instructions as still active.]\n${message}`;
+  }
+  if (intent === "context") return `[Additional context for the current task; this does not replace the task.]\n${message}`;
+  if (intent === "reply") return `[Answer to your question. This does not replace the task.]\n${message}`;
+  if (priorBrief) {
+    return `[Follow-up request. The prior task below is background context only, not an instruction to repeat it.]\n\nPrior task (background only):\n${priorBrief}\n\nFollow-up request:\n${message}`;
+  }
+  return message;
+}
+
 export const __test__ = {
   borderLine,
   renderSubagentWidgetLines,
@@ -1187,18 +1316,25 @@ export const __test__ = {
   buildSubagentToolAllowlist,
   applySandboxToParts,
   buildPiPromptArgs,
+  formatResumeTaskPrompt,
   formatWidgetRightLabel,
   observeRunningSubagent,
   getToolExtensionPath,
+  resolveBundledOrGlobalPath,
+  getBundledSiblingPath,
   resolveRunningByName,
   herdrAgentNameFor,
   uniqueRunningName,
+  reserveSubagentName,
   reservedNames,
   steerSubagent,
   handleSubagentSteer,
   resolveResultPresentation,
   sendSubagentResult,
   resolveResumeLaunchBehavior,
+  finishedIntentError,
+  formatSubagentMessage,
+  persistDeliveredTaskBrief,
   runningSubagents,
   formatElapsed,
   formatTokens,
@@ -1523,7 +1659,7 @@ async function watchSubagent(
   running: RunningSubagent,
   signal: AbortSignal,
 ): Promise<SubagentResult> {
-  const { name, task, surface, startTime, sessionFile } = running;
+  const { name, surface, startTime, sessionFile } = running;
 
   try {
     const result = await pollForExit(surface, AbortSignal.any([signal, getModuleAbortSignal()]), {
@@ -1571,7 +1707,7 @@ async function watchSubagent(
       closeSurfaceAndTab(surface, running.herdrTabId);
       runningSubagents.delete(running.id);
 
-      return { name, task, summary, exitCode: result.exitCode, elapsed, ...(sessionId ? { claudeSessionId: sessionId } : {}) };
+      return { name, task: running.task, summary, exitCode: result.exitCode, elapsed, ...(sessionId ? { claudeSessionId: sessionId } : {}) };
     }
 
     // A child that exits during self_compact must never look like a successful
@@ -1585,7 +1721,7 @@ async function watchSubagent(
       runningSubagents.delete(running.id);
       return {
         name,
-        task,
+        task: running.task,
         summary: "",
         sessionFile,
         ...(subagentSessionId ? { sessionId: subagentSessionId } : {}),
@@ -1622,13 +1758,12 @@ async function watchSubagent(
       ? summarizeSessionStats(sessionFile, { afterEntryCount: running.startEntryCount })
       : null;
     const subagentSessionId = existsSync(sessionFile) ? getSessionId(sessionFile) : null;
-
     closeSurfaceAndTab(surface, running.herdrTabId);
     runningSubagents.delete(running.id);
 
     return {
       name,
-      task,
+      task: running.task,
       summary,
       sessionFile,
       ...(subagentSessionId ? { sessionId: subagentSessionId } : {}),
@@ -1638,27 +1773,29 @@ async function watchSubagent(
       ...(stats ? { stats } : {}),
     };
   } catch (err: any) {
-    closeSurfaceAndTab(surface, running.herdrTabId);
-    runningSubagents.delete(running.id);
+    const detached = signal.aborted || getModuleAbortSignal().aborted;
+    if (runningSubagents.get(running.id) === running) runningSubagents.delete(running.id);
 
-    if (signal.aborted) {
+    if (detached) {
       return {
         name,
-        task,
-        summary: "Subagent cancelled.",
+        task: running.task,
+        summary: "Watcher detached; child termination is unknown.",
         exitCode: 1,
         elapsed: Math.floor((Date.now() - startTime) / 1000),
-        error: "cancelled",
+        error: "detached",
+        detached: true,
         sessionFile,
       };
     }
     return {
       name,
-      task,
+      task: running.task,
       summary: `Subagent error: ${err?.message ?? String(err)}`,
       exitCode: 1,
       elapsed: Math.floor((Date.now() - startTime) / 1000),
       error: err?.message ?? String(err),
+      terminationConfirmed: false,
     };
   }
 }
@@ -1690,6 +1827,9 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       statusInterval = null;
       (globalThis as any)[STATUS_INTERVAL_KEY] = null;
     }
+    // Aborting stops observation only; Herdr owns child process lifecycle. Keep
+    // persisted entries marked running so a watcher abort is never reported as
+    // confirmed child termination.
     const moduleAbort = (globalThis as any)[POLL_ABORT_KEY] as AbortController | undefined;
     if (moduleAbort) moduleAbort.abort();
     for (const [_id, agent] of runningSubagents) {
@@ -1713,17 +1853,27 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         "When the sub-agent finishes, the harness AUTOMATICALLY delivers its result as a steer message that wakes you up and starts a new turn - you do not need to do anything to receive it. " +
         "DO NOT write polling loops, sleep/wait commands, tail/watch scripts, or repeatedly read session/log files to detect completion. DO NOT call subagents_list or any other tool to 'check' status. All of that is wasted work - the harness handles delivery for you. " +
         "Wait for the completion message before reporting results. Once it arrives, use the findings to answer the user's request. " +
-        "After spawning, either end your turn immediately, or work on other independent tasks (including spawning more subagents in parallel). The harness will wake you with the result when it is ready.",
+        "After spawning, either end your turn immediately, or work on other independent tasks (including spawning more subagents in parallel). The harness will wake you with the result when it is ready. " +
+        "For reliable delegation, give each child a self-contained brief with the goal, bounded scope/ownership, relevant context, permissions, completion criteria, and concise return format. Use short names, delegate independent work in parallel, keep nesting shallow, and avoid redundant status or review requests. Ask only about material scope, correctness, permission, or cost decisions; otherwise make reasonable scoped assumptions. If a child is blocked, ask for useful partial findings and the smallest next step.",
       promptSnippet:
         "Spawn a sub-agent in Herdr. Nested agents share a branch tab when it can fit a readable split; otherwise they get their own tab. " +
         "This is a fire-and-forget async tool: the call returns immediately with only an acknowledgement. " +
         "When the sub-agent finishes, the harness AUTOMATICALLY delivers its result as a steer message that wakes you up and starts a new turn - you do not need to do anything to receive it. " +
         "DO NOT write polling loops, sleep/wait commands, tail/watch scripts, or repeatedly read session/log files to detect completion. DO NOT call subagents_list or any other tool to 'check' status. All of that is wasted work - the harness handles delivery for you. " +
         "Wait for the completion message before reporting results. Once it arrives, use the findings to answer the user's request. " +
-        "After spawning, either end your turn immediately, or work on other independent tasks (including spawning more subagents in parallel). The harness will wake you with the result when it is ready.",
+        "After spawning, either end your turn immediately, or work on other independent tasks (including spawning more subagents in parallel). The harness will wake you with the result when it is ready. " +
+        "For reliable delegation, give each child a self-contained brief with the goal, bounded scope/ownership, relevant context, permissions, completion criteria, and concise return format. Use short names, delegate independent work in parallel, keep nesting shallow, and avoid redundant status or review requests. Ask only about material scope, correctness, permission, or cost decisions; otherwise make reasonable scoped assumptions. If a child is blocked, ask for useful partial findings and the smallest next step.",
       parameters: SubagentParams,
 
       async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+        if (!params.task.trim()) {
+          return {
+            content: [{ type: "text", text: "task is required and must not be blank" }],
+            details: { error: "task required" },
+            isError: true,
+          };
+        }
+
         // Prevent self-spawning (e.g. planner spawning another planner)
         const currentAgent = process.env.PI_SUBAGENT_AGENT;
         if (params.agent && currentAgent && params.agent === currentAgent) {
@@ -1806,18 +1956,22 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           ctx.sessionManager.getSessionId(),
         );
 
-        // Default the cosmetic pane label to the agent name when omitted,
-        // disambiguating against running subagents, in-flight reservations, and
-        // every name already in the registry - so names stay unique across the
-        // whole session, running or finished. Reserve the chosen name
-        // synchronously (before any await) so parallel spawns don't collide.
-        let reservedName: string | null = null;
-        if (!params.name?.trim()) {
-          const registryNames = new Set(Object.keys(readNameRegistry(parentArtifactDir)));
-          params.name = uniqueRunningName(params.agent, registryNames);
-          reservedName = params.name;
-          reservedNames.add(reservedName);
+        // Reserve every name before any await. Explicit names must be unused;
+        // omitted names get a unique default, including across finished runs.
+        const reservation = reserveSubagentName(
+          params.agent,
+          params.name,
+          new Set(Object.keys(readNameRegistry(parentArtifactDir))),
+        );
+        if ("error" in reservation) {
+          return {
+            content: [{ type: "text", text: reservation.error }],
+            details: { error: "duplicate name" },
+            isError: true,
+          };
         }
+        const reservedName = reservation.name;
+        params.name = reservedName;
 
         // Launch the subagent (creates pane, sends command). Release the name
         // reservation once it registers in runningSubagents (or launch fails) -
@@ -1826,18 +1980,24 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         try {
           running = await launchSubagent(params, ctx);
         } finally {
-          if (reservedName) reservedNames.delete(reservedName);
+          reservedNames.delete(reservedName);
         }
 
         // Persist name → session so subagent_message({ name }) can resume this
         // subagent after it finishes (and after a pi restart). Done at launch,
         // not completion, so the handle exists even if the parent dies mid-run.
-        registerName(parentArtifactDir, running.name, {
-          sessionFile: running.sessionFile,
-          sessionId: getSessionId(running.sessionFile),
-          ...(running.activityFile ? { activityFile: running.activityFile } : {}),
-          running: true,
-        });
+        try {
+          registerName(parentArtifactDir, running.name, {
+            sessionFile: running.sessionFile,
+            sessionId: getSessionId(running.sessionFile),
+            ...(running.activityFile ? { activityFile: running.activityFile } : {}),
+            running: true,
+            runId: running.id,
+            taskBrief: running.task,
+          });
+        } catch (err: any) {
+          console.error(`[interactive-subagents] Could not persist registry entry for "${running.name}" (run ${running.id}): ${err?.message ?? String(err)}`);
+        }
 
         // Create a separate AbortController for the watcher
         // (the tool's signal completes when we return)
@@ -1851,39 +2011,35 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         // Fire-and-forget: start watching in background
         watchSubagent(running, watcherAbort.signal)
           .then((result) => {
-            updateWidget(); // reflect removal from Map immediately
-            const registryEntry = resolveNameInRegistry(parentArtifactDir, running.name);
-            if (registryEntry) {
-              registerName(parentArtifactDir, running.name, { ...registryEntry, running: false });
-            }
-
-            const presentation = resolveResultPresentation(result, running.name);
-
-            sendSubagentResult(pi, presentation, {
-              name: running.name,
-              task: running.task,
-              agent: running.agent,
-              exitCode: result.exitCode,
-              elapsed: result.elapsed,
-              sessionFile: result.sessionFile,
-              ...(result.sessionId ? { sessionId: result.sessionId } : {}),
-              ...(result.errorMessage ? { errorMessage: result.errorMessage } : {}),
-              ...(result.handoffInterrupted ? { handoffInterrupted: true, handoffPhase: result.handoffPhase } : {}),
-              ...(result.claudeSessionId ? { claudeSessionId: result.claudeSessionId } : {}),
-              ...(result.stats ? { stats: result.stats } : {}),
-            });
+            if (result.detached) return;
+            completeRun(parentArtifactDir, running, () => {
+              const presentation = result.terminationConfirmed === false
+                ? `Sub-agent "${running.name}" watcher failed; child termination is unknown: ${result.error}`
+                : resolveResultPresentation(result, running.name);
+              sendSubagentResult(pi, presentation, {
+                name: running.name,
+                task: running.task,
+                agent: running.agent,
+                exitCode: result.exitCode,
+                elapsed: result.elapsed,
+                sessionFile: result.sessionFile,
+                ...(result.sessionId ? { sessionId: result.sessionId } : {}),
+                ...(result.errorMessage ? { errorMessage: result.errorMessage } : {}),
+                ...(result.terminationConfirmed === false ? { error: result.error } : {}),
+                ...(result.handoffInterrupted ? { handoffInterrupted: true, handoffPhase: result.handoffPhase } : {}),
+                ...(result.claudeSessionId ? { claudeSessionId: result.claudeSessionId } : {}),
+                ...(result.stats ? { stats: result.stats } : {}),
+              });
+            }, result.terminationConfirmed !== false);
           })
           .catch((err) => {
-            updateWidget();
-            const registryEntry = resolveNameInRegistry(parentArtifactDir, running.name);
-            if (registryEntry) {
-              registerName(parentArtifactDir, running.name, { ...registryEntry, running: false });
-            }
-            sendSubagentResult(pi, `Sub-agent "${running.name}" error: ${err?.message ?? String(err)}`, {
-              name: running.name,
-              task: running.task,
-              error: err?.message,
-            });
+            completeRun(parentArtifactDir, running, () => {
+              sendSubagentResult(pi, `Sub-agent "${running.name}" watcher error; child termination is unknown: ${err?.message ?? String(err)}`, {
+                name: running.name,
+                task: running.task,
+                error: err?.message,
+              });
+            }, false);
           });
 
         // Return immediately
@@ -2032,25 +2188,21 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       description:
         "Send a message to a subagent by name. Names are unique within your session and persist after a subagent finishes, " +
         "so the SAME name works whether the subagent is running or finished: if it is still running, your message steers its live session; " +
-        "if it has finished, your message resumes that session and continues it. Use this only for actionable additional work or to answer a subagent's question; a completed child needs no acknowledgment or stop message. " +
+        "if it has finished, a legacy message or `intent: task` resumes that session, while `context` and `reply` are running-child-only. " +
+        "Optional intent: `task` replaces the complete assignment and saved current brief; `context` adds non-replacing information; `reply` answers a question without identity validation. Omitted intent retains legacy behavior. " +
         "`name` and `message` are both required. " +
         "Steering a running subagent returns immediately with a local acknowledgement and does NOT, by itself, emit a new result. " +
         "Resuming is a fire-and-forget async call: when the resumed sub-agent finishes, the harness AUTOMATICALLY delivers its result as a steer message that wakes you up. " +
         "DO NOT poll, sleep, tail logs, or read session files to detect completion - the harness handles delivery. " +
         "DO NOT fabricate or assume results. After calling, either end your turn or work on other independent tasks.",
       promptSnippet:
-        "Give a subagent actionable additional work or answer its question: steers it if running, resumes it if finished (same name either way). " +
+        "Message a subagent by name. Optional intent `task` replaces the full assignment, `context` adds information to a running child, and `reply` answers a running child; omitted intent retains legacy auto-steer/resume behavior. " +
         "`name` and `message` are required. Steering returns immediately; resuming delivers its result later as a steer message. " +
         "Report completed results to the user instead of acknowledging them through this tool. Do not poll or fabricate results.",
       parameters: Type.Object({
-        name: Type.String({
-          description:
-            "Exact display name of the subagent. Steers it if it is still running; resumes its session if it has finished.",
-        }),
-        message: Type.String({
-          description:
-            "The message to deliver: a follow-up instruction for a running subagent, or the next task for a resumed session.",
-        }),
+        name: Type.String({ description: "Exact display name of the subagent." }),
+        message: Type.String({ description: "Message payload. With intent=task, this is the complete replacement assignment." }),
+        intent: Type.Optional(Type.Union([Type.Literal("task"), Type.Literal("context"), Type.Literal("reply")])),
       }),
 
       renderCall(args, theme) {
@@ -2098,6 +2250,8 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           const err = "Provide the subagent's `name` to steer (if running) or resume (if finished).";
           return { content: [{ type: "text" as const, text: err }], details: { error: err } };
         }
+        const message = params.message?.trim();
+        if (!message) return { content: [{ type: "text" as const, text: "message is required and must not be blank" }], details: { error: "message required" }, isError: true };
 
         if (!isHerdrAvailable()) {
           return herdrUnavailableResult();
@@ -2107,11 +2261,17 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         // A name that matches a currently-running subagent always steers it.
         const runningMatch = Array.from(runningSubagents.values()).find((r) => r.name === requestedName);
         if (runningMatch) {
-          return handleSubagentSteer({ name: requestedName, message: params.message });
+          const intent = params.intent;
+          const envelope = intent ? formatSubagentMessage(intent, requestedName, message) : message;
+          const result = handleSubagentSteer({ name: requestedName, message: envelope });
+          if (intent === "task" && (result.details as any)?.status === "steered") {
+            const artifact = getArtifactDir(ctx.sessionManager.getSessionDir(), ctx.sessionManager.getSessionId());
+            return persistDeliveredTaskBrief(runningMatch, artifact, message, result, true);
+          }
+          return result;
         }
 
         // ── Resume a finished session by name ──
-        const message = params.message;
         const name = requestedName; // identity preservation: the resumed run reclaims its name
         const { autoExit, interactive } = resolveResumeLaunchBehavior();
         const startTime = Date.now();
@@ -2133,6 +2293,9 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           return { content: [{ type: "text" as const, text: err }], details: { error: err } };
         }
 
+        const finishedError = finishedIntentError(params.intent);
+        if (finishedError) return { content: [{ type: "text" as const, text: finishedError }], details: { error: "not running" }, isError: true };
+
         const sessionPath = entry.sessionFile;
         if (!sessionPath || !existsSync(sessionPath)) {
           const err =
@@ -2146,7 +2309,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         for (const r of runningSubagents.values()) {
           if (resolve(r.sessionFile) === resolve(sessionPath)) {
             const err = `Subagent "${requestedName}" is still running as "${r.name}". Your message will steer it; resending as a steer.`;
-            return handleSubagentSteer({ name: r.name, message: params.message });
+            return handleSubagentSteer({ name: r.name, message });
           }
         }
 
@@ -2197,7 +2360,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
               .replace(/^-|-$/g, "") || "resume"}-${msgTimestamp}.md`,
           );
           mkdirSync(dirname(resumeMsgFile), { recursive: true });
-          writeFileSync(resumeMsgFile, message, "utf8");
+          writeFileSync(resumeMsgFile, formatSubagentMessage(params.intent, name, message, entry.taskBrief), "utf8");
         }
 
         // Replay the saved sandbox and nested-spawn identity in the new pane.
@@ -2221,7 +2384,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         const { surface, tabId } = allocatedSurface;
         try {
           await startAgent(herdrAgentName, "pi", surface, parts);
-          if (resumeMsgFile) promptAgent(herdrAgentName, `@${resumeMsgFile}`);
+          if (resumeMsgFile) promptAgent(herdrAgentName, formatResumeTaskPrompt(resumeMsgFile));
         } catch (error) {
           closeSurfaceAndTab(surface, tabId);
           throw error;
@@ -2246,12 +2409,26 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           }),
         };
         runningSubagents.set(id, running);
-        registerName(parentArtifactDir, name, {
+        const resumeMetadata: Partial<NameRegistryEntry> = {
           sessionFile: sessionPath,
           sessionId: resumedSessionId,
           activityFile,
           running: true,
-        });
+          runId: running.id,
+        };
+        let resumeToolResult = {
+          content: [{ type: "text" as const, text: `Session "${name}" resumed.` }],
+          details: { id, name, sessionId: resumedSessionId, sessionFile: sessionPath, status: "started" },
+        };
+        if (params.intent === "task") {
+          resumeToolResult = persistDeliveredTaskBrief(running, parentArtifactDir, message, resumeToolResult, true, resumeMetadata);
+        } else {
+          try {
+            registerName(parentArtifactDir, name, { ...entry, ...resumeMetadata });
+          } catch (err: any) {
+            console.error(`[interactive-subagents] Could not persist registry entry for "${name}" (run ${running.id}): ${err?.message ?? String(err)}`);
+          }
+        }
         startWidgetRefresh();
         startStatusRefresh(pi);
 
@@ -2261,60 +2438,48 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 
         watchSubagent(running, watcherAbort.signal)
           .then((result) => {
-            updateWidget();
-            const registryEntry = resolveNameInRegistry(parentArtifactDir, name);
-            if (registryEntry) {
-              registerName(parentArtifactDir, name, { ...registryEntry, running: false });
-            }
+            if (result.detached) return;
+            completeRun(parentArtifactDir, running, () => {
+              const allEntries = getNewEntries(sessionPath, entryCountBefore);
+              const summary = findLastAssistantMessage(allEntries) ??
+                (result.errorMessage
+                  ? `Subagent error: ${result.errorMessage}`
+                  : result.exitCode !== 0
+                    ? `Resumed session exited with code ${result.exitCode}`
+                    : "Resumed session exited without new output");
+              const presentation = result.terminationConfirmed === false
+                ? `Sub-agent "${name}" watcher failed; child termination is unknown: ${result.error}`
+                : resolveResultPresentation(
+                    { ...result, summary, sessionFile: sessionPath, sessionId: resumedSessionId },
+                    name,
+                  );
 
-            const allEntries = getNewEntries(sessionPath, entryCountBefore);
-            const summary = findLastAssistantMessage(allEntries) ??
-              (result.errorMessage
-                ? `Subagent error: ${result.errorMessage}`
-                : result.exitCode !== 0
-                  ? `Resumed session exited with code ${result.exitCode}`
-                  : "Resumed session exited without new output");
-            const presentation = resolveResultPresentation(
-              { ...result, summary, sessionFile: sessionPath, sessionId: resumedSessionId },
-              name,
-            );
-
-            sendSubagentResult(pi, presentation, {
-              name,
-              task: message,
-              exitCode: result.exitCode,
-              elapsed: result.elapsed,
-              sessionFile: sessionPath,
-              sessionId: resumedSessionId,
-              resumed: true,
-              ...(result.errorMessage ? { errorMessage: result.errorMessage } : {}),
-              ...(result.handoffInterrupted ? { handoffInterrupted: true, handoffPhase: result.handoffPhase } : {}),
-              ...(result.stats ? { stats: result.stats } : {}),
-            });
+              sendSubagentResult(pi, presentation, {
+                name,
+                task: running.task,
+                exitCode: result.exitCode,
+                elapsed: result.elapsed,
+                sessionFile: sessionPath,
+                sessionId: resumedSessionId,
+                resumed: true,
+                ...(result.errorMessage ? { errorMessage: result.errorMessage } : {}),
+                ...(result.terminationConfirmed === false ? { error: result.error } : {}),
+                ...(result.handoffInterrupted ? { handoffInterrupted: true, handoffPhase: result.handoffPhase } : {}),
+                ...(result.stats ? { stats: result.stats } : {}),
+              });
+            }, result.terminationConfirmed !== false);
           })
           .catch((err) => {
-            updateWidget();
-            const registryEntry = resolveNameInRegistry(parentArtifactDir, name);
-            if (registryEntry) {
-              registerName(parentArtifactDir, name, { ...registryEntry, running: false });
-            }
-            sendSubagentResult(pi, `Resume error: ${err?.message ?? String(err)}`, {
-              name,
-              resumed: true,
-              error: err?.message,
-            });
+            completeRun(parentArtifactDir, running, () => {
+              sendSubagentResult(pi, `Resume watcher error; child termination is unknown: ${err?.message ?? String(err)}`, {
+                name,
+                resumed: true,
+                error: err?.message,
+              });
+            }, false);
           });
 
-        return {
-          content: [{ type: "text", text: `Session "${name}" resumed.` }],
-          details: {
-            id,
-            name,
-            sessionId: resumedSessionId,
-            sessionFile: sessionPath,
-            status: "started",
-          },
-        };
+        return resumeToolResult;
       },
     });
 

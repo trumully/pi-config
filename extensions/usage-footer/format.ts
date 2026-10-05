@@ -226,43 +226,4 @@ export function formatUsageFooterLines(
   return footerLines;
 }
 
-export interface SubagentFooterLine {
-  name: string;
-  status: string;
-  inputTokens?: number;
-  outputTokens?: number;
-  cost?: number;
-  compactionCount?: number;
-}
 
-function subagentMetricParts(line: Pick<SubagentFooterLine, "inputTokens" | "outputTokens" | "cost" | "compactionCount">): string[] {
-  const parts: string[] = [];
-  if (typeof line.inputTokens === "number" && Number.isFinite(line.inputTokens)) parts.push(`↑${formatTokens(line.inputTokens)}`);
-  if (typeof line.outputTokens === "number" && Number.isFinite(line.outputTokens)) parts.push(`↓${formatTokens(line.outputTokens)}`);
-  if (typeof line.cost === "number" && Number.isFinite(line.cost)) parts.push(formatCost(line.cost));
-  if (typeof line.compactionCount === "number" && Number.isFinite(line.compactionCount)) parts.push(`↻ ${line.compactionCount}`);
-  return parts;
-}
-
-/** Formats the metrics suffix shared by the live widget and result indicator. */
-export function formatSubagentFooterStats(
-  line: Pick<SubagentFooterLine, "inputTokens" | "outputTokens" | "cost" | "compactionCount">,
-): string {
-  return subagentMetricParts(line).join(" · ");
-}
-
-/** Formats one compact subagent status row for completed results. */
-export function formatSubagentFooterLine(
-  line: SubagentFooterLine,
-  width: number,
-  theme: { fg(color: any, text: string): string; bold?(text: string): string },
-  text: FooterTextHelpers,
-): string {
-  const parts = [
-    theme.fg("toolTitle", theme.bold ? theme.bold(line.name) : line.name),
-    theme.fg(line.status === "failed" || line.status === "stalled" ? "error" : line.status === "running" ? "warning" : "success", line.status),
-    ...subagentMetricParts(line),
-  ];
-  const formatted = parts.join(theme.fg("dim", " · "));
-  return text.visibleWidth(formatted) > width ? text.truncateToWidth(formatted, width) : formatted;
-}

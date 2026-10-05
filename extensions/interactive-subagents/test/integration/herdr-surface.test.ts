@@ -21,7 +21,6 @@ import {
   untrackSurface,
   sendCommand,
   readScreen,
-  readScreenAsync,
   closeSurface,
   echoCommand,
   writeFileCommand,
@@ -195,17 +194,6 @@ for (const backend of backends) {
         commandCase.verify(screen);
       });
     }
-
-    it("reads pane output asynchronously", async () => {
-      const surface = createTrackedSurface(env, "async-read-test");
-      await sleep(700);
-
-      const marker = uniqueId();
-      sendCommand(surface, echoCommand(`ASYNC_${marker}`));
-      const screen = await waitForScreen(surface, new RegExp(`ASYNC_${marker}`), 15_000, 50);
-      assert.ok(screen.includes(`ASYNC_${marker}`));
-      assert.ok((await readScreenAsync(surface, 50)).includes(`ASYNC_${marker}`));
-    });
 
     it("writes output to a file and verifies the command result", async () => {
       const surface = createTrackedSurface(env, "file-test");

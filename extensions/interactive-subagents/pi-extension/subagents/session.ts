@@ -158,6 +158,10 @@ export interface NameRegistryEntry {
   activityFile?: string;
   /** Spawner-observed process state; authoritative when present because activity snapshots can lag shutdown. */
   running?: boolean;
+  /** Identity of the specific spawn/resume run; absent in older registry records. */
+  runId?: string;
+  /** Current task brief; absent for legacy registry records. */
+  taskBrief?: string;
 }
 
 export type NameRegistry = Record<string, NameRegistryEntry>;
@@ -190,18 +194,21 @@ export function registerName(
   name: string,
   entry: NameRegistryEntry,
 ): void {
-  try {
-    mkdirSync(artifactDir, { recursive: true });
-    const registry = readNameRegistry(artifactDir);
-    registry[name] = entry;
-    const p = nameRegistryPath(artifactDir);
-    const tmp = `${p}.tmp-${process.pid}-${Math.random().toString(16).slice(2, 8)}`;
-    writeFileSync(tmp, JSON.stringify(registry, null, 2), "utf8");
-    renameSync(tmp, p);
-  } catch {
-    // Best-effort: a failed registration only means resume-by-name won't find
-    // this subagent later; it never breaks the spawn itself.
-  }
+  mkdirSync(artifactDir, { recursive: true });
+  const registry = readNameRegistry(artifactDir);
+  registry[name] = entry;
+  const p = nameRegistryPath(artifactDir);
+  const tmp = `${p}.tmp-${process.pid}-${Math.random().toString(16).slice(2, 8)}`;
+  writeFileSync(tmp, JSON.stringify(registry, null, 2), "utf8");
+  renameSync(tmp, p);
+}
+
+/** Update state only when this completion still owns the persisted run. */
+export function finishRegisteredRun(artifactDir: string, name: string, runId: string): boolean {
+  const entry = resolveNameInRegistry(artifactDir, name);
+  if (!entry || entry.runId !== runId) return false;
+  registerName(artifactDir, name, { ...entry, running: false });
+  return true;
 }
 
 /** Resolve a name to its registry entry within a spawner session, or null. */
