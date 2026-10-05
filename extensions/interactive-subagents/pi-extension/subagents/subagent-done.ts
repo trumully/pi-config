@@ -1,6 +1,6 @@
 /**
  * Extension loaded into sub-agents.
- * - Shows agent identity + available tools as a styled widget above the editor (toggle with Ctrl+Alt+O)
+ * - Shows an on-demand agent identity + available tools panel (toggle with Ctrl+Alt+O)
  * - Provides an `ask_question` tool for asking the parent orchestrator a question
  *
  * Subagents do NOT self-terminate via a tool. Auto-exit agents shut down
@@ -128,7 +128,7 @@ export default function (pi: ExtensionAPI) {
   if (!runningChildId || !sessionFile) return;
 
   let toolNames: string[] = [];
-  let expanded = false;
+  let panelVisible = false;
 
   // Read subagent identity from env vars (set by parent orchestrator)
   const subagentName = process.env.PI_SUBAGENT_NAME ?? "";
@@ -293,38 +293,23 @@ export default function (pi: ExtensionAPI) {
   }
 
   function renderWidget(ctx: { ui: { setWidget: Function } }, _theme: any) {
+    if (!panelVisible) {
+      ctx.ui.setWidget("subagent-tools", undefined, { placement: "aboveEditor" });
+      return;
+    }
+
     ctx.ui.setWidget(
       "subagent-tools",
       (_tui: any, theme: any) => {
         const box = new Box(1, 0, (text: string) => theme.bg("toolSuccessBg", text));
-
         const label = subagentAgent || subagentName;
         const agentTag = label ? theme.bold(theme.fg("accent", `[${label}]`)) : "";
-
-        if (expanded) {
-          // Expanded: full tool list + denied
-          const countInfo = theme.fg("dim", ` - ${toolNames.length} available`);
-          const hint = theme.fg("muted", "  (Ctrl+Alt+O to collapse)");
-
-          const toolList = toolNames
-            .map((name: string) => theme.fg("dim", name))
-            .join(theme.fg("muted", ", "));
-
-          const content = new Text(
-            `${agentTag}${countInfo}${hint}\n${toolList}`,
-            0,
-            0,
-          );
-          box.addChild(content);
-        } else {
-          // Collapsed: one-line summary
-          const countInfo = theme.fg("dim", ` - ${toolNames.length} tools`);
-          const hint = theme.fg("muted", "  (Ctrl+Alt+O to expand)");
-
-          const content = new Text(`${agentTag}${countInfo}${hint}`, 0, 0);
-          box.addChild(content);
-        }
-
+        const countInfo = theme.fg("dim", ` - ${toolNames.length} available`);
+        const hint = theme.fg("muted", "  (Ctrl+Alt+O to hide)");
+        const toolList = toolNames
+          .map((name: string) => theme.fg("dim", name))
+          .join(theme.fg("muted", ", "));
+        box.addChild(new Text(`${agentTag}${countInfo}${hint}\n${toolList}`, 0, 0));
         return box;
       },
       { placement: "aboveEditor" },
@@ -337,7 +322,7 @@ export default function (pi: ExtensionAPI) {
   // `agent_start` (covers a reply that starts a fresh turn after parking).
   let awaitingAnswer = false;
 
-  // Show widget + status bar on session start
+  // Keep the child tools panel hidden until explicitly requested.
   pi.on("session_start", (_event, ctx) => {
     latestCtx = ctx;
     recorder.sessionStart();
@@ -606,11 +591,11 @@ export default function (pi: ExtensionAPI) {
   // snapshot before the first progress publication, and shutdown disables it.
   registerSubagentProgress(pi, recorder, runningChildrenCount);
 
-  // Toggle expand/collapse with Ctrl+Alt+O
+  // Toggle the child tools panel with Ctrl+Alt+O.
   pi.registerShortcut("ctrl+alt+o", {
-    description: "Toggle subagent tools widget",
+    description: "Toggle subagent tools panel",
     handler: (ctx) => {
-      expanded = !expanded;
+      panelVisible = !panelVisible;
       renderWidget(ctx, null);
     },
   });
