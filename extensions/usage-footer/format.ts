@@ -13,6 +13,7 @@ function formatEffort(effort: string): string {
 
 export interface UsageFooterSnapshot {
   cwd: string;
+  gitBranch: string | null;
   model: string;
   effort: string;
   contextWindow: number;
@@ -144,9 +145,10 @@ export function formatUsageFooterLines(
   if (width <= 0) return [];
 
   const directory = directoryName(snapshot.cwd);
+  const location = snapshot.gitBranch ? `${directory} (${snapshot.gitBranch})` : directory;
   const model = snapshot.model || "no-model";
   const effort = snapshot.effort || "default";
-  const line1 = fit(`${directory} · ${formatEffort(effort)} ${model}`, width, text);
+  const line1 = fit(`${location} · ${formatEffort(effort)} ${model}`, width, text);
 
   const cap = snapshot.contextWindow > 0 ? formatTokens(snapshot.contextWindow) : "?";
   const rawPercent = typeof snapshot.contextPercent === "number" && Number.isFinite(snapshot.contextPercent)

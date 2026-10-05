@@ -1,6 +1,7 @@
 import { join, resolve } from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
+import { getGitBranch } from "./git.ts";
 import { collectSubagentUsage } from "../interactive-subagents/pi-extension/subagents/usage.ts";
 import {
   loadProactiveCompactionConfig,
@@ -118,6 +119,7 @@ export default function usageFooter(pi: ExtensionAPI) {
 
     snapshot = {
       cwd: ctx.cwd,
+      gitBranch: getGitBranch(ctx.cwd),
       model: ctx.model?.id ?? "no-model",
       effort: ctx.thinkingLevel ?? "default",
       contextWindow: context?.contextWindow ?? ctx.model?.contextWindow ?? 0,
