@@ -8,12 +8,7 @@ const EFFORT_ICONS: Record<string, string> = {
 };
 
 function formatEffort(effort: string): string {
-  const level = effort.toLowerCase();
-  const icon = EFFORT_ICONS[level];
-  if (!icon) return effort;
-
-  const label = level === "minimal" ? "min" : level === "medium" ? "med" : level === "xhigh" ? "xhi" : level;
-  return `${icon} ${label}`;
+  return EFFORT_ICONS[effort.toLowerCase()] ?? effort;
 }
 
 export interface UsageFooterSnapshot {
@@ -130,32 +125,14 @@ function formatCost(cost: number): string {
   return `$${cost.toFixed(3)}`;
 }
 
-function keepPathTail(text: string, width: number, visibleWidth: FooterTextHelpers["visibleWidth"]): string {
-  if (width <= 0) return "";
-  if (visibleWidth(text) <= width) return text;
-  const chars = [...text];
-  let start = 0;
-  while (start < chars.length && visibleWidth(`…${chars.slice(start).join("")}`) > width) start++;
-  return start === chars.length ? "…" : `…${chars.slice(start).join("")}`;
+function directoryName(path: string): string {
+  const parts = (path || "?").replace(/[\\/]+$/, "").split(/[\\/]/);
+  return parts.at(-1) || path || "?";
 }
 
-function wrapParts(
-  parts: string[],
-  width: number,
-  text: FooterTextHelpers,
-): string[] {
-  const lines: string[] = [];
-  for (const originalPart of parts) {
-    const part = text.visibleWidth(originalPart) > width
-      ? text.truncateToWidth(originalPart, width)
-      : originalPart;
-    const lastLine = lines.at(-1);
-    const candidate = lastLine ? `${lastLine} · ${part}` : part;
-    if (lastLine && text.visibleWidth(candidate) > width) lines.push(part);
-    else if (lastLine) lines[lines.length - 1] = candidate;
-    else lines.push(part);
-  }
-  return lines;
+function fit(textValue: string, width: number, text: FooterTextHelpers): string {
+  if (width <= 0) return "";
+  return text.visibleWidth(textValue) <= width ? textValue : text.truncateToWidth(textValue, width);
 }
 
 export function formatUsageFooterLines(
@@ -166,64 +143,77 @@ export function formatUsageFooterLines(
 ): string[] {
   if (width <= 0) return [];
 
-  const modelPart = `${snapshot.model || "no-model"} · ${formatEffort(snapshot.effort || "default")}`;
-  const modelWidth = text.visibleWidth(modelPart);
-  const topLines: string[] = [];
-  if (modelWidth + 3 <= width) {
-    const cwd = keepPathTail(snapshot.cwd || "?", width - modelWidth - 2, text.visibleWidth);
-    topLines.push(`${theme.fg("muted", cwd)}${" ".repeat(width - text.visibleWidth(cwd) - modelWidth)}${theme.fg("accent", modelPart)}`);
-  } else {
-    topLines.push(theme.fg("muted", keepPathTail(snapshot.cwd || "?", width, text.visibleWidth)));
-    topLines.push(theme.fg("accent", keepPathTail(modelPart, width, text.visibleWidth)));
-  }
+  const directory = directoryName(snapshot.cwd);
+  const model = snapshot.model || "no-model";
+  const effort = snapshot.effort || "default";
+  const line1 = fit(`${directory} · ${formatEffort(effort)} ${model}`, width, text);
 
-  const contextCap = snapshot.contextWindow > 0 ? formatTokens(snapshot.contextWindow) : "?";
-  const percent = typeof snapshot.contextPercent === "number" && Number.isFinite(snapshot.contextPercent)
+  const cap = snapshot.contextWindow > 0 ? formatTokens(snapshot.contextWindow) : "?";
+  const rawPercent = typeof snapshot.contextPercent === "number" && Number.isFinite(snapshot.contextPercent)
     ? snapshot.contextPercent
     : null;
-  const contextPercent = percent === null ? "?" : `${Math.round(percent)}%`;
-  const contextColor = percent !== null && percent > 90
+  const percent = rawPercent === null ? "?" : `${Math.round(rawPercent)}%`;
+  const context = `${percent}/${cap}`;
+  const contextColor = rawPercent !== null && rawPercent > 90
     ? "error"
-    : percent !== null && percent > 70 ? "warning" : "accent";
-  const filledCells = percent === null
-    ? 0
-    : Math.round(Math.min(100, Math.max(0, percent)) / 10);
-  const boundary = snapshot.proactiveBoundaryPercent;
-  const boundaryCell = typeof boundary === "number" && Number.isFinite(boundary) && boundary >= 1 && boundary <= 100
-    ? Math.max(0, Math.min(9, Math.round(boundary / 10) - 1))
-    : -1;
-  const cells = Array.from({ length: 10 }, (_, index) => {
-    if (index === boundaryCell) return theme.fg("warning", "│");
-    return index < filledCells ? theme.fg(contextColor, "█") : theme.fg("dim", "░");
-  }).join("");
-  const boundaryLabel = boundaryCell >= 0 ? ` · compact ~${Math.round(boundary!)}%` : "";
-  const context = `${cells} ${contextPercent}/${contextCap}${boundaryLabel}`;
-  const tokenParts = [
-    snapshot.inputTokens === null ? null : `↑${formatTokens(snapshot.inputTokens)}`,
-    snapshot.outputTokens === null ? null : `↓${formatTokens(snapshot.outputTokens)}`,
-  ].filter((part): part is string => part !== null);
-  const usageLine = `${context}${tokenParts.length ? theme.fg("dim", ` · ${tokenParts.join(" ")}`) : ""}`;
-  const parts = [usageLine];
+    : rawPercent !== null && rawPercent > 70 ? "warning" : "accent";
+
+  let cost: string | null = null;
+  let split: string | null = null;
   if (snapshot.showSubagentCost) {
     if (snapshot.mainCost !== null && snapshot.subagentCost !== null) {
-      const totalCost = snapshot.mainCost + snapshot.subagentCost;
-      parts.push(theme.fg("dim", `~${formatCost(totalCost)} (main ${formatCost(snapshot.mainCost)} · subagents ${formatCost(snapshot.subagentCost)})`));
-    }
-  } else if (snapshot.mainCost !== null) {
-    parts.push(theme.fg("dim", `~${formatCost(snapshot.mainCost)}`));
-  }
-  if (snapshot.proactiveCompactionEnabled && snapshot.compactionCount !== null) {
-    parts.push(theme.fg("dim", `↻ ${snapshot.compactionCount}`));
-  }
-  if (snapshot.proactiveStatus) {
-    parts.push(theme.fg(snapshot.proactiveStatus.color, `↻ ${snapshot.proactiveStatus.label}`));
-  }
-  const footerLines = [...topLines, ...wrapParts(parts, width, text)];
+      cost = `~${formatCost(snapshot.mainCost + snapshot.subagentCost)}`;
+      split = `main ${formatCost(snapshot.mainCost)} + sub ${formatCost(snapshot.subagentCost)}`;
+    } else if (snapshot.mainCost !== null) cost = `~${formatCost(snapshot.mainCost)}+?`;
+    else if (snapshot.subagentCost !== null) cost = `~?+${formatCost(snapshot.subagentCost)}`;
+    else cost = "~?";
+  } else if (snapshot.mainCost !== null) cost = `~${formatCost(snapshot.mainCost)}`;
+  else cost = "~?";
 
-  if (snapshot.runDurationLabel) {
-    footerLines.push(theme.fg("dim", text.truncateToWidth(snapshot.runDurationLabel, width)));
+  const actionableStatus = snapshot.proactiveStatus?.color === "success"
+    ? null
+    : snapshot.proactiveStatus;
+  const statusLabels: Record<string, string> = {
+    "checkpoint requested": "requested",
+    "proactive compaction": "compacting",
+    resuming: "resuming",
+    "checkpoint handoff failed": "checkpoint failed",
+  };
+  const statusText = actionableStatus
+    ? `↻ ${statusLabels[actionableStatus.label] ?? actionableStatus.label}`
+    : null;
+  const activeTimer = snapshot.runDurationLabel?.startsWith("Running ")
+    ? snapshot.runDurationLabel
+    : null;
+  const base = fit(context, width, text);
+  let line = base;
+  const append = (value: string | null): boolean => {
+    if (!value) return false;
+    const candidate = `${line} · ${value}`;
+    if (text.visibleWidth(candidate) > width) return false;
+    line = candidate;
+    return true;
+  };
+  const visibleCost = cost !== null && append(cost);
+  let visibleStatus: string | null = null;
+  if (statusText) {
+    const remaining = width - text.visibleWidth(line) - (line ? 3 : 0);
+    if (remaining > 0) {
+      const status = fit(statusText, remaining, text);
+      if (status && append(status)) visibleStatus = status;
+    }
   }
-  return footerLines;
+  const visibleSplit = split !== null && text.visibleWidth(`${line} (${split})`) <= width;
+  if (visibleSplit) line = `${line} (${split})`;
+  const visibleTimer = append(activeTimer);
+
+  const styledParts = [theme.fg(contextColor, base)];
+  if (visibleCost) styledParts.push(theme.fg("dim", ` · ${cost}`));
+  if (visibleStatus) styledParts.push(theme.fg(actionableStatus!.color, ` · ${visibleStatus}`));
+  if (visibleSplit) styledParts.push(theme.fg("dim", ` (${split})`));
+  if (visibleTimer) styledParts.push(theme.fg("dim", ` · ${activeTimer}`));
+
+  return [theme.fg("muted", line1), styledParts.join("")];
 }
 
 

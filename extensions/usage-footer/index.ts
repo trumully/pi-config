@@ -136,7 +136,7 @@ export default function usageFooter(pi: ExtensionAPI) {
         childSessionFile !== null,
         proactiveConfig,
       ),
-      runDurationLabel: getRunTimerLabel(runTimer),
+      runDurationLabel: runTimer.startedAt === null ? null : getRunTimerLabel(runTimer),
     };
     requestRender?.();
   }
