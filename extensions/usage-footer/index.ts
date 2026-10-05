@@ -1,11 +1,11 @@
 import { join, resolve } from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
-import { collectSubagentUsage } from "./interactive-subagents/pi-extension/subagents/usage.ts";
+import { collectSubagentUsage } from "../interactive-subagents/pi-extension/subagents/usage.ts";
 import {
   loadProactiveCompactionConfig,
   readHandoffState,
-} from "./interactive-subagents/pi-extension/subagents/proactive-compaction.ts";
+} from "../interactive-subagents/pi-extension/subagents/proactive-compaction.ts";
 import {
   createRunTimerState,
   formatUsageFooterLines,
@@ -17,7 +17,7 @@ import {
   startRunTimer,
   type RunTimerState,
   type UsageFooterSnapshot,
-} from "./lib/usage-footer-format.ts";
+} from "./format.ts";
 
 const TIMER_KEY = Symbol.for("pi-usage-footer/refresh-timer");
 const RUN_TIMER_KEY = Symbol.for("pi-usage-footer/run-timer");
