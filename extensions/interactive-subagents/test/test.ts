@@ -1,12 +1,22 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { execFileSync } from "node:child_process";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { convertToLlm } from "@earendil-works/pi-coding-agent";
 import * as subagentsModule from "../pi-extension/subagents/index.ts";
+import { buildPromptAgentArgs } from "../pi-extension/subagents/herdr.ts";
 import { finishRegisteredRun, readNameRegistry, registerName } from "../pi-extension/subagents/session.ts";
+import { collectSubagentUsage } from "../pi-extension/subagents/usage.ts";
+import {
+  readClaudeCostEstimate,
+  readClaudeUsageSidecar,
+  reconcileClaudeCostEstimates,
+  writeClaudeUsageSidecar,
+} from "../pi-extension/subagents/claude-usage.ts";
+import { formatUsageFooterLines, type UsageFooterSnapshot } from "../../usage-footer/format.ts";
 import {
   createSubagentActivityRecorder,
   progressIndicators,
@@ -230,6 +240,517 @@ describe("interactive subagents smoke tests", () => {
     }
     const worker = readFileSync(join(root, "extensions/interactive-subagents/agents/worker.md"), "utf8");
     assert.match(worker, /^tools:.*\btodo\b/m);
+  });
+
+  it("passes Claude auto-exit behavior to the stop hook", () => {
+    const testApi = (subagentsModule as any).__test__;
+    assert.deepEqual(testApi.buildClaudeLaunchEnv("/tmp/claude-done", true), {
+      PI_CLAUDE_SENTINEL: "/tmp/claude-done",
+      PI_CLAUDE_AUTO_EXIT: "1",
+      PI_CLAUDE_ASK_FILE: "/tmp/claude-done.ask",
+      PI_CLAUDE_PENDING_FILE: "/tmp/claude-done.pending",
+      PI_CLAUDE_USAGE_FILE: "/tmp/claude-done.usage.json",
+    });
+    assert.deepEqual(testApi.buildClaudeLaunchEnv("/tmp/claude-done", false), {
+      PI_CLAUDE_SENTINEL: "/tmp/claude-done",
+      PI_CLAUDE_AUTO_EXIT: "0",
+      PI_CLAUDE_ASK_FILE: "/tmp/claude-done.ask",
+      PI_CLAUDE_PENDING_FILE: "/tmp/claude-done.pending",
+      PI_CLAUDE_USAGE_FILE: "/tmp/claude-done.usage.json",
+    });
+  });
+
+  it("forwards a Claude profile's effort to Claude Code launch arguments", () => {
+    const testApi = (subagentsModule as any).__test__;
+    const directory = mkdtempSync(join(tmpdir(), "claude-agent-profile-"));
+    const agentsDirectory = join(directory, "agents");
+    mkdirSync(agentsDirectory);
+    writeFileSync(join(agentsDirectory, "cc-worker.md"), [
+      "---",
+      "name: cc-worker",
+      "cli: claude",
+      "model: claude-opus-5-5",
+      "effort: high",
+      "---",
+      "Worker instructions.",
+    ].join("\n"));
+
+    const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
+    process.env.PI_CODING_AGENT_DIR = directory;
+    try {
+      const profile = testApi.loadAgentDefaults("cc-worker");
+      assert.ok(profile);
+      assert.equal(profile.effort, "high");
+      const systemPromptFile = testApi.writeClaudeSystemPromptFile(directory, "test-run", profile.body);
+      assert.equal(readFileSync(systemPromptFile, "utf8"), "Worker instructions.");
+      assert.deepEqual(testApi.buildClaudeCliArgs({
+        pluginDir: "/claude-plugin",
+        model: profile.model,
+        effort: profile.effort,
+        systemPromptFile,
+        usageFile: "C:\\Users\\Example\\AppData\\Local\\Temp\\done.usage.json",
+        statuslineScript: "C:\\Program Files\\pi-config\\statusline.py",
+      }), [
+        "--permission-mode", "auto",
+        "--plugin-dir", "/claude-plugin",
+        "--allowedTools", "mcp__plugin_pi-auto-exit_pi__ask_question",
+        "--settings", JSON.stringify({ statusLine: {
+          type: "command",
+          command: `uv run --no-project python ${testApi.quoteClaudeShellPath("C:\\Program Files\\pi-config\\statusline.py", process.platform === "win32" ? "win32" : "posix")}`,
+        } }),
+        "--model", "claude-opus-5-5",
+        "--effort", "high",
+        "--append-system-prompt-file", systemPromptFile,
+      ]);
+      assert.equal(
+        testApi.quoteClaudeShellPath("C:\\Users\\Example\\Claude Tools\\statusline.py", "win32"),
+        '"C:/Users/Example/Claude Tools/statusline.py"',
+      );
+      assert.equal(
+        testApi.quoteClaudeShellPath("/tmp/Claude Tools/o'hare.py", "posix"),
+        "'/tmp/Claude Tools/o'\\''hare.py'",
+      );
+    } finally {
+      if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+      else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("exposes the Claude ask_question MCP tool and writes an atomic question signal", () => {
+    const directory = mkdtempSync(join(tmpdir(), "claude-ask-mcp-"));
+    const askFile = join(directory, "question.ask");
+    const pendingFile = join(directory, "question.pending");
+    const server = resolve(dirname(fileURLToPath(import.meta.url)), "../pi-extension/subagents/plugin/mcp/ask_question.py");
+    const requests = [
+      { jsonrpc: "2.0", id: 1, method: "initialize", params: { protocolVersion: "2025-11-25", capabilities: {}, clientInfo: { name: "test", version: "1" } } },
+      { jsonrpc: "2.0", method: "notifications/initialized" },
+      { jsonrpc: "2.0", id: 2, method: "tools/list" },
+      { jsonrpc: "2.0", id: 3, method: "tools/call", params: { name: "ask_question", arguments: { question: "Which option should I use?" } } },
+    ];
+    try {
+      const output = execFileSync("uv", ["run", "--no-project", "python", server], {
+        input: requests.map((request) => JSON.stringify(request)).join("\n") + "\n",
+        env: { ...process.env, PI_CLAUDE_ASK_FILE: askFile, PI_CLAUDE_PENDING_FILE: pendingFile },
+        timeout: 15_000,
+        windowsHide: true,
+      });
+      const responses = output.toString("utf8").trim().split(/\r?\n/).map((line) => JSON.parse(line));
+      assert.equal(responses[0].result.protocolVersion, "2025-11-25");
+      assert.equal(responses[1].result.tools[0].name, "ask_question");
+      assert.match(responses[2].result.content[0].text, /sent to the Pi orchestrator/i);
+      assert.equal(JSON.parse(readFileSync(askFile, "utf8")).question, "Which option should I use?");
+      assert.equal(existsSync(pendingFile), true);
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("delivers Claude question sidecars through the parent watcher", () => {
+    const harness = registerSubagents();
+    const directory = mkdtempSync(join(tmpdir(), "claude-ask-watcher-"));
+    const askFile = join(directory, "question.ask");
+    writeFileSync(askFile, JSON.stringify({ id: "q1", question: "Need a decision?" }));
+    try {
+      const testApi = (subagentsModule as any).__test__;
+      testApi.deliverPendingQuestion({
+        name: "ClaudeWorker",
+        agent: "cc-worker",
+        startTime: Date.now() - 1000,
+        sessionFile: join(directory, "nonexistent-pi-session.jsonl"),
+        askFile,
+      });
+      assert.equal(existsSync(askFile), false);
+      assert.equal(harness.sentMessages.length, 1);
+      assert.match(harness.sentMessages[0].message.content, /Need a decision\?/);
+      assert.equal(harness.sentMessages[0].options?.triggerTurn, true);
+      assert.equal(harness.sentMessages[0].options?.deliverAs, "steer");
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("keeps an auto-exit Claude worker open while its question is pending", () => {
+    const directory = mkdtempSync(join(tmpdir(), "claude-question-pending-"));
+    const transcript = join(directory, "transcript.jsonl");
+    const sentinel = join(directory, "done");
+    const pending = `${sentinel}.pending`;
+    const hook = resolve(dirname(fileURLToPath(import.meta.url)), "../pi-extension/subagents/plugin/hooks/on-stop.sh");
+    writeFileSync(transcript, [
+      JSON.stringify({ type: "user", message: { role: "user", content: "initial task" } }),
+      JSON.stringify({ type: "user", message: { role: "user", content: "parent reply" } }),
+    ].join("\n"));
+    writeFileSync(pending, "q1");
+    try {
+      execFileSync("bash", [hook], {
+        input: JSON.stringify({ stop_hook_active: false, transcript_path: transcript, last_assistant_message: "WAITING" }),
+        env: { ...process.env, PI_CLAUDE_SENTINEL: sentinel, PI_CLAUDE_AUTO_EXIT: "1", PI_CLAUDE_PENDING_FILE: pending },
+        timeout: 10_000,
+        windowsHide: true,
+      });
+      assert.equal(existsSync(sentinel), false);
+      assert.equal(existsSync(`${sentinel}.transcript`), true);
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("clears the question-pending marker when Claude receives the parent's reply", () => {
+    const directory = mkdtempSync(join(tmpdir(), "claude-question-reply-"));
+    const pending = join(directory, "done.pending");
+    const hook = resolve(dirname(fileURLToPath(import.meta.url)), "../pi-extension/subagents/plugin/hooks/on-user-prompt.py");
+    writeFileSync(pending, "q1");
+    try {
+      execFileSync("uv", ["run", "--no-project", "python", hook], {
+        input: JSON.stringify({ prompt: "The user decision" }),
+        env: { ...process.env, PI_CLAUDE_PENDING_FILE: pending },
+        timeout: 10_000,
+        windowsHide: true,
+      });
+      assert.equal(existsSync(pending), false);
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("parses Claude cost-state as an estimate and aggregates its sidecar", () => {
+    const directory = mkdtempSync(join(tmpdir(), "claude-cost-state-"));
+    const transcript = join(directory, "transcript.jsonl");
+    const usageFile = join(directory, "child.usage.json");
+    const artifactDir = join(directory, "artifacts", "parent");
+    writeFileSync(transcript, [
+      JSON.stringify({ type: "user", message: { content: "private task text" } }),
+      JSON.stringify({
+        type: "cost-state",
+        sessionId: "claude-session-1",
+        totalCostUSD: 0.1234,
+        hasUnknownModelCost: false,
+        modelUsage: {
+          "model-a": { inputTokens: 10, outputTokens: 4, cacheReadInputTokens: 2, cacheCreationInputTokens: 3 },
+          "model-b": { inputTokens: 6, outputTokens: 5, cacheReadInputTokens: 1, cacheCreationInputTokens: 2 },
+        },
+      }),
+    ].join("\n"));
+    try {
+      const estimate = readClaudeCostEstimate(transcript);
+      assert.deepEqual(estimate, {
+        estimated: true,
+        cost: 0.1234,
+        costAvailable: true,
+        inputTokens: 16,
+        outputTokens: 9,
+        cacheReadTokens: 3,
+        cacheWriteTokens: 5,
+        sessionId: "claude-session-1",
+      });
+      writeClaudeUsageSidecar(usageFile, estimate);
+      registerName(artifactDir, "ClaudeWorker", {
+        sessionFile: join(directory, "not-a-pi-session.jsonl"),
+        sessionId: null,
+        usageFile,
+        running: false,
+      });
+      assert.deepEqual(collectSubagentUsage(artifactDir), {
+        sessionCount: 1,
+        runningCount: 0,
+        inputTokens: 16,
+        outputTokens: 9,
+        cacheReadTokens: 3,
+        cacheWriteTokens: 5,
+        cost: 0.1234,
+        costAvailable: true,
+        costComplete: true,
+        costEstimated: true,
+      });
+
+      const partialTranscript = join(directory, "partial.jsonl");
+      writeFileSync(partialTranscript, JSON.stringify({
+        type: "cost-state",
+        totalCostUSD: 0.05,
+        hasUnknownModelCost: true,
+        modelUsage: { "unknown-model": { inputTokens: 2, outputTokens: 1 } },
+      }));
+      assert.deepEqual(readClaudeCostEstimate(partialTranscript), {
+        estimated: true,
+        cost: null,
+        costAvailable: false,
+        inputTokens: 2,
+        outputTokens: 1,
+        cacheReadTokens: null,
+        cacheWriteTokens: null,
+        sessionId: null,
+        costExplicitlyUnknown: true,
+      });
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("updates the footer from status-line snapshots and reconciles final Claude cost", () => {
+    const directory = mkdtempSync(join(tmpdir(), "claude-live-cost-"));
+    const usageFile = join(directory, "child.usage.json");
+    const artifactDir = join(directory, "artifacts", "parent");
+    const script = resolve(dirname(fileURLToPath(import.meta.url)), "../pi-extension/subagents/plugin/statusline.py");
+    const runStatusLine = (payload: string, targetUsageFile = usageFile) => execFileSync("uv", ["run", "--no-project", "python", script], {
+      input: payload,
+      env: { ...process.env, PI_CLAUDE_USAGE_FILE: targetUsageFile },
+      timeout: 15_000,
+      windowsHide: true,
+    });
+
+    try {
+      registerName(artifactDir, "ClaudeWorker", {
+        sessionFile: join(directory, "not-a-pi-session.jsonl"),
+        sessionId: null,
+        usageFile,
+        running: true,
+      });
+      for (const cost of [0.05, 0.137]) {
+        runStatusLine(JSON.stringify({
+          session_id: "claude-live-1",
+          transcript_path: "must not be persisted",
+          cost: { total_cost_usd: cost },
+          current_usage: { input_tokens: 999 },
+        }));
+        const snapshot = readClaudeUsageSidecar(usageFile);
+        assert.equal(snapshot?.cost, cost);
+        assert.deepEqual([
+          snapshot?.inputTokens,
+          snapshot?.outputTokens,
+          snapshot?.cacheReadTokens,
+          snapshot?.cacheWriteTokens,
+        ], [null, null, null, null]);
+        const record = JSON.parse(readFileSync(usageFile, "utf8"));
+        assert.equal(record.source, "claude-code-statusline");
+        assert.equal("transcript_path" in record, false);
+        assert.equal("current_usage" in record, false);
+        const totals = collectSubagentUsage(artifactDir);
+        assert.equal(totals.cost, cost, "snapshots replace the previous cumulative amount");
+        assert.equal(totals.costAvailable, true);
+        assert.equal(totals.costComplete, true, "a known live estimate is currently complete");
+        assert.equal(totals.runningCount, 1);
+      }
+
+      for (const invalid of ["not json", JSON.stringify({ session_id: "s", cost: { total_cost_usd: -1 } }),
+        JSON.stringify({ session_id: "s", cost: { total_cost_usd: "0.2" } }),
+        JSON.stringify({ session_id: "s", cost: { total_cost_usd: null } }),
+        '{"session_id":"s","cost":{"total_cost_usd":NaN}}']) {
+        runStatusLine(invalid);
+        assert.equal(readClaudeUsageSidecar(usageFile)?.cost, 0.137, "bad input leaves the last valid snapshot intact");
+      }
+      // A filesystem failure is swallowed by the status-line helper and never
+      // becomes a failed child command or damages the prior valid snapshot.
+      runStatusLine(JSON.stringify({ session_id: "s", cost: { total_cost_usd: 0.5 } }), directory);
+      assert.equal(readClaudeUsageSidecar(usageFile)?.cost, 0.137);
+
+      const live = readClaudeUsageSidecar(usageFile)!;
+      assert.deepEqual(reconcileClaudeCostEstimates(live, null), live);
+      const finalFile = join(directory, "final.jsonl");
+      writeFileSync(finalFile, JSON.stringify({
+        type: "cost-state", sessionId: "claude-live-1", totalCostUSD: 0.2,
+        hasUnknownModelCost: false,
+        modelUsage: { model: { inputTokens: 12, outputTokens: 4, cacheReadInputTokens: 5, cacheCreationInputTokens: 3 } },
+      }));
+      const finalEstimate = readClaudeCostEstimate(finalFile)!;
+      const final = reconcileClaudeCostEstimates(live, finalEstimate)!;
+      assert.equal(final.cost, 0.2);
+      assert.equal(final.inputTokens, 12);
+      writeClaudeUsageSidecar(usageFile, final, "cost-state");
+      assert.equal(JSON.parse(readFileSync(usageFile, "utf8")).source, "claude-code-cost-state");
+      assert.equal(collectSubagentUsage(artifactDir).cost, 0.2);
+
+      const unknownFile = join(directory, "unknown-final.jsonl");
+      writeFileSync(unknownFile, JSON.stringify({
+        type: "cost-state", sessionId: "claude-live-1", totalCostUSD: 0.137,
+        hasUnknownModelCost: true,
+        modelUsage: { model: { inputTokens: 99, outputTokens: 7 } },
+      }));
+      const unknown = reconcileClaudeCostEstimates(live, readClaudeCostEstimate(unknownFile))!;
+      assert.equal(unknown.cost, null, "explicit unknown-model final cost must not inherit the live amount");
+      assert.equal(unknown.costAvailable, false);
+      assert.equal(unknown.inputTokens, 99);
+      writeClaudeUsageSidecar(usageFile, unknown, "cost-state");
+      assert.equal(JSON.parse(readFileSync(usageFile, "utf8")).source, "claude-code-cost-state");
+      assert.equal(collectSubagentUsage(artifactDir).costComplete, false);
+
+      const otherSessionFile = join(directory, "other-session.jsonl");
+      writeFileSync(otherSessionFile, JSON.stringify({
+        type: "cost-state", sessionId: "claude-live-2", totalCostUSD: 0.01,
+        hasUnknownModelCost: false, modelUsage: { model: { inputTokens: 2 } },
+      }));
+      const other = reconcileClaudeCostEstimates(live, readClaudeCostEstimate(otherSessionFile))!;
+      assert.equal(other.sessionId, "claude-live-2");
+      assert.equal(other.cost, 0.01);
+      assert.equal(other.inputTokens, 2, "do not merge tokens across different Claude sessions");
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("marks missing Claude cost unavailable and labels known child cost estimated", () => {
+    const directory = mkdtempSync(join(tmpdir(), "claude-cost-unknown-"));
+    const artifactDir = join(directory, "artifacts", "parent");
+    const usageFile = join(directory, "unknown.usage.json");
+    const sessionFile = join(directory, "unknown-session.jsonl");
+    try {
+      writeClaudeUsageSidecar(usageFile, null);
+      registerName(artifactDir, "UnknownClaude", { sessionFile, sessionId: null, usageFile, running: false });
+      assert.equal(collectSubagentUsage(artifactDir).costComplete, false);
+
+      const snapshot: UsageFooterSnapshot = {
+        cwd: "/project",
+        gitBranch: null,
+        model: "main-model",
+        effort: "medium",
+        contextWindow: 200_000,
+        contextPercent: 20,
+        inputTokens: 100,
+        outputTokens: 50,
+        mainCost: 0.3,
+        subagentCost: 0.125,
+        subagentCostEstimated: true,
+        showSubagentCost: true,
+        proactiveCompactionEnabled: false,
+        compactionCount: null,
+        proactiveStatus: null,
+        proactiveBoundaryPercent: null,
+        runDurationLabel: null,
+      };
+      const footer = formatUsageFooterLines(snapshot, 160, { fg: (_color, text) => text }, {
+        visibleWidth: (text) => text.length,
+        truncateToWidth: (text, width) => text.slice(0, width),
+      }).join("\n");
+      assert.match(footer, /~\$0\.425 \(main \$0\.300 \+ sub ~\$0\.125\)/);
+      assert.doesNotMatch(footer, /est\./);
+
+      const knownFooter = formatUsageFooterLines({ ...snapshot, subagentCostEstimated: false }, 160, { fg: (_color, text) => text }, {
+        visibleWidth: (text) => text.length,
+        truncateToWidth: (text, width) => text.slice(0, width),
+      }).join("\n");
+      assert.match(knownFooter, /\(main \$0\.300 \+ sub \$0\.125\)/);
+
+      const partialFooter = formatUsageFooterLines({ ...snapshot, mainCost: null }, 160, { fg: (_color, text) => text }, {
+        visibleWidth: (text) => text.length,
+        truncateToWidth: (text, width) => text.slice(0, width),
+      }).join("\n");
+      assert.match(partialFooter, /~\?\+~\$0\.125/);
+
+      const unknownFooter = formatUsageFooterLines({ ...snapshot, subagentCost: null, subagentCostEstimated: false }, 160, { fg: (_color, text) => text }, {
+        visibleWidth: (text) => text.length,
+        truncateToWidth: (text, width) => text.slice(0, width),
+      }).join("\n");
+      assert.match(unknownFooter, /\$0\.300\+\?/);
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("returns Claude results after parent steering in auto-exit sessions", () => {
+    const directory = mkdtempSync(join(tmpdir(), "claude-stop-hook-"));
+    const transcript = join(directory, "transcript.jsonl");
+    const sentinel = join(directory, "done");
+    const hook = resolve(dirname(fileURLToPath(import.meta.url)), "../pi-extension/subagents/plugin/hooks/on-stop.sh");
+    writeFileSync(transcript, [
+      JSON.stringify({ type: "user", message: { role: "user", content: "initial task" } }),
+      JSON.stringify({ type: "assistant", message: { role: "assistant", content: "working" } }),
+      JSON.stringify({ type: "user", message: { role: "user", content: "parent steering" } }),
+    ].join("\n"));
+
+    try {
+      execFileSync("bash", [hook], {
+        input: JSON.stringify({
+          stop_hook_active: false,
+          transcript_path: transcript,
+          last_assistant_message: "FINAL_RESULT",
+        }),
+        env: { ...process.env, PI_CLAUDE_SENTINEL: sentinel, PI_CLAUDE_AUTO_EXIT: "1" },
+        timeout: 10_000,
+        windowsHide: true,
+      });
+      assert.equal(readFileSync(sentinel, "utf8").trim(), "FINAL_RESULT");
+      assert.equal(readFileSync(`${sentinel}.transcript`, "utf8").trim(), transcript);
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("waits for Claude to start processing the initial prompt", () => {
+    assert.deepEqual(buildPromptAgentArgs("sub-cc-worker", "Do the task", true), [
+      "agent", "prompt", "sub-cc-worker", "Do the task",
+      "--wait", "--until", "working", "--timeout", "10000",
+    ]);
+  });
+
+  it("does not auto-finish an interactive Claude session after follow-up input", () => {
+    const directory = mkdtempSync(join(tmpdir(), "claude-stop-hook-interactive-"));
+    const transcript = join(directory, "transcript.jsonl");
+    const sentinel = join(directory, "done");
+    const hook = resolve(dirname(fileURLToPath(import.meta.url)), "../pi-extension/subagents/plugin/hooks/on-stop.sh");
+    writeFileSync(transcript, [
+      JSON.stringify({ type: "user", message: { role: "user", content: "initial task" } }),
+      JSON.stringify({ type: "user", message: { role: "user", content: "follow-up" } }),
+    ].join("\n"));
+
+    try {
+      execFileSync("bash", [hook], {
+        input: JSON.stringify({ stop_hook_active: false, transcript_path: transcript, last_assistant_message: "RESULT" }),
+        env: { ...process.env, PI_CLAUDE_SENTINEL: sentinel, PI_CLAUDE_AUTO_EXIT: "0" },
+        timeout: 10_000,
+        windowsHide: true,
+      });
+      assert.equal(existsSync(sentinel), false);
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("leaves a stalled initial prompt pane open and reports its identifiers", () => {
+    const testApi = (subagentsModule as any).__test__;
+    const closeCalls: Array<{ surface: string; tabId?: string }> = [];
+    assert.throws(
+      () => testApi.handleClaudeLaunchError(
+        new Error("agent_prompt_stalled: no working or blocked activity was observed"),
+        "sub-cc-worker",
+        "w2:pC",
+        "tab-3",
+        (surface: string, tabId?: string) => closeCalls.push({ surface, tabId }),
+      ),
+      /prompt did not start.*sub-cc-worker.*w2:pC.*left open/i,
+    );
+    assert.deepEqual(closeCalls, []);
+  });
+
+  it("leaves Claude startup-block panes open and reports their identifiers", () => {
+    const testApi = (subagentsModule as any).__test__;
+    const closeCalls: Array<{ surface: string; tabId?: string }> = [];
+    const blockedError = new Error(
+      "agent sub-cc-worker is blocked during startup and is not ready for prompts",
+    );
+
+    assert.throws(
+      () => testApi.handleClaudeLaunchError(
+        blockedError,
+        "sub-cc-worker",
+        "w2:pA",
+        "tab-1",
+        (surface: string, tabId?: string) => closeCalls.push({ surface, tabId }),
+      ),
+      /blocked during startup.*sub-cc-worker.*w2:pA.*left open/i,
+    );
+    assert.deepEqual(closeCalls, []);
+
+    const unrelatedError = new Error("Claude executable not found");
+    assert.throws(
+      () => testApi.handleClaudeLaunchError(
+        unrelatedError,
+        "sub-cc-worker",
+        "w2:pB",
+        "tab-2",
+        (surface: string, tabId?: string) => closeCalls.push({ surface, tabId }),
+      ),
+      /Claude executable not found/,
+    );
+    assert.deepEqual(closeCalls, [{ surface: "w2:pB", tabId: "tab-2" }]);
   });
 
   it("updates the task brief only after delivery and warns when persistence fails", () => {

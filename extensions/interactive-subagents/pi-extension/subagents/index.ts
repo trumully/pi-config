@@ -15,6 +15,12 @@ import {
 } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import {
+  readClaudeCostEstimate,
+  readClaudeUsageSidecar,
+  reconcileClaudeCostEstimates,
+  writeClaudeUsageSidecar,
+} from "./claude-usage.ts";
+import {
   isHerdrAvailable,
   herdrSetupHint,
   getHerdrIntegrationPath,
@@ -132,6 +138,7 @@ interface AgentDefaults {
   tools?: string;
   skills?: string;
   thinking?: string;
+  effort?: string;
   /**
    * If set (non-empty), this agent is granted the full subagent spawning
    * toolset and may only spawn the listed agents. Presence of this field -
@@ -331,6 +338,7 @@ function parseAgentDefinition(content: string, fallbackName: string): AgentDefin
           : undefined,
     skills: getFrontmatterValue(frontmatter, "skill") ?? getFrontmatterValue(frontmatter, "skills"),
     thinking: getFrontmatterValue(frontmatter, "thinking"),
+    effort: getFrontmatterValue(frontmatter, "effort"),
     subagentAgents: parseCommaList(getFrontmatterValue(frontmatter, "subagent_agents")),
     autoExit: parseOptionalBoolean(getFrontmatterValue(frontmatter, "auto-exit")),
     interactive: parseOptionalBoolean(getFrontmatterValue(frontmatter, "interactive")),
@@ -701,6 +709,9 @@ interface RunningSubagent {
   abortController?: AbortController;
   cli?: string;
   sentinelFile?: string;
+  askFile?: string;
+  pendingFile?: string;
+  usageFile?: string;
   statusState: SubagentStatusState;
   /**
    * When true, status transitions (stalled/recovered) do not wake the parent
@@ -1322,6 +1333,11 @@ export const __test__ = {
   resolveEffectiveInteractive,
   buildSubagentToolAllowlist,
   applySandboxToParts,
+  buildClaudeCliArgs,
+  buildClaudeLaunchEnv,
+  quoteClaudeShellPath,
+  writeClaudeSystemPromptFile,
+  handleClaudeLaunchError,
   buildPiPromptArgs,
   formatResumeTaskPrompt,
   formatWidgetRightLabel,
@@ -1336,6 +1352,7 @@ export const __test__ = {
   reservedNames,
   steerSubagent,
   handleSubagentSteer,
+  deliverPendingQuestion,
   resolveResultPresentation,
   sendSubagentResult,
   resolveResumeLaunchBehavior,
@@ -1350,6 +1367,53 @@ export const __test__ = {
   formatUsageSegments,
   widgetIcon,
 };
+
+function writeClaudeSystemPromptFile(artifactDir: string, id: string, systemPrompt: string): string {
+  const path = join(artifactDir, "context", `claude-${id}-system-prompt.md`);
+  mkdirSync(dirname(path), { recursive: true });
+  writeFileSync(path, systemPrompt, "utf8");
+  return path;
+}
+
+function buildClaudeLaunchEnv(sentinelFile: string, autoExit?: boolean): Record<string, string> {
+  return {
+    PI_CLAUDE_SENTINEL: sentinelFile,
+    PI_CLAUDE_AUTO_EXIT: autoExit ? "1" : "0",
+    PI_CLAUDE_ASK_FILE: `${sentinelFile}.ask`,
+    PI_CLAUDE_PENDING_FILE: `${sentinelFile}.pending`,
+    PI_CLAUDE_USAGE_FILE: `${sentinelFile}.usage.json`,
+  };
+}
+
+function quoteClaudeShellPath(path: string, platform: "win32" | "posix" = process.platform === "win32" ? "win32" : "posix"): string {
+  if (platform === "win32") {
+    return `"${path.replace(/\\/g, "/").replace(/"/g, '\\\"')}"`;
+  }
+  return `'${path.replace(/'/g, "'\\''")}'`;
+}
+
+function buildClaudeCliArgs(options: {
+  pluginDir?: string;
+  model?: string;
+  effort?: string;
+  systemPromptFile?: string;
+  usageFile?: string;
+  statuslineScript?: string;
+}): string[] {
+  const args = ["--permission-mode", "auto"];
+  if (options.pluginDir) {
+    args.push("--plugin-dir", options.pluginDir);
+    args.push("--allowedTools", "mcp__plugin_pi-auto-exit_pi__ask_question");
+  }
+  if (options.usageFile && options.statuslineScript) {
+    const command = `uv run --no-project python ${quoteClaudeShellPath(options.statuslineScript)}`;
+    args.push("--settings", JSON.stringify({ statusLine: { type: "command", command } }));
+  }
+  if (options.model) args.push("--model", options.model);
+  if (options.effort) args.push("--effort", options.effort);
+  if (options.systemPromptFile) args.push("--append-system-prompt-file", options.systemPromptFile);
+  return args;
+}
 
 function startWidgetRefresh() {
   if (widgetInterval) return;
@@ -1379,6 +1443,7 @@ async function launchSubagent(
 
   const agentDefs = params.agent ? loadAgentDefaults(params.agent) : null;
   const effectiveModel = params.model ?? agentDefs?.model;
+  const effectiveEffort = agentDefs?.effort;
   const effectiveTools = agentDefs?.tools;
   const effectiveSkills = agentDefs?.skills;
   const effectiveThinking = agentDefs?.thinking;
@@ -1439,25 +1504,30 @@ async function launchSubagent(
   if (agentDefs?.cli === "claude") {
     const sentinelFile = join(tmpdir(), `pi-claude-${id}-done`);
     const pluginDir = join(SUBAGENTS_DIR, "plugin");
-    const args = ["--dangerously-skip-permissions"];
-
-    if (existsSync(pluginDir)) args.push("--plugin-dir", pluginDir);
-    if (effectiveModel) args.push("--model", effectiveModel);
-    if (agentDefs.body) args.push("--append-system-prompt", agentDefs.body);
+    const systemPromptFile = agentDefs.body
+      ? writeClaudeSystemPromptFile(artifactDir, id, agentDefs.body)
+      : undefined;
+    const args = buildClaudeCliArgs({
+      pluginDir: existsSync(pluginDir) ? pluginDir : undefined,
+      model: effectiveModel,
+      effort: effectiveEffort,
+      systemPromptFile,
+      usageFile: `${sentinelFile}.usage.json`,
+      statuslineScript: join(pluginDir, "statusline.py"),
+    });
 
     const allocatedSurface = createSubagentSurface(params.name, {
       cwd: targetCwdForSession,
-      env: { PI_CLAUDE_SENTINEL: sentinelFile },
+      env: buildClaudeLaunchEnv(sentinelFile, agentDefs?.autoExit),
     });
     const { surface, tabId } = allocatedSurface;
     try {
       await startAgent(herdrAgentName, "claude", surface, args);
       // Start without a positional task so Herdr can return as soon as the
-      // agent is ready; submit work separately to retain fire-and-forget.
-      promptAgent(herdrAgentName, params.task);
+      // agent is ready; submit work separately and confirm it entered a turn.
+      promptAgent(herdrAgentName, params.task, { waitForWorking: true });
     } catch (error) {
-      closeSurfaceAndTab(surface, tabId);
-      throw error;
+      handleClaudeLaunchError(error, herdrAgentName, surface, tabId);
     }
 
     const running: RunningSubagent = {
@@ -1473,6 +1543,9 @@ async function launchSubagent(
       sessionFile: subagentSessionFile,
       cli: "claude",
       sentinelFile,
+      askFile: `${sentinelFile}.ask`,
+      pendingFile: `${sentinelFile}.pending`,
+      usageFile: `${sentinelFile}.usage.json`,
       interactive: effectiveInteractive,
       statusState: createStatusState({
         source: "claude",
@@ -1608,12 +1681,46 @@ function closeSurfaceAndTab(surface: string, tabId?: string): void {
   try { closeSurface(surface); } catch {}
 }
 
-function copyClaudeSession(sentinelFile: string): string | null {
+function handleClaudeLaunchError(
+  error: unknown,
+  agentName: string,
+  surface: string,
+  tabId?: string,
+  closeSurface: typeof closeSurfaceAndTab = closeSurfaceAndTab,
+): never {
+  const detail = error instanceof Error ? error.message : String(error);
+  if (/agent_prompt_stalled|prompt stalled/i.test(detail)) {
+    throw new Error(
+      `Claude Code prompt did not start: agent "${agentName}" in pane "${surface}" was left open for inspection. ` +
+        `Check its prompt before retrying. Herdr reported: ${detail}`,
+    );
+  }
+  if (/blocked during startup|not ready for prompts|agent_not_ready/i.test(detail)) {
+    throw new Error(
+      `Claude Code blocked during startup: agent "${agentName}" in pane "${surface}" was left open for inspection. ` +
+        `Resolve the startup prompt, then retry. Herdr reported: ${detail}`,
+    );
+  }
+
+  closeSurface(surface, tabId);
+  throw error;
+}
+
+function readClaudeTranscriptPath(sentinelFile: string): string | null {
   try {
     const transcriptFile = sentinelFile + ".transcript";
     if (!existsSync(transcriptFile)) return null;
     const transcriptPath = readFileSync(transcriptFile, "utf-8").trim();
-    if (!transcriptPath || !existsSync(transcriptPath)) return null;
+    return transcriptPath && existsSync(transcriptPath) ? transcriptPath : null;
+  } catch {
+    return null;
+  }
+}
+
+function copyClaudeSession(sentinelFile: string): string | null {
+  try {
+    const transcriptPath = readClaudeTranscriptPath(sentinelFile);
+    if (!transcriptPath) return null;
     mkdirSync(CLAUDE_SESSIONS_DIR, { recursive: true });
     const filename = basename(transcriptPath) || `claude-${Date.now()}.jsonl`;
     const dest = join(CLAUDE_SESSIONS_DIR, filename);
@@ -1632,7 +1739,7 @@ function copyClaudeSession(sentinelFile: string): string | null {
  * delivery so it fires once per question (a subagent may ask again later).
  */
 function deliverPendingQuestion(running: RunningSubagent): void {
-  const askFile = `${running.sessionFile}.ask`;
+  const askFile = running.askFile ?? `${running.sessionFile}.ask`;
   let payload: any = null;
   try {
     if (!existsSync(askFile)) return;
@@ -1643,7 +1750,10 @@ function deliverPendingQuestion(running: RunningSubagent): void {
   try {
     unlinkSync(askFile);
   } catch {}
-  if (!payload?.question) return;
+  if (typeof payload?.question !== "string" || !payload.question.trim()) {
+    if (running.pendingFile) try { unlinkSync(running.pendingFile); } catch {}
+    return;
+  }
 
   const name = running.name; // unique per session (deduped at spawn) - targets the reply
   const sessionId = existsSync(running.sessionFile) ? getSessionId(running.sessionFile) : null;
@@ -1707,15 +1817,36 @@ async function watchSubagent(
           : "Claude Code exited without output";
       }
 
-      // Copy Claude session transcript
+      // Close Claude first so its final cost-state has a chance to reach the
+      // transcript before we create the footer sidecar or copy the transcript.
+      closeSurfaceAndTab(surface, running.herdrTabId);
+
       let sessionId: string | null = null;
       if (running.sentinelFile) {
+        if (running.usageFile) {
+          try {
+            const transcriptPath = readClaudeTranscriptPath(running.sentinelFile);
+            const liveEstimate = readClaudeUsageSidecar(running.usageFile);
+            const finalEstimate = readClaudeCostEstimate(transcriptPath);
+            const estimate = reconcileClaudeCostEstimates(liveEstimate, finalEstimate);
+            const source = finalEstimate?.costAvailable || finalEstimate?.costExplicitlyUnknown
+              ? "cost-state"
+              : liveEstimate?.costAvailable
+                ? "statusline"
+                : "cost-state";
+            writeClaudeUsageSidecar(running.usageFile, estimate, source);
+          } catch (error) {
+            console.error(`[interactive-subagents] Could not record Claude usage estimate for "${name}": ${error instanceof Error ? error.message : String(error)}`);
+          }
+        }
         sessionId = copyClaudeSession(running.sentinelFile);
         try { unlinkSync(running.sentinelFile); } catch {}
         try { unlinkSync(running.sentinelFile + ".transcript"); } catch {}
+        for (const sidecar of [running.askFile, running.pendingFile]) {
+          if (sidecar) try { unlinkSync(sidecar); } catch {}
+        }
       }
 
-      closeSurfaceAndTab(surface, running.herdrTabId);
       runningSubagents.delete(running.id);
 
       return { name, task: running.task, summary, exitCode: result.exitCode, elapsed, ...(sessionId ? { claudeSessionId: sessionId } : {}) };
@@ -2002,6 +2133,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
             sessionFile: running.sessionFile,
             sessionId: getSessionId(running.sessionFile),
             ...(running.activityFile ? { activityFile: running.activityFile } : {}),
+            ...(running.usageFile ? { usageFile: running.usageFile } : {}),
             running: true,
             runId: running.id,
             taskBrief: running.task,

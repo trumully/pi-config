@@ -1,6 +1,7 @@
 import { existsSync, readdirSync, statSync } from "node:fs";
 import { basename, dirname, join, resolve } from "node:path";
 import { readSubagentActivityFile } from "./activity.ts";
+import { readClaudeUsageSidecar } from "./claude-usage.ts";
 import {
   getInheritedSessionEntryIds,
   getSessionId,
@@ -17,7 +18,12 @@ export interface SubagentUsageTotals {
   cacheReadTokens: number;
   cacheWriteTokens: number;
   cost: number;
+  /** At least one child contributed a known cost. */
   costAvailable: boolean;
+  /** Every registered child currently has a known cost; live Claude snapshots count. */
+  costComplete: boolean;
+  /** Known costs include Claude Code list-price estimates. */
+  costEstimated: boolean;
 }
 
 interface CachedSessionStats {
@@ -95,6 +101,8 @@ export function collectSubagentUsage(rootArtifactDir: string): SubagentUsageTota
     cacheWriteTokens: 0,
     cost: 0,
     costAvailable: false,
+    costComplete: true,
+    costEstimated: false,
   };
   const visited = new Set<string>();
   const visitedArtifactDirs = new Set<string>();
@@ -109,7 +117,7 @@ export function collectSubagentUsage(rootArtifactDir: string): SubagentUsageTota
       if (!child || typeof child.sessionFile !== "string") continue;
       const sessionFile = resolve(child.sessionFile);
       const key = cacheKey(sessionFile);
-      if (visited.has(key) || !existsSync(sessionFile)) continue;
+      if (visited.has(key)) continue;
       visited.add(key);
       totals.sessionCount += 1;
 
@@ -120,21 +128,47 @@ export function collectSubagentUsage(rootArtifactDir: string): SubagentUsageTota
         activityRunning = activityIsRunning(activityFile);
       }
       // The spawner's registry is updated when its watcher observes process exit,
-      // so an explicit running flag is authoritative. Activity snapshots can be
-      // left stale (for example, if a child exits before its final snapshot).
+      // so an explicit running flag is authoritative because activity snapshots
+      // can lag shutdown.
       if (child.running ?? activityRunning ?? false) totals.runningCount += 1;
 
-      const stats = readCachedStats(sessionFile);
-      if (stats) {
-        totals.inputTokens += stats.inputTokens;
-        totals.outputTokens += stats.outputTokens;
-        totals.cacheReadTokens += stats.cacheReadTokens;
-        totals.cacheWriteTokens += stats.cacheWriteTokens;
-        totals.cost += stats.cost;
-        totals.costAvailable ||= stats.costAvailable;
+      if (typeof child.usageFile === "string") {
+        const usage = readClaudeUsageSidecar(resolve(child.usageFile));
+        if (usage) {
+          totals.inputTokens += usage.inputTokens ?? 0;
+          totals.outputTokens += usage.outputTokens ?? 0;
+          totals.cacheReadTokens += usage.cacheReadTokens ?? 0;
+          totals.cacheWriteTokens += usage.cacheWriteTokens ?? 0;
+          if (usage.costAvailable && usage.cost !== null) {
+            totals.cost += usage.cost;
+            totals.costAvailable = true;
+            totals.costEstimated ||= usage.estimated;
+          } else {
+            totals.costComplete = false;
+          }
+        } else {
+          totals.costComplete = false;
+        }
+      } else if (existsSync(sessionFile)) {
+        const stats = readCachedStats(sessionFile);
+        if (stats) {
+          totals.inputTokens += stats.inputTokens;
+          totals.outputTokens += stats.outputTokens;
+          totals.cacheReadTokens += stats.cacheReadTokens;
+          totals.cacheWriteTokens += stats.cacheWriteTokens;
+          totals.cost += stats.cost;
+          totals.costAvailable ||= stats.costAvailable;
+          if (!stats.costAvailable) totals.costComplete = false;
+        } else {
+          totals.costComplete = false;
+        }
+      } else {
+        // A registered child without a transcript or usage sidecar has unknown
+        // cost, including while it is still running.
+        totals.costComplete = false;
       }
 
-      const sessionId = child.sessionId ?? getSessionId(sessionFile);
+      const sessionId = child.sessionId ?? (existsSync(sessionFile) ? getSessionId(sessionFile) : null);
       if (sessionId) {
         visit(join(dirname(sessionFile), "artifacts", sessionId));
       }

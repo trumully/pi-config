@@ -301,10 +301,20 @@ export async function startAgent(
   parseResponse(stdout, "agent start");
 }
 
-/** Submit a single prompt atomically to a recognized Herdr agent. */
-export function promptAgent(target: string, prompt: string): void {
+export function buildPromptAgentArgs(target: string, prompt: string, waitForWorking = false): string[] {
+  const args = ["agent", "prompt", target, prompt];
+  if (waitForWorking) args.push("--wait", "--until", "working", "--timeout", "10000");
+  return args;
+}
+
+/** Submit a prompt, optionally waiting until Herdr observes the agent start its turn. */
+export function promptAgent(
+  target: string,
+  prompt: string,
+  options: { waitForWorking?: boolean } = {},
+): void {
   requireHerdr();
-  runHerdrSync(["agent", "prompt", target, prompt]);
+  runHerdrSync(buildPromptAgentArgs(target, prompt, options.waitForWorking));
 }
 
 /** Run a normal shell command in a pane (used by surface-level tests). */

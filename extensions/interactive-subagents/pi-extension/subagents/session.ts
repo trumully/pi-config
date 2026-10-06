@@ -156,6 +156,8 @@ export interface NameRegistryEntry {
   sessionId: string | null;
   /** Activity snapshot path for Pi children; absent for older records and Claude CLI children. */
   activityFile?: string;
+  /** Final usage sidecar path for Claude CLI children. */
+  usageFile?: string;
   /** Spawner-observed process state; authoritative when present because activity snapshots can lag shutdown. */
   running?: boolean;
   /** Identity of the specific spawn/resume run; absent in older registry records. */
