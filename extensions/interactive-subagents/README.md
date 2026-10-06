@@ -49,6 +49,10 @@ Instructions for this agent.
 
 `tools` is an allowlist. `subagent_agents` grants spawning access and limits which profiles can be spawned; omit it to prevent spawning. Other profile options include `cwd`, `thinking`, `skills`, `session-mode`, `system-prompt`, `auto-exit`, and `interactive`.
 
+For a Claude Code profile, set `cli: claude`. Its `model` and optional `effort` fields are passed to Claude Code as `--model` and `--effort`; `thinking` applies to Pi profiles, not Claude Code. Claude Code documents effort values `low`, `medium`, `high`, `xhigh`, `max`, and `ultracode` (availability depends on the model; `ultracode` requires Claude Code v2.1.203 or later). See the [Claude Code CLI reference](https://code.claude.com/docs/en/cli-reference).
+
+Claude Code children can receive `subagent_message` steers and return results. The bundled plugin also exposes `mcp__plugin_pi-auto-exit_pi__ask_question`, a freeform child-to-parent question bridge. It uses per-run sidecars and keeps the child open until the parent replies. The launch explicitly allows only this MCP tool; other actions still use Claude's `auto` permission mode. The plugin requires `uv` on `PATH`. Claude Code launches use `--permission-mode auto` rather than bypassing permission prompts; availability depends on Claude Code's account, model, and organization settings.
+
 ## Configuration
 
 Copy `config.json.example` to `config.json` in this extension directory. It is gitignored. The supported options are:

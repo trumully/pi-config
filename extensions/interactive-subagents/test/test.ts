@@ -1,11 +1,13 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { execFileSync } from "node:child_process";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { convertToLlm } from "@earendil-works/pi-coding-agent";
 import * as subagentsModule from "../pi-extension/subagents/index.ts";
+import { buildPromptAgentArgs } from "../pi-extension/subagents/herdr.ts";
 import { finishRegisteredRun, readNameRegistry, registerName } from "../pi-extension/subagents/session.ts";
 import {
   createSubagentActivityRecorder,
@@ -230,6 +232,269 @@ describe("interactive subagents smoke tests", () => {
     }
     const worker = readFileSync(join(root, "extensions/interactive-subagents/agents/worker.md"), "utf8");
     assert.match(worker, /^tools:.*\btodo\b/m);
+  });
+
+  it("passes Claude auto-exit behavior to the stop hook", () => {
+    const testApi = (subagentsModule as any).__test__;
+    assert.deepEqual(testApi.buildClaudeLaunchEnv("/tmp/claude-done", true), {
+      PI_CLAUDE_SENTINEL: "/tmp/claude-done",
+      PI_CLAUDE_AUTO_EXIT: "1",
+      PI_CLAUDE_ASK_FILE: "/tmp/claude-done.ask",
+      PI_CLAUDE_PENDING_FILE: "/tmp/claude-done.pending",
+    });
+    assert.deepEqual(testApi.buildClaudeLaunchEnv("/tmp/claude-done", false), {
+      PI_CLAUDE_SENTINEL: "/tmp/claude-done",
+      PI_CLAUDE_AUTO_EXIT: "0",
+      PI_CLAUDE_ASK_FILE: "/tmp/claude-done.ask",
+      PI_CLAUDE_PENDING_FILE: "/tmp/claude-done.pending",
+    });
+  });
+
+  it("forwards a Claude profile's effort to Claude Code launch arguments", () => {
+    const testApi = (subagentsModule as any).__test__;
+    const directory = mkdtempSync(join(tmpdir(), "claude-agent-profile-"));
+    const agentsDirectory = join(directory, "agents");
+    mkdirSync(agentsDirectory);
+    writeFileSync(join(agentsDirectory, "cc-worker.md"), [
+      "---",
+      "name: cc-worker",
+      "cli: claude",
+      "model: claude-opus-5-5",
+      "effort: high",
+      "---",
+      "Worker instructions.",
+    ].join("\n"));
+
+    const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
+    process.env.PI_CODING_AGENT_DIR = directory;
+    try {
+      const profile = testApi.loadAgentDefaults("cc-worker");
+      assert.ok(profile);
+      assert.equal(profile.effort, "high");
+      const systemPromptFile = testApi.writeClaudeSystemPromptFile(directory, "test-run", profile.body);
+      assert.equal(readFileSync(systemPromptFile, "utf8"), "Worker instructions.");
+      assert.deepEqual(testApi.buildClaudeCliArgs({
+        pluginDir: "/claude-plugin",
+        model: profile.model,
+        effort: profile.effort,
+        systemPromptFile,
+      }), [
+        "--permission-mode", "auto",
+        "--plugin-dir", "/claude-plugin",
+        "--allowedTools", "mcp__plugin_pi-auto-exit_pi__ask_question",
+        "--model", "claude-opus-5-5",
+        "--effort", "high",
+        "--append-system-prompt-file", systemPromptFile,
+      ]);
+    } finally {
+      if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+      else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("exposes the Claude ask_question MCP tool and writes an atomic question signal", () => {
+    const directory = mkdtempSync(join(tmpdir(), "claude-ask-mcp-"));
+    const askFile = join(directory, "question.ask");
+    const pendingFile = join(directory, "question.pending");
+    const server = resolve(dirname(fileURLToPath(import.meta.url)), "../pi-extension/subagents/plugin/mcp/ask_question.py");
+    const requests = [
+      { jsonrpc: "2.0", id: 1, method: "initialize", params: { protocolVersion: "2025-11-25", capabilities: {}, clientInfo: { name: "test", version: "1" } } },
+      { jsonrpc: "2.0", method: "notifications/initialized" },
+      { jsonrpc: "2.0", id: 2, method: "tools/list" },
+      { jsonrpc: "2.0", id: 3, method: "tools/call", params: { name: "ask_question", arguments: { question: "Which option should I use?" } } },
+    ];
+    try {
+      const output = execFileSync("uv", ["run", "--no-project", "python", server], {
+        input: requests.map((request) => JSON.stringify(request)).join("\n") + "\n",
+        env: { ...process.env, PI_CLAUDE_ASK_FILE: askFile, PI_CLAUDE_PENDING_FILE: pendingFile },
+        timeout: 15_000,
+        windowsHide: true,
+      });
+      const responses = output.toString("utf8").trim().split(/\r?\n/).map((line) => JSON.parse(line));
+      assert.equal(responses[0].result.protocolVersion, "2025-11-25");
+      assert.equal(responses[1].result.tools[0].name, "ask_question");
+      assert.match(responses[2].result.content[0].text, /sent to the Pi orchestrator/i);
+      assert.equal(JSON.parse(readFileSync(askFile, "utf8")).question, "Which option should I use?");
+      assert.equal(existsSync(pendingFile), true);
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("delivers Claude question sidecars through the parent watcher", () => {
+    const harness = registerSubagents();
+    const directory = mkdtempSync(join(tmpdir(), "claude-ask-watcher-"));
+    const askFile = join(directory, "question.ask");
+    writeFileSync(askFile, JSON.stringify({ id: "q1", question: "Need a decision?" }));
+    try {
+      const testApi = (subagentsModule as any).__test__;
+      testApi.deliverPendingQuestion({
+        name: "ClaudeWorker",
+        agent: "cc-worker",
+        startTime: Date.now() - 1000,
+        sessionFile: join(directory, "nonexistent-pi-session.jsonl"),
+        askFile,
+      });
+      assert.equal(existsSync(askFile), false);
+      assert.equal(harness.sentMessages.length, 1);
+      assert.match(harness.sentMessages[0].message.content, /Need a decision\?/);
+      assert.equal(harness.sentMessages[0].options?.triggerTurn, true);
+      assert.equal(harness.sentMessages[0].options?.deliverAs, "steer");
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("keeps an auto-exit Claude worker open while its question is pending", () => {
+    const directory = mkdtempSync(join(tmpdir(), "claude-question-pending-"));
+    const transcript = join(directory, "transcript.jsonl");
+    const sentinel = join(directory, "done");
+    const pending = `${sentinel}.pending`;
+    const hook = resolve(dirname(fileURLToPath(import.meta.url)), "../pi-extension/subagents/plugin/hooks/on-stop.sh");
+    writeFileSync(transcript, [
+      JSON.stringify({ type: "user", message: { role: "user", content: "initial task" } }),
+      JSON.stringify({ type: "user", message: { role: "user", content: "parent reply" } }),
+    ].join("\n"));
+    writeFileSync(pending, "q1");
+    try {
+      execFileSync("bash", [hook], {
+        input: JSON.stringify({ stop_hook_active: false, transcript_path: transcript, last_assistant_message: "WAITING" }),
+        env: { ...process.env, PI_CLAUDE_SENTINEL: sentinel, PI_CLAUDE_AUTO_EXIT: "1", PI_CLAUDE_PENDING_FILE: pending },
+        timeout: 10_000,
+        windowsHide: true,
+      });
+      assert.equal(existsSync(sentinel), false);
+      assert.equal(existsSync(`${sentinel}.transcript`), true);
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("clears the question-pending marker when Claude receives the parent's reply", () => {
+    const directory = mkdtempSync(join(tmpdir(), "claude-question-reply-"));
+    const pending = join(directory, "done.pending");
+    const hook = resolve(dirname(fileURLToPath(import.meta.url)), "../pi-extension/subagents/plugin/hooks/on-user-prompt.py");
+    writeFileSync(pending, "q1");
+    try {
+      execFileSync("uv", ["run", "--no-project", "python", hook], {
+        input: JSON.stringify({ prompt: "The user decision" }),
+        env: { ...process.env, PI_CLAUDE_PENDING_FILE: pending },
+        timeout: 10_000,
+        windowsHide: true,
+      });
+      assert.equal(existsSync(pending), false);
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("returns Claude results after parent steering in auto-exit sessions", () => {
+    const directory = mkdtempSync(join(tmpdir(), "claude-stop-hook-"));
+    const transcript = join(directory, "transcript.jsonl");
+    const sentinel = join(directory, "done");
+    const hook = resolve(dirname(fileURLToPath(import.meta.url)), "../pi-extension/subagents/plugin/hooks/on-stop.sh");
+    writeFileSync(transcript, [
+      JSON.stringify({ type: "user", message: { role: "user", content: "initial task" } }),
+      JSON.stringify({ type: "assistant", message: { role: "assistant", content: "working" } }),
+      JSON.stringify({ type: "user", message: { role: "user", content: "parent steering" } }),
+    ].join("\n"));
+
+    try {
+      execFileSync("bash", [hook], {
+        input: JSON.stringify({
+          stop_hook_active: false,
+          transcript_path: transcript,
+          last_assistant_message: "FINAL_RESULT",
+        }),
+        env: { ...process.env, PI_CLAUDE_SENTINEL: sentinel, PI_CLAUDE_AUTO_EXIT: "1" },
+        timeout: 10_000,
+        windowsHide: true,
+      });
+      assert.equal(readFileSync(sentinel, "utf8").trim(), "FINAL_RESULT");
+      assert.equal(readFileSync(`${sentinel}.transcript`, "utf8").trim(), transcript);
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("waits for Claude to start processing the initial prompt", () => {
+    assert.deepEqual(buildPromptAgentArgs("sub-cc-worker", "Do the task", true), [
+      "agent", "prompt", "sub-cc-worker", "Do the task",
+      "--wait", "--until", "working", "--timeout", "10000",
+    ]);
+  });
+
+  it("does not auto-finish an interactive Claude session after follow-up input", () => {
+    const directory = mkdtempSync(join(tmpdir(), "claude-stop-hook-interactive-"));
+    const transcript = join(directory, "transcript.jsonl");
+    const sentinel = join(directory, "done");
+    const hook = resolve(dirname(fileURLToPath(import.meta.url)), "../pi-extension/subagents/plugin/hooks/on-stop.sh");
+    writeFileSync(transcript, [
+      JSON.stringify({ type: "user", message: { role: "user", content: "initial task" } }),
+      JSON.stringify({ type: "user", message: { role: "user", content: "follow-up" } }),
+    ].join("\n"));
+
+    try {
+      execFileSync("bash", [hook], {
+        input: JSON.stringify({ stop_hook_active: false, transcript_path: transcript, last_assistant_message: "RESULT" }),
+        env: { ...process.env, PI_CLAUDE_SENTINEL: sentinel, PI_CLAUDE_AUTO_EXIT: "0" },
+        timeout: 10_000,
+        windowsHide: true,
+      });
+      assert.equal(existsSync(sentinel), false);
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("leaves a stalled initial prompt pane open and reports its identifiers", () => {
+    const testApi = (subagentsModule as any).__test__;
+    const closeCalls: Array<{ surface: string; tabId?: string }> = [];
+    assert.throws(
+      () => testApi.handleClaudeLaunchError(
+        new Error("agent_prompt_stalled: no working or blocked activity was observed"),
+        "sub-cc-worker",
+        "w2:pC",
+        "tab-3",
+        (surface: string, tabId?: string) => closeCalls.push({ surface, tabId }),
+      ),
+      /prompt did not start.*sub-cc-worker.*w2:pC.*left open/i,
+    );
+    assert.deepEqual(closeCalls, []);
+  });
+
+  it("leaves Claude startup-block panes open and reports their identifiers", () => {
+    const testApi = (subagentsModule as any).__test__;
+    const closeCalls: Array<{ surface: string; tabId?: string }> = [];
+    const blockedError = new Error(
+      "agent sub-cc-worker is blocked during startup and is not ready for prompts",
+    );
+
+    assert.throws(
+      () => testApi.handleClaudeLaunchError(
+        blockedError,
+        "sub-cc-worker",
+        "w2:pA",
+        "tab-1",
+        (surface: string, tabId?: string) => closeCalls.push({ surface, tabId }),
+      ),
+      /blocked during startup.*sub-cc-worker.*w2:pA.*left open/i,
+    );
+    assert.deepEqual(closeCalls, []);
+
+    const unrelatedError = new Error("Claude executable not found");
+    assert.throws(
+      () => testApi.handleClaudeLaunchError(
+        unrelatedError,
+        "sub-cc-worker",
+        "w2:pB",
+        "tab-2",
+        (surface: string, tabId?: string) => closeCalls.push({ surface, tabId }),
+      ),
+      /Claude executable not found/,
+    );
+    assert.deepEqual(closeCalls, [{ surface: "w2:pB", tabId: "tab-2" }]);
   });
 
   it("updates the task brief only after delivery and warns when persistence fails", () => {
