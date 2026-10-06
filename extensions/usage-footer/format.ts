@@ -164,12 +164,13 @@ export function formatUsageFooterLines(
 
   let cost: string | null = null;
   let split: string | null = null;
+  const estimatePrefix = snapshot.subagentCostEstimated ? "~" : "";
   if (snapshot.showSubagentCost) {
     if (snapshot.mainCost !== null && snapshot.subagentCost !== null) {
       cost = `~${formatCost(snapshot.mainCost + snapshot.subagentCost)}`;
-      split = `main ${formatCost(snapshot.mainCost)} + sub ${formatCost(snapshot.subagentCost)}`;
+      split = `main ${formatCost(snapshot.mainCost)} + sub ${estimatePrefix}${formatCost(snapshot.subagentCost)}`;
     } else if (snapshot.mainCost !== null) cost = `~${formatCost(snapshot.mainCost)}+?`;
-    else if (snapshot.subagentCost !== null) cost = `~?+${formatCost(snapshot.subagentCost)}`;
+    else if (snapshot.subagentCost !== null) cost = `~?+${estimatePrefix}${formatCost(snapshot.subagentCost)}`;
     else cost = "~?";
   } else if (snapshot.mainCost !== null) cost = `~${formatCost(snapshot.mainCost)}`;
   else cost = "~?";

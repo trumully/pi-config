@@ -16,6 +16,7 @@ import {
   reconcileClaudeCostEstimates,
   writeClaudeUsageSidecar,
 } from "../pi-extension/subagents/claude-usage.ts";
+import { formatUsageFooterLines, type UsageFooterSnapshot } from "../../usage-footer/format.ts";
 import {
   createSubagentActivityRecorder,
   progressIndicators,
@@ -586,7 +587,7 @@ describe("interactive subagents smoke tests", () => {
     }
   });
 
-  it("marks missing Claude cost unavailable", () => {
+  it("marks missing Claude cost unavailable and labels known child cost estimated", () => {
     const directory = mkdtempSync(join(tmpdir(), "claude-cost-unknown-"));
     const artifactDir = join(directory, "artifacts", "parent");
     const usageFile = join(directory, "unknown.usage.json");
@@ -596,6 +597,49 @@ describe("interactive subagents smoke tests", () => {
       registerName(artifactDir, "UnknownClaude", { sessionFile, sessionId: null, usageFile, running: false });
       assert.equal(collectSubagentUsage(artifactDir).costComplete, false);
 
+      const snapshot: UsageFooterSnapshot = {
+        cwd: "/project",
+        gitBranch: null,
+        model: "main-model",
+        effort: "medium",
+        contextWindow: 200_000,
+        contextPercent: 20,
+        inputTokens: 100,
+        outputTokens: 50,
+        mainCost: 0.3,
+        subagentCost: 0.125,
+        subagentCostEstimated: true,
+        showSubagentCost: true,
+        proactiveCompactionEnabled: false,
+        compactionCount: null,
+        proactiveStatus: null,
+        proactiveBoundaryPercent: null,
+        runDurationLabel: null,
+      };
+      const footer = formatUsageFooterLines(snapshot, 160, { fg: (_color, text) => text }, {
+        visibleWidth: (text) => text.length,
+        truncateToWidth: (text, width) => text.slice(0, width),
+      }).join("\n");
+      assert.match(footer, /~\$0\.425 \(main \$0\.300 \+ sub ~\$0\.125\)/);
+      assert.doesNotMatch(footer, /est\./);
+
+      const knownFooter = formatUsageFooterLines({ ...snapshot, subagentCostEstimated: false }, 160, { fg: (_color, text) => text }, {
+        visibleWidth: (text) => text.length,
+        truncateToWidth: (text, width) => text.slice(0, width),
+      }).join("\n");
+      assert.match(knownFooter, /\(main \$0\.300 \+ sub \$0\.125\)/);
+
+      const partialFooter = formatUsageFooterLines({ ...snapshot, mainCost: null }, 160, { fg: (_color, text) => text }, {
+        visibleWidth: (text) => text.length,
+        truncateToWidth: (text, width) => text.slice(0, width),
+      }).join("\n");
+      assert.match(partialFooter, /~\?\+~\$0\.125/);
+
+      const unknownFooter = formatUsageFooterLines({ ...snapshot, subagentCost: null, subagentCostEstimated: false }, 160, { fg: (_color, text) => text }, {
+        visibleWidth: (text) => text.length,
+        truncateToWidth: (text, width) => text.slice(0, width),
+      }).join("\n");
+      assert.match(unknownFooter, /\$0\.300\+\?/);
     } finally {
       rmSync(directory, { recursive: true, force: true });
     }
