@@ -9,6 +9,13 @@ import { convertToLlm } from "@earendil-works/pi-coding-agent";
 import * as subagentsModule from "../pi-extension/subagents/index.ts";
 import { buildPromptAgentArgs } from "../pi-extension/subagents/herdr.ts";
 import { finishRegisteredRun, readNameRegistry, registerName } from "../pi-extension/subagents/session.ts";
+import { collectSubagentUsage } from "../pi-extension/subagents/usage.ts";
+import {
+  readClaudeCostEstimate,
+  readClaudeUsageSidecar,
+  reconcileClaudeCostEstimates,
+  writeClaudeUsageSidecar,
+} from "../pi-extension/subagents/claude-usage.ts";
 import {
   createSubagentActivityRecorder,
   progressIndicators,
@@ -241,12 +248,14 @@ describe("interactive subagents smoke tests", () => {
       PI_CLAUDE_AUTO_EXIT: "1",
       PI_CLAUDE_ASK_FILE: "/tmp/claude-done.ask",
       PI_CLAUDE_PENDING_FILE: "/tmp/claude-done.pending",
+      PI_CLAUDE_USAGE_FILE: "/tmp/claude-done.usage.json",
     });
     assert.deepEqual(testApi.buildClaudeLaunchEnv("/tmp/claude-done", false), {
       PI_CLAUDE_SENTINEL: "/tmp/claude-done",
       PI_CLAUDE_AUTO_EXIT: "0",
       PI_CLAUDE_ASK_FILE: "/tmp/claude-done.ask",
       PI_CLAUDE_PENDING_FILE: "/tmp/claude-done.pending",
+      PI_CLAUDE_USAGE_FILE: "/tmp/claude-done.usage.json",
     });
   });
 
@@ -278,14 +287,28 @@ describe("interactive subagents smoke tests", () => {
         model: profile.model,
         effort: profile.effort,
         systemPromptFile,
+        usageFile: "C:\\Users\\Example\\AppData\\Local\\Temp\\done.usage.json",
+        statuslineScript: "C:\\Program Files\\pi-config\\statusline.py",
       }), [
         "--permission-mode", "auto",
         "--plugin-dir", "/claude-plugin",
         "--allowedTools", "mcp__plugin_pi-auto-exit_pi__ask_question",
+        "--settings", JSON.stringify({ statusLine: {
+          type: "command",
+          command: `uv run --no-project python ${testApi.quoteClaudeShellPath("C:\\Program Files\\pi-config\\statusline.py", process.platform === "win32" ? "win32" : "posix")}`,
+        } }),
         "--model", "claude-opus-5-5",
         "--effort", "high",
         "--append-system-prompt-file", systemPromptFile,
       ]);
+      assert.equal(
+        testApi.quoteClaudeShellPath("C:\\Users\\Example\\Claude Tools\\statusline.py", "win32"),
+        '"C:/Users/Example/Claude Tools/statusline.py"',
+      );
+      assert.equal(
+        testApi.quoteClaudeShellPath("/tmp/Claude Tools/o'hare.py", "posix"),
+        "'/tmp/Claude Tools/o'\\''hare.py'",
+      );
     } finally {
       if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
       else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
@@ -384,6 +407,195 @@ describe("interactive subagents smoke tests", () => {
         windowsHide: true,
       });
       assert.equal(existsSync(pending), false);
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("parses Claude cost-state as an estimate and aggregates its sidecar", () => {
+    const directory = mkdtempSync(join(tmpdir(), "claude-cost-state-"));
+    const transcript = join(directory, "transcript.jsonl");
+    const usageFile = join(directory, "child.usage.json");
+    const artifactDir = join(directory, "artifacts", "parent");
+    writeFileSync(transcript, [
+      JSON.stringify({ type: "user", message: { content: "private task text" } }),
+      JSON.stringify({
+        type: "cost-state",
+        sessionId: "claude-session-1",
+        totalCostUSD: 0.1234,
+        hasUnknownModelCost: false,
+        modelUsage: {
+          "model-a": { inputTokens: 10, outputTokens: 4, cacheReadInputTokens: 2, cacheCreationInputTokens: 3 },
+          "model-b": { inputTokens: 6, outputTokens: 5, cacheReadInputTokens: 1, cacheCreationInputTokens: 2 },
+        },
+      }),
+    ].join("\n"));
+    try {
+      const estimate = readClaudeCostEstimate(transcript);
+      assert.deepEqual(estimate, {
+        estimated: true,
+        cost: 0.1234,
+        costAvailable: true,
+        inputTokens: 16,
+        outputTokens: 9,
+        cacheReadTokens: 3,
+        cacheWriteTokens: 5,
+        sessionId: "claude-session-1",
+      });
+      writeClaudeUsageSidecar(usageFile, estimate);
+      registerName(artifactDir, "ClaudeWorker", {
+        sessionFile: join(directory, "not-a-pi-session.jsonl"),
+        sessionId: null,
+        usageFile,
+        running: false,
+      });
+      assert.deepEqual(collectSubagentUsage(artifactDir), {
+        sessionCount: 1,
+        runningCount: 0,
+        inputTokens: 16,
+        outputTokens: 9,
+        cacheReadTokens: 3,
+        cacheWriteTokens: 5,
+        cost: 0.1234,
+        costAvailable: true,
+        costComplete: true,
+        costEstimated: true,
+      });
+
+      const partialTranscript = join(directory, "partial.jsonl");
+      writeFileSync(partialTranscript, JSON.stringify({
+        type: "cost-state",
+        totalCostUSD: 0.05,
+        hasUnknownModelCost: true,
+        modelUsage: { "unknown-model": { inputTokens: 2, outputTokens: 1 } },
+      }));
+      assert.deepEqual(readClaudeCostEstimate(partialTranscript), {
+        estimated: true,
+        cost: null,
+        costAvailable: false,
+        inputTokens: 2,
+        outputTokens: 1,
+        cacheReadTokens: null,
+        cacheWriteTokens: null,
+        sessionId: null,
+        costExplicitlyUnknown: true,
+      });
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("updates the footer from status-line snapshots and reconciles final Claude cost", () => {
+    const directory = mkdtempSync(join(tmpdir(), "claude-live-cost-"));
+    const usageFile = join(directory, "child.usage.json");
+    const artifactDir = join(directory, "artifacts", "parent");
+    const script = resolve(dirname(fileURLToPath(import.meta.url)), "../pi-extension/subagents/plugin/statusline.py");
+    const runStatusLine = (payload: string, targetUsageFile = usageFile) => execFileSync("uv", ["run", "--no-project", "python", script], {
+      input: payload,
+      env: { ...process.env, PI_CLAUDE_USAGE_FILE: targetUsageFile },
+      timeout: 15_000,
+      windowsHide: true,
+    });
+
+    try {
+      registerName(artifactDir, "ClaudeWorker", {
+        sessionFile: join(directory, "not-a-pi-session.jsonl"),
+        sessionId: null,
+        usageFile,
+        running: true,
+      });
+      for (const cost of [0.05, 0.137]) {
+        runStatusLine(JSON.stringify({
+          session_id: "claude-live-1",
+          transcript_path: "must not be persisted",
+          cost: { total_cost_usd: cost },
+          current_usage: { input_tokens: 999 },
+        }));
+        const snapshot = readClaudeUsageSidecar(usageFile);
+        assert.equal(snapshot?.cost, cost);
+        assert.deepEqual([
+          snapshot?.inputTokens,
+          snapshot?.outputTokens,
+          snapshot?.cacheReadTokens,
+          snapshot?.cacheWriteTokens,
+        ], [null, null, null, null]);
+        const record = JSON.parse(readFileSync(usageFile, "utf8"));
+        assert.equal(record.source, "claude-code-statusline");
+        assert.equal("transcript_path" in record, false);
+        assert.equal("current_usage" in record, false);
+        const totals = collectSubagentUsage(artifactDir);
+        assert.equal(totals.cost, cost, "snapshots replace the previous cumulative amount");
+        assert.equal(totals.costAvailable, true);
+        assert.equal(totals.costComplete, true, "a known live estimate is currently complete");
+        assert.equal(totals.runningCount, 1);
+      }
+
+      for (const invalid of ["not json", JSON.stringify({ session_id: "s", cost: { total_cost_usd: -1 } }),
+        JSON.stringify({ session_id: "s", cost: { total_cost_usd: "0.2" } }),
+        JSON.stringify({ session_id: "s", cost: { total_cost_usd: null } }),
+        '{"session_id":"s","cost":{"total_cost_usd":NaN}}']) {
+        runStatusLine(invalid);
+        assert.equal(readClaudeUsageSidecar(usageFile)?.cost, 0.137, "bad input leaves the last valid snapshot intact");
+      }
+      // A filesystem failure is swallowed by the status-line helper and never
+      // becomes a failed child command or damages the prior valid snapshot.
+      runStatusLine(JSON.stringify({ session_id: "s", cost: { total_cost_usd: 0.5 } }), directory);
+      assert.equal(readClaudeUsageSidecar(usageFile)?.cost, 0.137);
+
+      const live = readClaudeUsageSidecar(usageFile)!;
+      assert.deepEqual(reconcileClaudeCostEstimates(live, null), live);
+      const finalFile = join(directory, "final.jsonl");
+      writeFileSync(finalFile, JSON.stringify({
+        type: "cost-state", sessionId: "claude-live-1", totalCostUSD: 0.2,
+        hasUnknownModelCost: false,
+        modelUsage: { model: { inputTokens: 12, outputTokens: 4, cacheReadInputTokens: 5, cacheCreationInputTokens: 3 } },
+      }));
+      const finalEstimate = readClaudeCostEstimate(finalFile)!;
+      const final = reconcileClaudeCostEstimates(live, finalEstimate)!;
+      assert.equal(final.cost, 0.2);
+      assert.equal(final.inputTokens, 12);
+      writeClaudeUsageSidecar(usageFile, final, "cost-state");
+      assert.equal(JSON.parse(readFileSync(usageFile, "utf8")).source, "claude-code-cost-state");
+      assert.equal(collectSubagentUsage(artifactDir).cost, 0.2);
+
+      const unknownFile = join(directory, "unknown-final.jsonl");
+      writeFileSync(unknownFile, JSON.stringify({
+        type: "cost-state", sessionId: "claude-live-1", totalCostUSD: 0.137,
+        hasUnknownModelCost: true,
+        modelUsage: { model: { inputTokens: 99, outputTokens: 7 } },
+      }));
+      const unknown = reconcileClaudeCostEstimates(live, readClaudeCostEstimate(unknownFile))!;
+      assert.equal(unknown.cost, null, "explicit unknown-model final cost must not inherit the live amount");
+      assert.equal(unknown.costAvailable, false);
+      assert.equal(unknown.inputTokens, 99);
+      writeClaudeUsageSidecar(usageFile, unknown, "cost-state");
+      assert.equal(JSON.parse(readFileSync(usageFile, "utf8")).source, "claude-code-cost-state");
+      assert.equal(collectSubagentUsage(artifactDir).costComplete, false);
+
+      const otherSessionFile = join(directory, "other-session.jsonl");
+      writeFileSync(otherSessionFile, JSON.stringify({
+        type: "cost-state", sessionId: "claude-live-2", totalCostUSD: 0.01,
+        hasUnknownModelCost: false, modelUsage: { model: { inputTokens: 2 } },
+      }));
+      const other = reconcileClaudeCostEstimates(live, readClaudeCostEstimate(otherSessionFile))!;
+      assert.equal(other.sessionId, "claude-live-2");
+      assert.equal(other.cost, 0.01);
+      assert.equal(other.inputTokens, 2, "do not merge tokens across different Claude sessions");
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("marks missing Claude cost unavailable", () => {
+    const directory = mkdtempSync(join(tmpdir(), "claude-cost-unknown-"));
+    const artifactDir = join(directory, "artifacts", "parent");
+    const usageFile = join(directory, "unknown.usage.json");
+    const sessionFile = join(directory, "unknown-session.jsonl");
+    try {
+      writeClaudeUsageSidecar(usageFile, null);
+      registerName(artifactDir, "UnknownClaude", { sessionFile, sessionId: null, usageFile, running: false });
+      assert.equal(collectSubagentUsage(artifactDir).costComplete, false);
+
     } finally {
       rmSync(directory, { recursive: true, force: true });
     }

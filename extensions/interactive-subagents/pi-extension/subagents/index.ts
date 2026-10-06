@@ -15,6 +15,12 @@ import {
 } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import {
+  readClaudeCostEstimate,
+  readClaudeUsageSidecar,
+  reconcileClaudeCostEstimates,
+  writeClaudeUsageSidecar,
+} from "./claude-usage.ts";
+import {
   isHerdrAvailable,
   herdrSetupHint,
   getHerdrIntegrationPath,
@@ -705,6 +711,7 @@ interface RunningSubagent {
   sentinelFile?: string;
   askFile?: string;
   pendingFile?: string;
+  usageFile?: string;
   statusState: SubagentStatusState;
   /**
    * When true, status transitions (stalled/recovered) do not wake the parent
@@ -1328,6 +1335,7 @@ export const __test__ = {
   applySandboxToParts,
   buildClaudeCliArgs,
   buildClaudeLaunchEnv,
+  quoteClaudeShellPath,
   writeClaudeSystemPromptFile,
   handleClaudeLaunchError,
   buildPiPromptArgs,
@@ -1373,7 +1381,15 @@ function buildClaudeLaunchEnv(sentinelFile: string, autoExit?: boolean): Record<
     PI_CLAUDE_AUTO_EXIT: autoExit ? "1" : "0",
     PI_CLAUDE_ASK_FILE: `${sentinelFile}.ask`,
     PI_CLAUDE_PENDING_FILE: `${sentinelFile}.pending`,
+    PI_CLAUDE_USAGE_FILE: `${sentinelFile}.usage.json`,
   };
+}
+
+function quoteClaudeShellPath(path: string, platform: "win32" | "posix" = process.platform === "win32" ? "win32" : "posix"): string {
+  if (platform === "win32") {
+    return `"${path.replace(/\\/g, "/").replace(/"/g, '\\\"')}"`;
+  }
+  return `'${path.replace(/'/g, "'\\''")}'`;
 }
 
 function buildClaudeCliArgs(options: {
@@ -1381,11 +1397,17 @@ function buildClaudeCliArgs(options: {
   model?: string;
   effort?: string;
   systemPromptFile?: string;
+  usageFile?: string;
+  statuslineScript?: string;
 }): string[] {
   const args = ["--permission-mode", "auto"];
   if (options.pluginDir) {
     args.push("--plugin-dir", options.pluginDir);
     args.push("--allowedTools", "mcp__plugin_pi-auto-exit_pi__ask_question");
+  }
+  if (options.usageFile && options.statuslineScript) {
+    const command = `uv run --no-project python ${quoteClaudeShellPath(options.statuslineScript)}`;
+    args.push("--settings", JSON.stringify({ statusLine: { type: "command", command } }));
   }
   if (options.model) args.push("--model", options.model);
   if (options.effort) args.push("--effort", options.effort);
@@ -1490,6 +1512,8 @@ async function launchSubagent(
       model: effectiveModel,
       effort: effectiveEffort,
       systemPromptFile,
+      usageFile: `${sentinelFile}.usage.json`,
+      statuslineScript: join(pluginDir, "statusline.py"),
     });
 
     const allocatedSurface = createSubagentSurface(params.name, {
@@ -1521,6 +1545,7 @@ async function launchSubagent(
       sentinelFile,
       askFile: `${sentinelFile}.ask`,
       pendingFile: `${sentinelFile}.pending`,
+      usageFile: `${sentinelFile}.usage.json`,
       interactive: effectiveInteractive,
       statusState: createStatusState({
         source: "claude",
@@ -1792,11 +1817,28 @@ async function watchSubagent(
           : "Claude Code exited without output";
       }
 
-      // Close Claude before copying its completed transcript.
+      // Close Claude first so its final cost-state has a chance to reach the
+      // transcript before we create the footer sidecar or copy the transcript.
       closeSurfaceAndTab(surface, running.herdrTabId);
 
       let sessionId: string | null = null;
       if (running.sentinelFile) {
+        if (running.usageFile) {
+          try {
+            const transcriptPath = readClaudeTranscriptPath(running.sentinelFile);
+            const liveEstimate = readClaudeUsageSidecar(running.usageFile);
+            const finalEstimate = readClaudeCostEstimate(transcriptPath);
+            const estimate = reconcileClaudeCostEstimates(liveEstimate, finalEstimate);
+            const source = finalEstimate?.costAvailable || finalEstimate?.costExplicitlyUnknown
+              ? "cost-state"
+              : liveEstimate?.costAvailable
+                ? "statusline"
+                : "cost-state";
+            writeClaudeUsageSidecar(running.usageFile, estimate, source);
+          } catch (error) {
+            console.error(`[interactive-subagents] Could not record Claude usage estimate for "${name}": ${error instanceof Error ? error.message : String(error)}`);
+          }
+        }
         sessionId = copyClaudeSession(running.sentinelFile);
         try { unlinkSync(running.sentinelFile); } catch {}
         try { unlinkSync(running.sentinelFile + ".transcript"); } catch {}
@@ -2091,6 +2133,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
             sessionFile: running.sessionFile,
             sessionId: getSessionId(running.sessionFile),
             ...(running.activityFile ? { activityFile: running.activityFile } : {}),
+            ...(running.usageFile ? { usageFile: running.usageFile } : {}),
             running: true,
             runId: running.id,
             taskBrief: running.task,

@@ -22,6 +22,8 @@ export interface UsageFooterSnapshot {
   outputTokens: number | null;
   mainCost: number | null;
   subagentCost: number | null;
+  /** True when a known child cost comes from Claude Code's estimate. */
+  subagentCostEstimated: boolean;
   showSubagentCost: boolean;
   proactiveCompactionEnabled: boolean;
   compactionCount: number | null;
