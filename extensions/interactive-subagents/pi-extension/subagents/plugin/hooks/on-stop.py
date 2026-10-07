@@ -1,3 +1,8 @@
+# /// script
+# requires-python = ">=3.14"
+# dependencies = []
+# ///
+
 """Persist Claude's final response for the Pi subagent watcher."""
 
 import json

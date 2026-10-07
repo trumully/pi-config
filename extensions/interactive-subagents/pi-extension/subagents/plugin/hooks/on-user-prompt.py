@@ -1,3 +1,8 @@
+# /// script
+# requires-python = ">=3.14"
+# dependencies = []
+# ///
+
 """Clear the pending question marker when the parent replies."""
 
 import os

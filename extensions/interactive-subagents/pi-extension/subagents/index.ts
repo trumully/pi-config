@@ -1406,7 +1406,7 @@ function buildClaudeCliArgs(options: {
     args.push("--allowedTools", "mcp__plugin_pi-auto-exit_pi__ask_question");
   }
   if (options.usageFile && options.statuslineScript) {
-    const command = `uv run --no-project python ${quoteClaudeShellPath(options.statuslineScript)}`;
+    const command = `uv run --no-project ${quoteClaudeShellPath(options.statuslineScript)}`;
     args.push("--settings", JSON.stringify({ statusLine: { type: "command", command } }));
   }
   if (options.model) args.push("--model", options.model);

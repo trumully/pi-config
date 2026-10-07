@@ -296,7 +296,7 @@ describe("interactive subagents smoke tests", () => {
         "--allowedTools", "mcp__plugin_pi-auto-exit_pi__ask_question",
         "--settings", JSON.stringify({ statusLine: {
           type: "command",
-          command: `uv run --no-project python ${testApi.quoteClaudeShellPath("C:\\Program Files\\pi-config\\statusline.py", process.platform === "win32" ? "win32" : "posix")}`,
+          command: `uv run --no-project ${testApi.quoteClaudeShellPath("C:\\Program Files\\pi-config\\statusline.py", process.platform === "win32" ? "win32" : "posix")}`,
         } }),
         "--model", "claude-opus-5-5",
         "--effort", "high",
@@ -329,7 +329,7 @@ describe("interactive subagents smoke tests", () => {
       { jsonrpc: "2.0", id: 3, method: "tools/call", params: { name: "ask_question", arguments: { question: "Which option should I use?" } } },
     ];
     try {
-      const output = execFileSync("uv", ["run", "--no-project", "python", server], {
+      const output = execFileSync("uv", ["run", "--no-project", server], {
         input: requests.map((request) => JSON.stringify(request)).join("\n") + "\n",
         env: { ...process.env, PI_CLAUDE_ASK_FILE: askFile, PI_CLAUDE_PENDING_FILE: pendingFile },
         timeout: 15_000,
@@ -375,14 +375,14 @@ describe("interactive subagents smoke tests", () => {
     const transcript = join(directory, "transcript.jsonl");
     const sentinel = join(directory, "done");
     const pending = `${sentinel}.pending`;
-    const hook = resolve(dirname(fileURLToPath(import.meta.url)), "../pi-extension/subagents/plugin/hooks/on-stop.sh");
+    const hook = resolve(dirname(fileURLToPath(import.meta.url)), "../pi-extension/subagents/plugin/hooks/on-stop.py");
     writeFileSync(transcript, [
       JSON.stringify({ type: "user", message: { role: "user", content: "initial task" } }),
       JSON.stringify({ type: "user", message: { role: "user", content: "parent reply" } }),
     ].join("\n"));
     writeFileSync(pending, "q1");
     try {
-      execFileSync("bash", [hook], {
+      execFileSync("uv", ["run", "--no-project", hook], {
         input: JSON.stringify({ stop_hook_active: false, transcript_path: transcript, last_assistant_message: "WAITING" }),
         env: { ...process.env, PI_CLAUDE_SENTINEL: sentinel, PI_CLAUDE_AUTO_EXIT: "1", PI_CLAUDE_PENDING_FILE: pending },
         timeout: 10_000,
@@ -401,7 +401,7 @@ describe("interactive subagents smoke tests", () => {
     const hook = resolve(dirname(fileURLToPath(import.meta.url)), "../pi-extension/subagents/plugin/hooks/on-user-prompt.py");
     writeFileSync(pending, "q1");
     try {
-      execFileSync("uv", ["run", "--no-project", "python", hook], {
+      execFileSync("uv", ["run", "--no-project", hook], {
         input: JSON.stringify({ prompt: "The user decision" }),
         env: { ...process.env, PI_CLAUDE_PENDING_FILE: pending },
         timeout: 10_000,
@@ -491,7 +491,7 @@ describe("interactive subagents smoke tests", () => {
     const usageFile = join(directory, "child.usage.json");
     const artifactDir = join(directory, "artifacts", "parent");
     const script = resolve(dirname(fileURLToPath(import.meta.url)), "../pi-extension/subagents/plugin/statusline.py");
-    const runStatusLine = (payload: string, targetUsageFile = usageFile) => execFileSync("uv", ["run", "--no-project", "python", script], {
+    const runStatusLine = (payload: string, targetUsageFile = usageFile) => execFileSync("uv", ["run", "--no-project", script], {
       input: payload,
       env: { ...process.env, PI_CLAUDE_USAGE_FILE: targetUsageFile },
       timeout: 15_000,
@@ -649,7 +649,7 @@ describe("interactive subagents smoke tests", () => {
     const directory = mkdtempSync(join(tmpdir(), "claude-stop-hook-"));
     const transcript = join(directory, "transcript.jsonl");
     const sentinel = join(directory, "done");
-    const hook = resolve(dirname(fileURLToPath(import.meta.url)), "../pi-extension/subagents/plugin/hooks/on-stop.sh");
+    const hook = resolve(dirname(fileURLToPath(import.meta.url)), "../pi-extension/subagents/plugin/hooks/on-stop.py");
     writeFileSync(transcript, [
       JSON.stringify({ type: "user", message: { role: "user", content: "initial task" } }),
       JSON.stringify({ type: "assistant", message: { role: "assistant", content: "working" } }),
@@ -657,7 +657,7 @@ describe("interactive subagents smoke tests", () => {
     ].join("\n"));
 
     try {
-      execFileSync("bash", [hook], {
+      execFileSync("uv", ["run", "--no-project", hook], {
         input: JSON.stringify({
           stop_hook_active: false,
           transcript_path: transcript,
@@ -685,14 +685,14 @@ describe("interactive subagents smoke tests", () => {
     const directory = mkdtempSync(join(tmpdir(), "claude-stop-hook-interactive-"));
     const transcript = join(directory, "transcript.jsonl");
     const sentinel = join(directory, "done");
-    const hook = resolve(dirname(fileURLToPath(import.meta.url)), "../pi-extension/subagents/plugin/hooks/on-stop.sh");
+    const hook = resolve(dirname(fileURLToPath(import.meta.url)), "../pi-extension/subagents/plugin/hooks/on-stop.py");
     writeFileSync(transcript, [
       JSON.stringify({ type: "user", message: { role: "user", content: "initial task" } }),
       JSON.stringify({ type: "user", message: { role: "user", content: "follow-up" } }),
     ].join("\n"));
 
     try {
-      execFileSync("bash", [hook], {
+      execFileSync("uv", ["run", "--no-project", hook], {
         input: JSON.stringify({ stop_hook_active: false, transcript_path: transcript, last_assistant_message: "RESULT" }),
         env: { ...process.env, PI_CLAUDE_SENTINEL: sentinel, PI_CLAUDE_AUTO_EXIT: "0" },
         timeout: 10_000,

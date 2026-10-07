@@ -1,6 +1,6 @@
 # Interactive subagents
 
-This repository contains a customized fork of [Amos Blomqvist's pi-interactive-subagents](https://github.com/amosblomqvist/pi-interactive-subagents), which is itself a fork of [HazAT's pi-interactive-subagents](https://github.com/HazAT/pi-interactive-subagents).
+This repository contains a customized fork of [Eero Alvar's pi-interactive-subagents](https://github.com/amosblomqvist/pi-interactive-subagents), which is itself a fork of [HazAT's pi-interactive-subagents](https://github.com/HazAT/pi-interactive-subagents).
 
 Spawn Pi agents in Herdr tabs while the parent session keeps working. Child results return to the parent asynchronously as steer messages. Use this when a task can run independently without blocking the parent.
 

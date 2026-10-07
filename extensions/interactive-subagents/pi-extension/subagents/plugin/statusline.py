@@ -1,3 +1,8 @@
+# /// script
+# requires-python = ">=3.14"
+# dependencies = []
+# ///
+
 """Publish Claude Code's cumulative status-line cost for the Pi footer."""
 
 import json

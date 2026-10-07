@@ -1,3 +1,8 @@
+# /// script
+# requires-python = ">=3.14"
+# dependencies = []
+# ///
+
 """Minimal stdio MCP server that sends a question to the Pi parent."""
 
 import json

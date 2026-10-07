@@ -12,6 +12,12 @@ pi install git:github.com/trumully/pi-config
 
 Tailor the config with `pi config` or [package filtering](https://github.com/earendil-works/pi/blob/b2b5c42f6138b73ec4b2f49ec0ca468800f88586/packages/coding-agent/docs/packages.md#package-filtering).
 
+## Prerequisites
+
+Interactive subagents require Herdr. Start Pi inside Herdr, with the Herdr CLI available.
+
+Some bundled agent profiles need extra tools; see their definitions for details. Claude Code agents need [uv](https://docs.astral.sh/uv/getting-started/installation/).
+
 ## Extensions
 
 | Extension | Description |
