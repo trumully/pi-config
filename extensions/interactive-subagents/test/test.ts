@@ -186,18 +186,18 @@ describe("compact subagent progress", () => {
       },
       activityRead: { ok: true }, activity: { phase: "active", progress: { updatedAt: now, activeChildren: 2, todos: { completed: 1, total: 3 } } },
     };
-    const wide = testApi.renderSubagentWidgetLines([base], 100).join("\n");
+    const wide = testApi.renderSubagentWidgetLines([base], 100, "full").join("\n");
     assert.match(wide, /WorkerName/);
     assert.match(wide, /↳ 2/);
     assert.match(wide, /● 1\/3/);
     assert.match(wide, /active/);
-    const narrow = testApi.renderSubagentWidgetLines([base], 60).join("\n");
+    const narrow = testApi.renderSubagentWidgetLines([base], 60, "full").join("\n");
     assert.match(narrow, /WorkerName/);
     assert.match(narrow, /↳ 2/);
     assert.doesNotMatch(narrow, /●/);
     assert.match(narrow, /active/);
     const stale = { ...base, activity: { phase: "active", progress: { updatedAt: now - 20_000, activeChildren: 2, todos: { completed: 1, total: 3 } } } };
-    assert.doesNotMatch(testApi.renderSubagentWidgetLines([stale], 100).join("\n"), /↳|●/);
+    assert.doesNotMatch(testApi.renderSubagentWidgetLines([stale], 100, "full").join("\n"), /↳|●/);
   });
 });
 
@@ -972,7 +972,7 @@ describe("interactive subagents smoke tests", () => {
           snapshotError: null,
           currentKind: "waiting",
         },
-      }], 120).join("\n");
+      }], 120, "full").join("\n");
 
       assert.match(rendered, /extension-readmes \(worker\)/);
       assert.match(rendered, /\d\d:\d\d/);

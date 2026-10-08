@@ -19,6 +19,7 @@ export type StatusActivityPhase = "starting" | "active" | "waiting" | "done";
 
 export interface StatusConfig {
   enabled: boolean;
+  mode: "minimal" | "full";
   lineLimit: number;
 }
 
@@ -140,11 +141,16 @@ function activityLabel(snapshot: Pick<StatusSnapshot, "activityLabel" | "activeS
 export function parseStatusConfig(rawConfig: unknown, source = "config.json"): StatusConfig {
   const config = requireObject(rawConfig, source, "root");
   const status = requireObject(config.status, source, "status");
-  rejectUnsupportedKeys(status, ["enabled"], source, "status");
+  rejectUnsupportedKeys(status, ["enabled", "mode"], source, "status");
   const enabled = requireBoolean(status.enabled, source, "status.enabled");
+  const mode = status.mode === undefined ? "minimal" : status.mode;
+  if (mode !== "minimal" && mode !== "full") {
+    invalidStatusConfig(source, 'status.mode must be "minimal" or "full"');
+  }
 
   return {
     enabled,
+    mode,
     lineLimit: DEFAULT_STATUS_LINE_LIMIT,
   };
 }

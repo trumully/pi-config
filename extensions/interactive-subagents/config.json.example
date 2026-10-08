@@ -1,6 +1,7 @@
 {
   "status": {
-    "enabled": true
+    "enabled": true,
+    "mode": "minimal"
   },
   "proactiveCompaction": {
     "enabled": true,

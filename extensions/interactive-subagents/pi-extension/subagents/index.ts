@@ -814,7 +814,28 @@ function borderBottom(width: number): string {
   return `${ACCENT}╰${"─".repeat(inner)}╯${RST}`;
 }
 
-function renderSubagentWidgetLines(agents: RunningSubagent[], width: number): string[] {
+function renderMinimalSubagentWidgetLine(agents: RunningSubagent[], width: number): string[] {
+  const counts = new Map<string, number>();
+  for (const agent of agents) {
+    const kind = statusConfig.enabled ? classifyStatus(agent.statusState, Date.now()).kind : "running";
+    counts.set(kind, (counts.get(kind) ?? 0) + 1);
+  }
+  const labels = statusConfig.enabled
+    ? ["active", "waiting", "starting", "stalled", "running"]
+    : ["running"];
+  const summary = labels
+    .filter((label) => (counts.get(label) ?? 0) > 0)
+    .map((label) => `${counts.get(label)} ${label}`)
+    .join(" · ");
+  return [truncateToWidth(`↳ ${agents.length} subagents · ${summary}`, width)];
+}
+
+function renderSubagentWidgetLines(
+  agents: RunningSubagent[],
+  width: number,
+  mode: "minimal" | "full" = statusConfig.mode,
+): string[] {
+  if (mode === "minimal") return renderMinimalSubagentWidgetLine(agents, width);
   const count = agents.length;
   const title = "Subagents";
   const info = `${count} running`;
@@ -1365,6 +1386,7 @@ export const __test__ = {
   formatContextUsage,
   contextWindowFor,
   formatUsageSegments,
+  renderMinimalSubagentWidgetLine,
   widgetIcon,
 };
 
