@@ -3,6 +3,7 @@
     "enabled": true,
     "mode": "minimal"
   },
+  "limits": { "maxConcurrent": 4 },
   "proactiveCompaction": {
     "enabled": true,
     "thresholdPercent": 70

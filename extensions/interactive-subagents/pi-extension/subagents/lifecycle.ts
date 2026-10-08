@@ -1,5 +1,6 @@
 import { closeSync, existsSync, mkdirSync, openSync, readFileSync, realpathSync, unlinkSync, writeFileSync, renameSync } from "node:fs";
 import { randomUUID } from "node:crypto";
+import type { CapacityTicket } from "./capacity.ts";
 import { basename, dirname, join, resolve } from "node:path";
 
 export interface RunMetadata {
@@ -7,6 +8,7 @@ export interface RunMetadata {
   state: "launching" | "running" | "unknown" | "finished";
   launchConfirmed?: boolean;
   interactive?: boolean;
+  capacity?: CapacityTicket;
   parentSessionId: string;
   runId: string;
   herdrAgentName: string;

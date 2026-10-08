@@ -17,6 +17,11 @@ import {
 import { createHash } from "node:crypto";
 import { homedir, tmpdir } from "node:os";
 import {
+  CAPACITY_SCOPE_ENV, attachCapacity, capacityScope, loadCapacityLimit,
+  releaseCapacity, releasePriorCapacity, releaseUnsubmittedCapacity, reserveCapacity, restoreCapacity,
+  type CapacityTicket,
+} from "./capacity.ts";
+import {
   bindMailbox,
   createFileDeliveryStore,
   currentParentSessionId,
@@ -574,6 +579,7 @@ function getArtifactDir(sessionDir: string, sessionId: string): string {
 }
 
 const statusConfig = loadStatusConfig();
+const maximumConcurrent = loadCapacityLimit();
 const proactiveCompactionEnabled = (() => {
   try {
     return loadProactiveCompactionConfig().enabled;
@@ -667,6 +673,7 @@ function completeRun(
     try {
       const finished = finishRegisteredRun(artifactDir, running.name, running.id);
       if (finished && running.ownershipToken) releaseTranscriptOwnership(running.sessionFile, running.ownershipToken);
+      if (finished && running.runMetadata?.capacity) releaseCapacity(running.runMetadata.capacity);
     } catch (err: any) {
       console.error(`[interactive-subagents] Could not persist completion for "${running.name}" (run ${running.id}): ${err?.message ?? String(err)}`);
     }
@@ -687,7 +694,7 @@ function completeRun(
 /** Roll back only when Herdr has never received a start request. */
 function rollbackUnsubmittedResume(
   artifactDir: string, name: string, prior: NameRegistryEntry, runId: string,
-  sessionFile: string, ownerToken: string, registryClaimed: boolean,
+  sessionFile: string, ownerToken: string, capacity: CapacityTicket, registryClaimed: boolean,
 ): void {
   // Restore archived signals while the transcript is still exclusively owned.
   for (const suffix of [".exit", ".ask", ".pending"]) {
@@ -710,6 +717,11 @@ function rollbackUnsubmittedResume(
     releaseTranscriptOwnership(sessionFile, ownerToken);
   } catch (error: any) {
     warnOnce(`resume-rollback-owner:${runId}`, `Could not release unsubmitted resume ownership for "${name}": ${error?.message ?? String(error)}`);
+  }
+  try {
+    releaseCapacity(capacity);
+  } catch (error: any) {
+    warnOnce(`resume-rollback-capacity:${runId}`, `Could not release unsubmitted resume capacity for "${name}": ${error?.message ?? String(error)}`);
   }
 }
 
@@ -1571,8 +1583,19 @@ function startWidgetRefresh() {
  */
 type LaunchContext = { sessionManager: { getSessionFile(): string | null; getSessionId(): string; getSessionDir(): string }; cwd: string };
 
-async function launchSubagent(
-  params: typeof SubagentParams.static, ctx: LaunchContext,
+async function launchSubagent(params: typeof SubagentParams.static, ctx: LaunchContext): Promise<RunningSubagent> {
+  const artifactDir = getArtifactDir(ctx.sessionManager.getSessionDir(), ctx.sessionManager.getSessionId());
+  const capacity = await reserveCapacity(capacityScope(artifactDir, maximumConcurrent));
+  try {
+    return await launchReservedSubagent(params, ctx, capacity);
+  } catch (error) {
+    releaseUnsubmittedCapacity(capacity);
+    throw error;
+  }
+}
+
+async function launchReservedSubagent(
+  params: typeof SubagentParams.static, ctx: LaunchContext, capacity: CapacityTicket,
 ): Promise<RunningSubagent> {
   const startTime = Date.now();
   const id = Math.random().toString(16).slice(2, 10);
@@ -1655,7 +1678,7 @@ async function launchSubagent(
 
     const allocatedSurface = createSubagentSurface(params.name, {
       cwd: targetCwdForSession,
-      env: buildClaudeLaunchEnv(sentinelFile, agentDefs?.autoExit),
+      env: { ...buildClaudeLaunchEnv(sentinelFile, agentDefs?.autoExit), [CAPACITY_SCOPE_ENV]: capacity.scope },
     });
     const { surface, tabId } = allocatedSurface;
     const parentSessionId = ctx.sessionManager.getSessionId();
@@ -1665,7 +1688,7 @@ async function launchSubagent(
       ...(tabId ? { herdrTabId: tabId } : {}), sessionFile: subagentSessionFile, transcriptOffset: 0,
       usageFile: `${sentinelFile}.usage.json`, askFile: `${sentinelFile}.ask`,
       pendingFile: `${sentinelFile}.pending`, sentinelFile, profile: params.agent, task: params.task,
-      startTime, cli: "claude", interactive: effectiveInteractive,
+      startTime, cli: "claude", interactive: effectiveInteractive, capacity,
     };
     try {
       claimRegisteredRun(parentArtifactDir, params.name, {
@@ -1677,6 +1700,7 @@ async function launchSubagent(
       throw error;
     }
     try {
+      attachCapacity(capacity, parentArtifactDir, params.name, id);
       await startAgent(herdrAgentName, "claude", surface, args);
       // Start without a positional task so Herdr can return as soon as the
       // agent is ready; submit work separately and confirm it entered a turn.
@@ -1781,6 +1805,7 @@ async function launchSubagent(
 
   // Submit the task text directly. The parent builds the complete initial message,
   // including wrapper instructions for blank-session modes.
+  childEnv[CAPACITY_SCOPE_ENV] = capacity.scope;
   const promptArgs = buildPiPromptArgs({
     effectiveSkills,
     taskArg: fullTask,
@@ -1805,7 +1830,7 @@ async function launchSubagent(
     surface, ...(tabId ? { herdrTabId: tabId } : {}), sessionFile: subagentSessionFile,
     transcriptOffset: startEntryCount, ownerToken, activityFile,
     askFile: `${subagentSessionFile}.ask`, pendingFile: `${subagentSessionFile}.pending`, profile: params.agent,
-    task: params.task, startTime, cli: "pi", interactive: effectiveInteractive,
+    task: params.task, startTime, cli: "pi", interactive: effectiveInteractive, capacity,
   };
   const parentArtifactDir = getArtifactDir(ctx.sessionManager.getSessionDir(), parentSessionId);
   try {
@@ -1819,6 +1844,7 @@ async function launchSubagent(
     throw error;
   }
   try {
+    attachCapacity(capacity, parentArtifactDir, params.name, id);
     await startAgent(herdrAgentName, "pi", surface, parts);
     // Herdr starts the Pi TUI ready for input. Submit skill commands and task
     // text separately so Pi can expand skills before processing the task.
@@ -2245,6 +2271,15 @@ async function reconcileParentRuns(pi: ExtensionAPI, ctx: ExtensionContext, pare
   for (const [name, entry] of candidates) {
     const meta = entry.runMetadata!;
     if (!isCurrent()) return;
+    if (!meta.capacity) {
+      try {
+        meta.capacity = restoreCapacity(artifactDir, name, meta.runId, maximumConcurrent);
+        updateRegisteredRun(artifactDir, name, meta.runId, { runMetadata: meta });
+      } catch (error: any) {
+        warnOnce(`capacity-recovery:${parentSessionId}:${meta.runId}`,
+          `Could not restore capacity for "${name}"; observation will still recover, while new launches remain guarded: ${error?.message ?? String(error)}`);
+      }
+    }
     if (runningSubagents.has(meta.runId)) continue;
     let livePanes: Set<string>;
     try {
@@ -2353,6 +2388,12 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         getEntries: () => ctx.sessionManager.getEntries(),
         isIdle: () => ctx.isIdle(),
       });
+      try {
+        capacityScope(artifactDir, maximumConcurrent);
+      } catch (error: any) {
+        warnOnce(`capacity-startup:${parentSessionId}`,
+          `Could not initialize launch capacity; mailbox replay and run recovery will still proceed: ${error?.message ?? String(error)}`);
+      }
       // Bind before reconciliation: any terminal result recovered below must
       // target this session's mailbox, never a later session's binding.
       setTimeout(() => {
@@ -2978,6 +3019,12 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         childEnv.PI_SUBAGENT_ACTIVITY_FILE = activityFile;
         if (autoExit) childEnv.PI_SUBAGENT_AUTO_EXIT = "1";
 
+        const scope = capacityScope(artifactDir, maximumConcurrent);
+        if (entry.running === false || herdrConfirmedAbsent) {
+          releasePriorCapacity(scope, parentArtifactDir, name, entry.runId, priorRun?.capacity);
+        }
+        const capacity = await reserveCapacity(scope);
+        childEnv[CAPACITY_SCOPE_ENV] = capacity.scope;
         let allocatedSurface: ReturnType<typeof createSubagentSurface>;
         try {
           allocatedSurface = createSubagentSurface(name, {
@@ -2985,6 +3032,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
             env: childEnv,
           });
         } catch (error) {
+          releaseUnsubmittedCapacity(capacity);
           throw error;
         }
         const { surface, tabId } = allocatedSurface;
@@ -2998,6 +3046,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
             herdrConfirmedAbsent,
           });
         } catch (error) {
+          releaseUnsubmittedCapacity(capacity);
           closeSurfaceAndTab(surface, tabId);
           throw error;
         }
@@ -3006,7 +3055,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           surface, ...(tabId ? { herdrTabId: tabId } : {}), sessionFile: sessionPath,
           transcriptOffset: entryCountBefore, ownerToken, activityFile,
           askFile: `${sessionPath}.ask`, pendingFile: `${sessionPath}.pending`, profile: loadout.agent ?? undefined,
-          task: message, startTime, cli: "pi", interactive,
+          task: message, startTime, cli: "pi", interactive, capacity,
         };
         let registryClaimed = false;
         let launchSubmitted = false;
@@ -3018,6 +3067,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
             const stale = `${sessionPath}${suffix}`;
             if (existsSync(stale)) renameSync(stale, `${stale}.prior-${id}`);
           }
+          attachCapacity(capacity, parentArtifactDir, name, id);
           launchSubmitted = true;
           await startAgent(herdrAgentName, "pi", surface, parts);
           if (resumeMsgFile) promptAgent(herdrAgentName, formatResumeTaskPrompt(resumeMsgFile));
@@ -3027,7 +3077,9 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           updateRegisteredRun(parentArtifactDir, name, id, { sessionFile: sessionPath, sessionId: resumedSessionId, running: true, taskBrief: params.intent === "task" ? message : entry.taskBrief, runMetadata });
         } catch (error) {
           if (!launchSubmitted) {
-            rollbackUnsubmittedResume(parentArtifactDir, name, entry, id, sessionPath, ownerToken, registryClaimed);
+            rollbackUnsubmittedResume(parentArtifactDir, name, entry, id, sessionPath, ownerToken, capacity, registryClaimed);
+          } else {
+            releaseUnsubmittedCapacity(capacity);
           }
           closeSurfaceAndTab(surface, tabId);
           throw error;

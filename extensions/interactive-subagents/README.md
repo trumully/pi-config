@@ -64,9 +64,12 @@ Copy `config.json.example` to `config.json` in this extension directory. It is g
 ```json
 {
   "status": { "enabled": true, "mode": "minimal" },
+  "limits": { "maxConcurrent": 4 },
   "proactiveCompaction": { "enabled": true, "thresholdPercent": 70 }
 }
 ```
+
+`limits.maxConcurrent` defaults to 4 and must be a positive integer. It caps one root parent's delegation tree, including startup, resumed children and nested launches. At capacity, launches fail clearly rather than queue; steering an existing child does not consume another slot. Unknown starts keep their slots until exit is confirmed, so a stale guard or unresolved run can require inspection. Existing children from before this change should be restarted to inherit the shared tree budget.
 
 Status controls the agent-state display. `mode` is `minimal` (the default: one compact active-count line) or `full` (the per-agent widget); `enabled` still controls status detail/notifications. Proactive compaction applies to Pi children, not the parent or Claude CLI agents. If compaction fails or is interrupted, the child stays open; send a follow-up to continue from its checkpoint.
 
