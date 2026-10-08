@@ -28,14 +28,21 @@ Children run with the tools allowed by their profile. `subagent_agents` controls
 
 ## Agent profiles
 
-Bundled profiles are `scout`, `worker`, `gh-scout`, and `researcher`. Project profiles in `.pi/agents/` override user profiles in `~/.pi/agent/agents/`, which override bundled profiles.
+Bundled profiles are `scout`, `worker`, `tasker`, `architect`, `writer`, `gh-scout`, `researcher`, `cc-worker`, and `cc-reviewer`. Project profiles in `.pi/agents/` override user profiles in `~/.pi/agent/agents/`, which override bundled profiles.
 
 | Profile | Default model | Purpose |
 | --- | --- | --- |
 | `scout` | `openai/gpt-6-luna` | Read-only local exploration and structural search |
 | `worker` | `openai/gpt-6-luna` | Implementation, with `scout` as its only child profile |
+| `tasker` | `openai/gpt-6-luna` | Tiny, well-specified edits, commands and lookups; low thinking, no children |
+| `architect` | `openai/gpt-6-luna` | Read-only design decisions and actionable plans; no shell or children |
+| `writer` | `openai/gpt-6-luna` | Scoped prose drafting/editing; no shell or children |
 | `gh-scout` | `openai/gpt-6-luna` | Read-only GitHub inspection with `gh` |
 | `researcher` | `openai/gpt-6-luna` | Web research |
+| `cc-worker` | `claude-opus-5-5` | Claude Code implementation |
+| `cc-reviewer` | `claude-opus-5-5` | Read-only Claude Code review with triggering cases and refutation |
+
+Use `tasker` for a small explicit job rather than a complex feature. `architect` returns a plan, not authorization to implement it. `writer` changes only authorized prose files and flags missing facts instead of inventing them. The new roles do not delegate; choose their use explicitly. Prompt adaptations and their upstream license are recorded in [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md).
 
 Set `model` in profile frontmatter to customize a profile's default. The `model` argument can override it for one spawn. For example:
 
