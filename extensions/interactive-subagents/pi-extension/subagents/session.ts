@@ -7,9 +7,12 @@ import {
   readSync,
   renameSync,
   writeFileSync,
+  unlinkSync,
 } from "node:fs";
 import { randomUUID } from "node:crypto";
 import { dirname, join } from "node:path";
+import type { RunMetadata } from "./lifecycle.ts";
+import { processIsAlive } from "./lifecycle.ts";
 
 export interface SessionEntry {
   type: string;
@@ -164,6 +167,8 @@ export interface NameRegistryEntry {
   runId?: string;
   /** Current task brief; absent for legacy registry records. */
   taskBrief?: string;
+  /** Versioned watcher reconstruction data; legacy records remain readable. */
+  runMetadata?: RunMetadata;
 }
 
 export type NameRegistry = Record<string, NameRegistryEntry>;
@@ -191,26 +196,84 @@ export function readNameRegistry(artifactDir: string): NameRegistry {
  * Writes atomically (temp file + rename) so a concurrent reader never sees a
  * partial registry.
  */
-export function registerName(
+function mutateRegisteredName(
   artifactDir: string,
   name: string,
-  entry: NameRegistryEntry,
-): void {
+  mutate: (entry: NameRegistryEntry | null) => NameRegistryEntry | null,
+): NameRegistryEntry | null {
   mkdirSync(artifactDir, { recursive: true });
-  const registry = readNameRegistry(artifactDir);
-  registry[name] = entry;
   const p = nameRegistryPath(artifactDir);
-  const tmp = `${p}.tmp-${process.pid}-${Math.random().toString(16).slice(2, 8)}`;
-  writeFileSync(tmp, JSON.stringify(registry, null, 2), "utf8");
-  renameSync(tmp, p);
+  const lock = `${p}.lock`;
+  const guard = `${lock}.guard`;
+  let guardFd: number;
+  try {
+    guardFd = openSync(guard, "wx", 0o600);
+    writeFileSync(guardFd, `${JSON.stringify({ pid: process.pid })}\n`);
+  } catch {
+    throw new Error(`Subagent registry is locked by another writer (${lock}).`);
+  }
+  let lockFd: number | undefined;
+  let ownsLock = false;
+  try {
+    if (existsSync(lock)) {
+      let ownerPid: number | undefined;
+      try { ownerPid = JSON.parse(readFileSync(lock, "utf8")).pid; } catch {}
+      if (!Number.isInteger(ownerPid)) throw new Error(`Subagent registry lock is unreadable (${lock}).`);
+      if (processIsAlive(ownerPid!)) throw new Error(`Subagent registry is locked by process ${ownerPid}.`);
+      unlinkSync(lock);
+    }
+    lockFd = openSync(lock, "wx", 0o600);
+    ownsLock = true;
+    writeFileSync(lockFd, `${JSON.stringify({ pid: process.pid })}\n`);
+    const registry = readNameRegistry(artifactDir);
+    const entry = mutate(registry[name] ?? null);
+    if (!entry) return null;
+    registry[name] = entry;
+    const tmp = `${p}.tmp-${process.pid}-${Math.random().toString(16).slice(2, 8)}`;
+    writeFileSync(tmp, JSON.stringify(registry, null, 2), "utf8");
+    renameSync(tmp, p);
+    return entry;
+  } finally {
+    if (lockFd !== undefined) closeSync(lockFd);
+    if (ownsLock) try { unlinkSync(lock); } catch {}
+    try { closeSync(guardFd); } catch {}
+    try { unlinkSync(guard); } catch {}
+  }
 }
 
-/** Update state only when this completion still owns the persisted run. */
+export function registerName(artifactDir: string, name: string, entry: NameRegistryEntry): void {
+  mutateRegisteredName(artifactDir, name, () => entry);
+}
+
+/** Claim a new name or replace exactly the run inspected before acquiring ownership. */
+export function claimRegisteredRun(
+  artifactDir: string, name: string, entry: NameRegistryEntry, prior?: NameRegistryEntry,
+): void {
+  mutateRegisteredName(artifactDir, name, (current) => {
+    if (prior ? !current || current.runId !== prior.runId || current.sessionFile !== prior.sessionFile : !!current) {
+      throw new Error(`Subagent registry changed for "${name}"; refusing to replace another run.`);
+    }
+    return entry;
+  });
+}
+
+export function updateRegisteredRun(
+  artifactDir: string, name: string, runId: string, updates: Partial<NameRegistryEntry>,
+): boolean {
+  return !!mutateRegisteredName(artifactDir, name, (current) =>
+    current?.runId === runId ? { ...current, ...updates } : null,
+  );
+}
+
+/** Check ownership and persist terminal state within the same registry lock. */
 export function finishRegisteredRun(artifactDir: string, name: string, runId: string): boolean {
-  const entry = resolveNameInRegistry(artifactDir, name);
-  if (!entry || entry.runId !== runId) return false;
-  registerName(artifactDir, name, { ...entry, running: false });
-  return true;
+  return !!mutateRegisteredName(artifactDir, name, (current) => {
+    if (current?.runId !== runId) return null;
+    return {
+      ...current, running: false,
+      ...(current.runMetadata ? { runMetadata: { ...current.runMetadata, state: "finished" as const } } : {}),
+    };
+  });
 }
 
 /** Resolve a name to its registry entry within a spawner session, or null. */

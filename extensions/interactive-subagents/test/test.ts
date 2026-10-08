@@ -8,6 +8,7 @@ import { fileURLToPath } from "node:url";
 import { convertToLlm } from "@earendil-works/pi-coding-agent";
 import * as subagentsModule from "../pi-extension/subagents/index.ts";
 import { buildPromptAgentArgs } from "../pi-extension/subagents/herdr.ts";
+import { bindMailbox, createFileDeliveryStore, unbindMailbox } from "../pi-extension/subagents/delivery.ts";
 import { finishRegisteredRun, readNameRegistry, registerName } from "../pi-extension/subagents/session.ts";
 import { collectSubagentUsage } from "../pi-extension/subagents/usage.ts";
 import {
@@ -351,9 +352,21 @@ describe("interactive subagents smoke tests", () => {
     const directory = mkdtempSync(join(tmpdir(), "claude-ask-watcher-"));
     const askFile = join(directory, "question.ask");
     writeFileSync(askFile, JSON.stringify({ id: "q1", question: "Need a decision?" }));
+    bindMailbox({
+      parentSessionId: "ask-test-parent",
+      store: createFileDeliveryStore(join(directory, "mailbox")),
+      send: (item) => harness.api.sendMessage(
+        { customType: item.customType, content: item.content, display: true, details: item.details },
+        { triggerTurn: true, deliverAs: "steer" },
+      ),
+      getEntries: () => [],
+      isIdle: () => true,
+    });
     try {
       const testApi = (subagentsModule as any).__test__;
       testApi.deliverPendingQuestion({
+        id: "ask-test-run",
+        parentSessionId: "ask-test-parent",
         name: "ClaudeWorker",
         agent: "cc-worker",
         startTime: Date.now() - 1000,
@@ -366,6 +379,7 @@ describe("interactive subagents smoke tests", () => {
       assert.equal(harness.sentMessages[0].options?.triggerTurn, true);
       assert.equal(harness.sentMessages[0].options?.deliverAs, "steer");
     } finally {
+      unbindMailbox();
       rmSync(directory, { recursive: true, force: true });
     }
   });
