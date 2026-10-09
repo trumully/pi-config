@@ -51,6 +51,7 @@
     "extensions": [
       "./extensions/interactive-subagents/pi-extension/subagents/index.ts",
       "./extensions/ast-grep/index.ts",
+      "./extensions/gh-readonly/index.ts",
       "./extensions/prompt-snippets/index.ts",
       "./extensions/usage-footer/index.ts",
       "./node_modules/@juicesharp/rpiv-ask-user-question/index.ts",

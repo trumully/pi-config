@@ -38,9 +38,11 @@ Bundled profiles are `scout`, `worker`, `tasker`, `architect`, `writer`, `gh-sco
 | `architect` | `openai/gpt-6-luna` | Read-only design decisions and actionable plans; no shell or children |
 | `writer` | `openai/gpt-6-luna` | Scoped prose drafting/editing; no shell or children |
 | `gh-scout` | `openai/gpt-6-luna` | Read-only GitHub inspection with `gh` |
-| `researcher` | `openai/gpt-6-luna` | Web research |
+| `researcher` | `openai/gpt-6-luna` | Web research without local GitHub clones |
 | `cc-worker` | `claude-opus-5-5` | Claude Code implementation |
 | `cc-reviewer` | `claude-opus-5-5` | Read-only Claude Code review with triggering cases and refutation |
+
+Set `githubClone.enabled` to `false` in the active `pi-web-access` `web-search.json` to disable local repository clones. For GitHub repository inspection, researchers ask the parent to delegate to `gh-scout`. That profile has only [`gh_readonly`](../gh-readonly/README.md), a standalone, shell-free, allowlisted GitHub CLI extension; it cannot clone repositories or use general shell/local-file tools. Install `gh` and authenticate outside the agent before accessing private repositories.
 
 Use `tasker` for a small explicit job rather than a complex feature. `architect` returns a plan, not authorization to implement it. `writer` changes only authorized prose files and flags missing facts instead of inventing them. The new roles do not delegate; choose their use explicitly. Prompt adaptations and their upstream license are recorded in [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md).
 

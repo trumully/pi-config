@@ -291,6 +291,10 @@ function getToolExtensionPath(tool: string): string | undefined {
       join(extBase, "ast-grep", "index.ts"),
     ),
     safe_bash: join(SUBAGENTS_DIR, "tools", "safe-bash.ts"),
+    gh_readonly: resolveBundledOrGlobalPath(
+      getBundledSiblingPath("gh-readonly/index.ts"),
+      join(extBase, "gh-readonly", "index.ts"),
+    ),
   };
   // Prefer the built-in path, but fall back to a runtime-registered extension
   // when that path no longer exists on disk (e.g. a built-in tool extension
