@@ -49,4 +49,4 @@ Restart Pi after updating. `settings.example.json` is a reference, not a setting
 
 ## Workflow
 
-[Interactive subagents](extensions/interactive-subagents/README.md) delegate bounded work to scout, worker, and researcher profiles. Scouts and workers use [ast-grep](extensions/ast-grep/README.md); workers use codemode, and researchers use web access. Disable local GitHub cloning by setting `"githubClone": { "enabled": false }` in `~/.pi/agent/web-search.json` (or the config directory selected by `pi-web-access`). Researchers ask their parent to delegate repository inspection to `gh-scout`, which uses the dedicated `gh_readonly` tool instead of a shell. The GitHub CLI must be installed and already authenticated for private repositories. [Prompt snippets](extensions/prompt-snippets/README.md) add optional instructions to your next message. Open their menu with `Alt+S` or `/snippets`.
+Use [interactive subagents](extensions/interactive-subagents/README.md) to delegate focused tasks and [prompt snippets](extensions/prompt-snippets/README.md) to add reusable instructions to your messages. Open the snippets menu with `Alt+S` or `/snippets`.
