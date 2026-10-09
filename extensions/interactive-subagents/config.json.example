@@ -1,7 +1,9 @@
 {
   "status": {
-    "enabled": true
+    "enabled": true,
+    "mode": "compact"
   },
+  "limits": { "maxConcurrent": 4 },
   "proactiveCompaction": {
     "enabled": true,
     "thresholdPercent": 70

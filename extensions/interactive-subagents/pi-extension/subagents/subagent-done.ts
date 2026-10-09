@@ -15,7 +15,7 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Box, Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
-import { writeFileSync } from "node:fs";
+import { renameSync, writeFileSync } from "node:fs";
 import { randomUUID } from "node:crypto";
 import { createSubagentActivityRecorder } from "./activity.ts";
 import { registerSubagentProgress } from "./progress.ts";
@@ -640,11 +640,16 @@ export default function (pi: ExtensionAPI) {
       awaitingAnswer = true;
       recorder.askQuestion();
       const askData = {
+        id: randomUUID(),
         name: process.env.PI_SUBAGENT_NAME ?? "subagent",
         agent: process.env.PI_SUBAGENT_AGENT ?? "",
         question: params.question,
       };
-      writeFileSync(`${sessionFile}.ask`, JSON.stringify(askData));
+      // Write atomically so the parent watcher never reads a partial question.
+      const askFile = `${sessionFile}.ask`;
+      const tempFile = `${askFile}.tmp-${process.pid}-${askData.id}`;
+      writeFileSync(tempFile, JSON.stringify(askData));
+      renameSync(tempFile, askFile);
 
       const result = {
         content: [

@@ -9,6 +9,7 @@ import { execFile, execFileSync } from "node:child_process";
 import { promisify } from "node:util";
 import { existsSync, readFileSync, rmSync } from "node:fs";
 import { join } from "node:path";
+import { canonicalSessionPath } from "./lifecycle.ts";
 
 const execFileAsync = promisify(execFile);
 const MAX_BUFFER = 10 * 1024 * 1024;
@@ -358,21 +359,60 @@ export function closeSurface(surface: string): void {
 }
 
 /** Whether Herdr still recognizes an agent in the subagent's pane. */
-export async function isAgentRunning(surface: string): Promise<boolean> {
+export async function listRunningAgentPanes(): Promise<Set<string>> {
   requireHerdr();
   const stdout = await runHerdr(["agent", "list"]);
   const response = parseResponse<{ agents?: Array<{ pane_id?: string }> }>(stdout, "agent list");
-  return response.result?.agents?.some((agent) => agent.pane_id === surface) ?? false;
+  if (!Array.isArray(response.result?.agents)) throw new Error("herdr agent list returned no agents array");
+  return new Set(response.result.agents.flatMap((agent) => typeof agent.pane_id === "string" ? [agent.pane_id] : []));
+}
+
+export async function isAgentRunning(surface: string): Promise<boolean> {
+  return (await listRunningAgentPanes()).has(surface);
+}
+
+/** Resolve the registered run identity, including after a pane move. */
+export async function getRunningAgentSurface(
+  target: string, fallback?: { surface: string; sessionFile: string },
+): Promise<{ surface: string; tabId?: string } | null> {
+  requireHerdr();
+  let stdout: string;
+  try {
+    ({ stdout } = await execFileAsync(herdrBinary(), ["agent", "get", target], {
+      encoding: "utf8", timeout: 35_000, maxBuffer: MAX_BUFFER, windowsHide: true,
+    }));
+  } catch (error: any) {
+    const raw = String(error?.stderr || error?.stdout || "").trim();
+    try {
+      if (JSON.parse(raw)?.error?.code === "agent_not_found") {
+        if (!fallback) return null;
+        return findTranscriptWriter(fallback);
+      }
+    } catch {}
+    throw new Error(`Could not confirm Herdr identity ${target}: ${errorText(error)}`);
+  }
+  const response = parseResponse<{ agent?: { pane_id?: string; tab_id?: string } }>(stdout, "agent get");
+  const agent = response.result?.agent;
+  if (typeof agent?.pane_id !== "string") throw new Error(`Herdr returned no pane for ${target}`);
+  return { surface: agent.pane_id, ...(typeof agent.tab_id === "string" ? { tabId: agent.tab_id } : {}) };
 }
 
 // ── Exit polling ──
 
 export interface PollResult {
-  reason: "done" | "sentinel" | "agent-exit" | "error";
-  /** Exit status when available. Agent disappearance does not expose an OS exit code. */
-  exitCode: number;
+  /**
+   * `unconfirmed`: Herdr stopped listing the agent, but no sidecar, sentinel,
+   * or clean-exit signal confirmed how it ended.
+   */
+  reason: "done" | "sentinel" | "agent-exit" | "error" | "unconfirmed";
+  /** Exit status when known; null when the outcome is unconfirmed. */
+  exitCode: number | null;
   errorMessage?: string;
 }
+
+/** Bounded wait for a late exit signal after the agent disappears from Herdr. */
+const LATE_EXIT_SIGNAL_GRACE_MS = 2_000;
+const LATE_EXIT_SIGNAL_POLL_MS = 250;
 
 function interpretExitSidecar(data: any): PollResult {
   if (data?.type === "error") {
@@ -401,17 +441,71 @@ function readExitSidecar(sessionFile: string | undefined): PollResult | null {
 
 export const __pollForExitTest__ = { interpretExitSidecar, readExitSidecar };
 
+function sleep(ms: number, signal: AbortSignal): Promise<void> {
+  return new Promise<void>((resolve, reject) => {
+    if (signal.aborted) return reject(new Error("Aborted"));
+    const timer = setTimeout(() => {
+      signal.removeEventListener("abort", onAbort);
+      resolve();
+    }, ms);
+    function onAbort() {
+      clearTimeout(timer);
+      reject(new Error("Aborted"));
+    }
+    signal.addEventListener("abort", onAbort, { once: true });
+  });
+}
+
+function readExitSignal(options: {
+  sessionFile?: string;
+  sentinelFile?: string;
+  cleanExitConfirmed?: () => boolean;
+}): PollResult | null {
+  const exitResult = readExitSidecar(options.sessionFile);
+  if (exitResult) return exitResult;
+  if (options.sentinelFile) {
+    try {
+      if (existsSync(options.sentinelFile)) return { reason: "sentinel", exitCode: 0 };
+    } catch {}
+  }
+  try {
+    if (options.cleanExitConfirmed?.()) return { reason: "agent-exit", exitCode: 0 };
+  } catch {}
+  return null;
+}
+
+async function findTranscriptWriter(expected: { surface: string; sessionFile: string }): Promise<{ surface: string; tabId?: string } | null> {
+  const stdout = await runHerdr(["agent", "list"]);
+  const response = parseResponse<{ agents?: Array<{ pane_id?: string; tab_id?: string; agent_session?: { kind?: string; value?: string } }> }>(stdout, "agent list");
+  if (!Array.isArray(response.result?.agents)) throw new Error("Herdr agent identity list is unavailable");
+  const normalize = canonicalSessionPath;
+  for (const agent of response.result.agents) {
+    if (typeof agent.pane_id !== "string") continue;
+    if (agent.agent_session?.kind === "path" && typeof agent.agent_session.value === "string" &&
+        normalize(agent.agent_session.value) === normalize(expected.sessionFile)) {
+      return { surface: agent.pane_id, tabId: agent.tab_id };
+    }
+    if (agent.pane_id === expected.surface) throw new Error("Saved pane still contains an agent whose run identity cannot be confirmed");
+  }
+  return null;
+}
+
 /**
  * Wait for either the extension's error/completion sidecar, a Claude stop
- * sentinel, or Herdr to stop listing an agent in the child pane.
+ * sentinel, or Herdr to stop listing an agent in the child pane. A vanished
+ * agent counts as a clean exit only when a sidecar, sentinel, or
+ * `cleanExitConfirmed` says so; otherwise the outcome is `unconfirmed`.
  */
 export async function pollForExit(
   surface: string,
   signal: AbortSignal,
   options: {
     interval: number;
+    agentName?: string;
     sessionFile?: string;
     sentinelFile?: string;
+    /** Durable child-side signal that it ended cleanly, e.g. activity phase "done". */
+    cleanExitConfirmed?: () => boolean;
     onTick?: (elapsed: number) => void;
   },
 ): Promise<PollResult> {
@@ -430,29 +524,34 @@ export async function pollForExit(
     }
 
     let agentRunning = true;
+    let moved = false;
     try {
-      agentRunning = await isAgentRunning(surface);
+      if (options.agentName) {
+        const agent = await getRunningAgentSurface(options.agentName,
+          options.sessionFile ? { surface, sessionFile: options.sessionFile } : undefined,
+        );
+        agentRunning = agent !== null;
+        moved = !!agent && agent.surface !== surface;
+      } else {
+        agentRunning = await isAgentRunning(surface);
+      }
     } catch {
       // A transient Herdr/server error must not be confused with agent exit.
     }
+    if (moved) throw new Error("Child moved to another Herdr pane; reopen the parent session to reattach observation.");
 
     if (!agentRunning) {
-      // The process can disappear just before the final sidecar becomes visible.
-      return readExitSidecar(options.sessionFile) ?? { reason: "agent-exit", exitCode: 0 };
+      // The process can disappear just before its final signal becomes visible.
+      const graceEnd = Date.now() + LATE_EXIT_SIGNAL_GRACE_MS;
+      for (;;) {
+        const exitSignal = readExitSignal(options);
+        if (exitSignal) return exitSignal;
+        if (Date.now() >= graceEnd) return { reason: "unconfirmed", exitCode: null };
+        await sleep(LATE_EXIT_SIGNAL_POLL_MS, signal);
+      }
     }
 
     options.onTick?.(Math.floor((Date.now() - start) / 1000));
-    await new Promise<void>((resolve, reject) => {
-      if (signal.aborted) return reject(new Error("Aborted"));
-      const timer = setTimeout(() => {
-        signal.removeEventListener("abort", onAbort);
-        resolve();
-      }, options.interval);
-      function onAbort() {
-        clearTimeout(timer);
-        reject(new Error("Aborted"));
-      }
-      signal.addEventListener("abort", onAbort, { once: true });
-    });
+    await sleep(options.interval, signal);
   }
 }

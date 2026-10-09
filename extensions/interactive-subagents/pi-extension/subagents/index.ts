@@ -11,9 +11,27 @@ import {
   existsSync,
   mkdirSync,
   copyFileSync,
+  renameSync,
   unlinkSync,
 } from "node:fs";
+import { createHash } from "node:crypto";
 import { homedir, tmpdir } from "node:os";
+import {
+  CAPACITY_SCOPE_ENV, attachCapacity, capacityScope, loadCapacityLimit,
+  releaseCapacity, releasePriorCapacity, releaseUnsubmittedCapacity, reserveCapacity, restoreCapacity,
+  type CapacityTicket,
+} from "./capacity.ts";
+import {
+  bindMailbox,
+  createFileDeliveryStore,
+  currentParentSessionId,
+  deliveryId,
+  enqueueDelivery,
+  observeMessageEnd,
+  replayPending,
+  unbindMailbox,
+  warnOnce,
+} from "./delivery.ts";
 import {
   readClaudeCostEstimate,
   readClaudeUsageSidecar,
@@ -29,12 +47,15 @@ import {
   startAgent,
   promptAgent,
   pollForExit,
+  getRunningAgentSurface,
   closeSurface,
   readScreen,
 } from "./herdr.ts";
 
 import {
   countSessionEntryLines,
+  claimRegisteredRun,
+  updateRegisteredRun,
   findLastAssistantMessage,
   finishRegisteredRun,
   getNewEntries,
@@ -70,6 +91,7 @@ import {
   type ActivityReadResult,
   type SubagentActivityState,
 } from "./activity.ts";
+import { acquireTranscriptOwnership, inspectTranscriptOwnership, releaseTranscriptOwnership, updateTranscriptOwnership, type RunMetadata } from "./lifecycle.ts";
 import {
   handoffBlocksResultDelivery,
   handoffSidecarExists,
@@ -269,6 +291,10 @@ function getToolExtensionPath(tool: string): string | undefined {
       join(extBase, "ast-grep", "index.ts"),
     ),
     safe_bash: join(SUBAGENTS_DIR, "tools", "safe-bash.ts"),
+    gh_readonly: resolveBundledOrGlobalPath(
+      getBundledSiblingPath("gh-readonly/index.ts"),
+      join(extBase, "gh-readonly", "index.ts"),
+    ),
   };
   // Prefer the built-in path, but fall back to a runtime-registered extension
   // when that path no longer exists on disk (e.g. a built-in tool extension
@@ -557,6 +583,7 @@ function getArtifactDir(sessionDir: string, sessionId: string): string {
 }
 
 const statusConfig = loadStatusConfig();
+const maximumConcurrent = loadCapacityLimit();
 const proactiveCompactionEnabled = (() => {
   try {
     return loadProactiveCompactionConfig().enabled;
@@ -597,6 +624,36 @@ function sendSubagentResult(
   );
 }
 
+/**
+ * Record a run's result in the parent mailbox before handing it to Pi, so it
+ * survives a crash or reload until the parent transcript persists it. Falls
+ * back to a direct, non-recoverable send when the mailbox is unavailable.
+ */
+function deliverSubagentResult(
+  pi: Pick<ExtensionAPI, "sendMessage">,
+  runId: string,
+  content: string,
+  details: Record<string, unknown>,
+  terminationConfirmed: boolean,
+): void {
+  const parentSessionId = currentParentSessionId();
+  if (details.parentSessionId && details.parentSessionId !== parentSessionId) return;
+  if (parentSessionId) {
+    try {
+      const status = enqueueDelivery({
+        id: deliveryId(parentSessionId, runId, terminationConfirmed ? "result" : "watcher-error"),
+        customType: "subagent_result",
+        content,
+        details: { ...details, runId, terminationConfirmed },
+      });
+      if (status !== "unbound") return;
+    } catch (err: any) {
+      console.error(`[interactive-subagents] Could not record result for run ${runId} in the parent mailbox; delivering without crash recovery: ${err?.message ?? String(err)}`);
+    }
+  }
+  sendSubagentResult(pi, content, { ...details, runId, terminationConfirmed });
+}
+
 /** Shared registry/result boundary for fresh spawns and resumed runs. */
 function completeRun(
   artifactDir: string,
@@ -606,18 +663,69 @@ function completeRun(
 ): void {
   const registryEntry = resolveNameInRegistry(artifactDir, running.name);
   if (registryEntry?.runId && registryEntry.runId !== running.id) return;
+  // A watcher belongs to the parent session that spawned it. If Pi switched
+  // sessions or unbound the mailbox, leave its durable running record intact;
+  // reopening that parent will reconcile and deliver the stable run ID there.
+  if (running.parentSessionId && currentParentSessionId() !== running.parentSessionId) return;
   updateWidget();
-  if (terminationConfirmed) {
-    try {
-      finishRegisteredRun(artifactDir, running.name, running.id);
-    } catch (err: any) {
-      console.error(`[interactive-subagents] Could not persist completion for "${running.name}" (run ${running.id}): ${err?.message ?? String(err)}`);
-    }
-  }
   try {
     deliver();
   } catch (err: any) {
     console.error(`[interactive-subagents] Could not deliver result for "${running.name}" (run ${running.id}): ${err?.message ?? String(err)}`);
+  }
+  if (terminationConfirmed) {
+    try {
+      const finished = finishRegisteredRun(artifactDir, running.name, running.id);
+      if (finished && running.ownershipToken) releaseTranscriptOwnership(running.sessionFile, running.ownershipToken);
+      if (finished && running.runMetadata?.capacity) releaseCapacity(running.runMetadata.capacity);
+    } catch (err: any) {
+      console.error(`[interactive-subagents] Could not persist completion for "${running.name}" (run ${running.id}): ${err?.message ?? String(err)}`);
+    }
+  } else {
+    try {
+      const current = resolveNameInRegistry(artifactDir, running.name);
+      if (current?.runId === running.id && current.runMetadata) {
+        updateRegisteredRun(artifactDir, running.name, running.id, {
+          running: true, runMetadata: { ...current.runMetadata, state: "unknown" },
+        });
+      }
+    } catch (err: any) {
+      console.error(`[interactive-subagents] Could not persist UNKNOWN state for "${running.name}" (run ${running.id}): ${err?.message ?? String(err)}`);
+    }
+  }
+}
+
+/** Roll back only when Herdr has never received a start request. */
+function rollbackUnsubmittedResume(
+  artifactDir: string, name: string, prior: NameRegistryEntry, runId: string,
+  sessionFile: string, ownerToken: string, capacity: CapacityTicket, registryClaimed: boolean,
+): void {
+  // Restore archived signals while the transcript is still exclusively owned.
+  for (const suffix of [".exit", ".ask", ".pending"]) {
+    const path = `${sessionFile}${suffix}`;
+    const archived = `${path}.prior-${runId}`;
+    try {
+      if (existsSync(archived) && !existsSync(path)) renameSync(archived, path);
+    } catch (error: any) {
+      warnOnce(`resume-rollback-signal:${runId}:${suffix}`, `Could not restore ${path}: ${error?.message ?? String(error)}`);
+    }
+  }
+  if (registryClaimed) {
+    try {
+      updateRegisteredRun(artifactDir, name, runId, { ...prior, runMetadata: prior.runMetadata });
+    } catch (error: any) {
+      warnOnce(`resume-rollback-registry:${runId}`, `Could not restore the prior registry run for "${name}": ${error?.message ?? String(error)}`);
+    }
+  }
+  try {
+    releaseTranscriptOwnership(sessionFile, ownerToken);
+  } catch (error: any) {
+    warnOnce(`resume-rollback-owner:${runId}`, `Could not release unsubmitted resume ownership for "${name}": ${error?.message ?? String(error)}`);
+  }
+  try {
+    releaseCapacity(capacity);
+  } catch (error: any) {
+    warnOnce(`resume-rollback-capacity:${runId}`, `Could not release unsubmitted resume capacity for "${name}": ${error?.message ?? String(error)}`);
   }
 }
 
@@ -651,6 +759,14 @@ function resolveResultPresentation(
     );
   }
 
+  if (result.exitCode === null) {
+    return (
+      `Sub-agent "${name}" exited after ${formatElapsed(result.elapsed)} without a completion signal, ` +
+      `so its outcome is unconfirmed: it may have finished, crashed, been killed, or been closed by the user. ` +
+      `Verify the work before relying on it. Its last output follows.\n\n${result.summary}`
+    );
+  }
+
   return result.exitCode !== 0
     ? `Sub-agent "${name}" failed (exit code ${result.exitCode}).\n\n${result.summary}`
     : `Sub-agent "${name}" completed (${formatElapsed(result.elapsed)}).\n\n${result.summary}`;
@@ -667,7 +783,8 @@ interface SubagentResult {
   /** Canonical session header id, used for follow-ups via subagent_message. */
   sessionId?: string;
   claudeSessionId?: string;
-  exitCode: number;
+  /** Null when the child vanished without a confirming exit signal. */
+  exitCode: number | null;
   elapsed: number;
   error?: string;
   /** Provider/agent error message when auto-retry exhausted (overload, rate limit, etc.). */
@@ -720,6 +837,10 @@ interface RunningSubagent {
    * subagent's pane (e.g. planner).
    */
   interactive: boolean;
+  parentSessionId?: string;
+  parentArtifactDir?: string;
+  ownershipToken?: string;
+  runMetadata?: RunMetadata;
 }
 
 /** All currently running subagents, keyed by id. */
@@ -814,7 +935,59 @@ function borderBottom(width: number): string {
   return `${ACCENT}╰${"─".repeat(inner)}╯${RST}`;
 }
 
-function renderSubagentWidgetLines(agents: RunningSubagent[], width: number): string[] {
+function renderMinimalSubagentWidgetLine(agents: RunningSubagent[], width: number): string[] {
+  const counts = new Map<string, number>();
+  for (const agent of agents) {
+    const kind = statusConfig.enabled ? classifyStatus(agent.statusState, Date.now()).kind : "running";
+    counts.set(kind, (counts.get(kind) ?? 0) + 1);
+  }
+  const labels = statusConfig.enabled
+    ? ["active", "waiting", "starting", "stalled", "running"]
+    : ["running"];
+  const summary = labels
+    .filter((label) => (counts.get(label) ?? 0) > 0)
+    .map((label) => `${counts.get(label)} ${label}`)
+    .join(" · ");
+  return [truncateToWidth(`↳ ${agents.length} subagents · ${summary}`, width)];
+}
+
+function renderCompactSubagentWidgetLines(agents: RunningSubagent[], width: number): string[] {
+  if (width <= 0) return [];
+  const now = Date.now();
+  const rows = agents.map((agent) => {
+    const snapshot = classifyStatus(agent.statusState, now);
+    const kind = statusConfig.enabled ? snapshot.kind : "running";
+    const name = `${agent.name}${agent.agent ? ` (${agent.agent})` : ""}`.replace(/\s+/g, " ");
+    const status = kind === "active"
+      ? snapshot.activityLabel ?? snapshot.activeScope ?? "active"
+      : kind;
+    return {
+      identity: `${widgetIcon(kind)} ${name}`,
+      elapsed: formatElapsedMMSS(agent.startTime),
+      status: truncateToWidth(status.replace(/\s+/g, " ").trim(), 24),
+    };
+  });
+  const identityWidth = Math.max(0, ...rows.map((row) => visibleWidth(row.identity)));
+  const elapsedWidth = Math.max(0, ...rows.map((row) => visibleWidth(row.elapsed)));
+  const statusWidth = Math.max(0, ...rows.map((row) => visibleWidth(row.status)));
+  // Align short rows without stretching them across the terminal. Reserve room
+  // for elapsed time and status; on tiny terminals keep the agent identity first.
+  const availableIdentity = width - elapsedWidth - statusWidth - 4;
+  return rows.map((row) => {
+    if (availableIdentity < 8) return truncateToWidth(`${row.identity}  ${row.elapsed}  ${row.status}`, width);
+    const columns = Math.min(identityWidth, availableIdentity);
+    const identity = truncateToWidth(row.identity, columns);
+    return `${identity}${" ".repeat(columns - visibleWidth(identity) + 2)}${row.elapsed.padStart(elapsedWidth)}  ${row.status}`;
+  });
+}
+
+function renderSubagentWidgetLines(
+  agents: RunningSubagent[],
+  width: number,
+  mode: "compact" | "minimal" | "full" = statusConfig.mode,
+): string[] {
+  if (mode === "compact") return renderCompactSubagentWidgetLines(agents, width);
+  if (mode === "minimal") return renderMinimalSubagentWidgetLine(agents, width);
   const count = agents.length;
   const title = "Subagents";
   const info = `${count} running`;
@@ -1127,7 +1300,10 @@ function resolveRunningByName(name: string):
     return { error: "Provide the exact display name of a running subagent." };
   }
 
-  const matches = Array.from(runningSubagents.values()).filter((running) => running.name === requestedName);
+  const parentSessionId = currentParentSessionId();
+  const matches = Array.from(runningSubagents.values()).filter((running) =>
+    running.name === requestedName && (!running.parentSessionId || running.parentSessionId === parentSessionId),
+  );
   if (matches.length === 1) return { running: matches[0] };
   if (matches.length === 0) {
     const names = Array.from(runningSubagents.values()).map((r) => r.name);
@@ -1225,6 +1401,7 @@ function startStatusRefresh(pi: ExtensionAPI) {
     let shouldRefreshWidget = false;
 
     for (const running of runningSubagents.values()) {
+      if (running.parentSessionId && running.parentSessionId !== currentParentSessionId()) continue;
       observeRunningSubagent(running, now);
       const { nextState, snapshot, transition } = advanceStatusState(running.statusState, now);
       if (nextState.currentKind !== running.statusState.currentKind) {
@@ -1281,7 +1458,9 @@ function persistDeliveredTaskBrief(
   deliveredResult: any,
   deliverySucceeded: boolean,
   metadata: Partial<NameRegistryEntry> = {},
-  writeRegistry: typeof registerName = registerName,
+  writeRegistry: typeof registerName = (dir, name, entry) => {
+    if (!updateRegisteredRun(dir, name, running.id, entry)) throw new Error("The persisted run changed.");
+  },
 ): any {
   if (!deliverySucceeded) return deliveredResult;
   running.task = message;
@@ -1355,6 +1534,8 @@ export const __test__ = {
   deliverPendingQuestion,
   resolveResultPresentation,
   sendSubagentResult,
+  deliverSubagentResult,
+  rollbackUnsubmittedResume,
   resolveResumeLaunchBehavior,
   finishedIntentError,
   formatSubagentMessage,
@@ -1365,6 +1546,8 @@ export const __test__ = {
   formatContextUsage,
   contextWindowFor,
   formatUsageSegments,
+  renderMinimalSubagentWidgetLine,
+  reconcileParentRuns,
   widgetIcon,
 };
 
@@ -1433,9 +1616,21 @@ function startWidgetRefresh() {
  *
  * Call watchSubagent() on the returned object to observe completion.
  */
-async function launchSubagent(
-  params: typeof SubagentParams.static,
-  ctx: { sessionManager: { getSessionFile(): string | null; getSessionId(): string; getSessionDir(): string }; cwd: string },
+type LaunchContext = { sessionManager: { getSessionFile(): string | null; getSessionId(): string; getSessionDir(): string }; cwd: string };
+
+async function launchSubagent(params: typeof SubagentParams.static, ctx: LaunchContext): Promise<RunningSubagent> {
+  const artifactDir = getArtifactDir(ctx.sessionManager.getSessionDir(), ctx.sessionManager.getSessionId());
+  const capacity = await reserveCapacity(capacityScope(artifactDir, maximumConcurrent));
+  try {
+    return await launchReservedSubagent(params, ctx, capacity);
+  } catch (error) {
+    releaseUnsubmittedCapacity(capacity);
+    throw error;
+  }
+}
+
+async function launchReservedSubagent(
+  params: typeof SubagentParams.static, ctx: LaunchContext, capacity: CapacityTicket,
 ): Promise<RunningSubagent> {
   const startTime = Date.now();
   const id = Math.random().toString(16).slice(2, 10);
@@ -1518,14 +1713,39 @@ async function launchSubagent(
 
     const allocatedSurface = createSubagentSurface(params.name, {
       cwd: targetCwdForSession,
-      env: buildClaudeLaunchEnv(sentinelFile, agentDefs?.autoExit),
+      env: { ...buildClaudeLaunchEnv(sentinelFile, agentDefs?.autoExit), [CAPACITY_SCOPE_ENV]: capacity.scope },
     });
     const { surface, tabId } = allocatedSurface;
+    const parentSessionId = ctx.sessionManager.getSessionId();
+    const parentArtifactDir = getArtifactDir(ctx.sessionManager.getSessionDir(), parentSessionId);
+    const claudeMetadata: RunMetadata = {
+      version: 1, state: "launching", parentSessionId, runId: id, herdrAgentName, surface,
+      ...(tabId ? { herdrTabId: tabId } : {}), sessionFile: subagentSessionFile, transcriptOffset: 0,
+      usageFile: `${sentinelFile}.usage.json`, askFile: `${sentinelFile}.ask`,
+      pendingFile: `${sentinelFile}.pending`, sentinelFile, profile: params.agent, task: params.task,
+      startTime, cli: "claude", interactive: effectiveInteractive, capacity,
+    };
     try {
+      claimRegisteredRun(parentArtifactDir, params.name, {
+        sessionFile: subagentSessionFile, sessionId: null, usageFile: `${sentinelFile}.usage.json`,
+        running: true, runId: id, taskBrief: params.task, runMetadata: claudeMetadata,
+      });
+    } catch (error) {
+      closeSurfaceAndTab(surface, tabId);
+      throw error;
+    }
+    try {
+      attachCapacity(capacity, parentArtifactDir, params.name, id);
       await startAgent(herdrAgentName, "claude", surface, args);
       // Start without a positional task so Herdr can return as soon as the
       // agent is ready; submit work separately and confirm it entered a turn.
       promptAgent(herdrAgentName, params.task, { waitForWorking: true });
+      claudeMetadata.state = "running";
+      claudeMetadata.launchConfirmed = true;
+      updateRegisteredRun(parentArtifactDir, params.name, id, {
+        sessionFile: subagentSessionFile, sessionId: null, usageFile: `${sentinelFile}.usage.json`,
+        running: true, runId: id, taskBrief: params.task, runMetadata: claudeMetadata,
+      });
     } catch (error) {
       handleClaudeLaunchError(error, herdrAgentName, surface, tabId);
     }
@@ -1547,6 +1767,9 @@ async function launchSubagent(
       pendingFile: `${sentinelFile}.pending`,
       usageFile: `${sentinelFile}.usage.json`,
       interactive: effectiveInteractive,
+      parentSessionId,
+      parentArtifactDir,
+      runMetadata: claudeMetadata,
       statusState: createStatusState({
         source: "claude",
         startTimeMs: startTime,
@@ -1617,6 +1840,7 @@ async function launchSubagent(
 
   // Submit the task text directly. The parent builds the complete initial message,
   // including wrapper instructions for blank-session modes.
+  childEnv[CAPACITY_SCOPE_ENV] = capacity.scope;
   const promptArgs = buildPiPromptArgs({
     effectiveSkills,
     taskArg: fullTask,
@@ -1626,13 +1850,49 @@ async function launchSubagent(
     env: childEnv,
   });
   const { surface, tabId } = allocatedSurface;
+  const parentSessionId = ctx.sessionManager.getSessionId();
+  let ownerToken: string;
   try {
+    ownerToken = acquireTranscriptOwnership({
+      sessionFile: subagentSessionFile, runId: id, herdrAgentName, surface, state: "launching",
+    });
+  } catch (error) {
+    closeSurfaceAndTab(surface, tabId);
+    throw error;
+  }
+  const runMetadata: RunMetadata = {
+    version: 1, state: "launching", parentSessionId, runId: id, herdrAgentName,
+    surface, ...(tabId ? { herdrTabId: tabId } : {}), sessionFile: subagentSessionFile,
+    transcriptOffset: startEntryCount, ownerToken, activityFile,
+    askFile: `${subagentSessionFile}.ask`, pendingFile: `${subagentSessionFile}.pending`, profile: params.agent,
+    task: params.task, startTime, cli: "pi", interactive: effectiveInteractive, capacity,
+  };
+  const parentArtifactDir = getArtifactDir(ctx.sessionManager.getSessionDir(), parentSessionId);
+  try {
+    claimRegisteredRun(parentArtifactDir, params.name, {
+      sessionFile: subagentSessionFile, sessionId: getSessionId(subagentSessionFile),
+      activityFile, running: true, runId: id, taskBrief: params.task, runMetadata,
+    });
+  } catch (error) {
+    releaseTranscriptOwnership(subagentSessionFile, ownerToken);
+    closeSurfaceAndTab(surface, tabId);
+    throw error;
+  }
+  try {
+    attachCapacity(capacity, parentArtifactDir, params.name, id);
     await startAgent(herdrAgentName, "pi", surface, parts);
     // Herdr starts the Pi TUI ready for input. Submit skill commands and task
     // text separately so Pi can expand skills before processing the task.
     for (const promptArg of promptArgs) {
       if (promptArg !== "") promptAgent(herdrAgentName, promptArg);
     }
+    runMetadata.state = "running";
+    runMetadata.launchConfirmed = true;
+    updateTranscriptOwnership(subagentSessionFile, ownerToken, "running");
+    updateRegisteredRun(parentArtifactDir, params.name, id, {
+      sessionFile: subagentSessionFile, sessionId: getSessionId(subagentSessionFile),
+      activityFile, running: true, runId: id, taskBrief: params.task, runMetadata,
+    });
   } catch (error) {
     closeSurfaceAndTab(surface, tabId);
     throw error;
@@ -1650,7 +1910,13 @@ async function launchSubagent(
     startEntryCount,
     sessionFile: subagentSessionFile,
     activityFile,
+    askFile: `${subagentSessionFile}.ask`,
+    pendingFile: `${subagentSessionFile}.pending`,
     interactive: effectiveInteractive,
+    parentSessionId,
+    parentArtifactDir,
+    ownershipToken: ownerToken,
+    runMetadata,
     statusState: createStatusState({
       source: "pi",
       startTimeMs: startTime,
@@ -1731,49 +1997,130 @@ function copyClaudeSession(sentinelFile: string): string | null {
   }
 }
 
+/** A `.ask` file must stay unparseable and unchanged this long before it is quarantined. */
+const MALFORMED_ASK_SETTLE_MS = 2_000;
+/** Unparseable `.ask` files seen by the watcher, keyed by path. */
+const malformedAsks = new Map<string, { fingerprint: string; since: number }>();
+
+function questionReplyHint(name: string): string {
+  return `\n\nReply with subagent_message({ name: "${name}", message: "…" }) - the same name works whether it is still running or has since exited. It stays open until you reply.`;
+}
+
 /**
  * Detect an `ask_question` signal from a still-running subagent and notify the
- * orchestrator without ending the subagent. Each subagent has its own
- * `${sessionFile}.ask` file and its own watcher, so parallel questions from
- * multiple subagents are delivered independently. The file is deleted after
- * delivery so it fires once per question (a subagent may ask again later).
+ * orchestrator without ending the subagent. Each subagent has its own `.ask`
+ * file and its own watcher, so parallel questions are delivered independently.
+ * The file is removed only after the question is recorded in the parent
+ * mailbox; until then it is retried on the next tick. The pending marker is
+ * left for the child's reply hook to clear.
  */
 function deliverPendingQuestion(running: RunningSubagent): void {
   const askFile = running.askFile ?? `${running.sessionFile}.ask`;
+  let raw: string;
+  try {
+    if (!existsSync(askFile)) {
+      malformedAsks.delete(askFile);
+      return;
+    }
+    raw = readFileSync(askFile, "utf-8");
+  } catch {
+    return; // Transient read failure: retry on the next tick.
+  }
+  // Without a parent mailbox the question cannot be recorded; keep it.
+  const parentSessionId = currentParentSessionId();
+  if (!parentSessionId || parentSessionId !== running.parentSessionId) return;
+
+  const fingerprint = createHash("sha256").update(raw).digest("hex").slice(0, 16);
   let payload: any = null;
   try {
-    if (!existsSync(askFile)) return;
-    payload = JSON.parse(readFileSync(askFile, "utf-8"));
-  } catch {
-    // Malformed/partway-written file - drop it and move on.
-  }
-  try {
-    unlinkSync(askFile);
+    payload = JSON.parse(raw);
   } catch {}
-  if (typeof payload?.question !== "string" || !payload.question.trim()) {
-    if (running.pendingFile) try { unlinkSync(running.pendingFile); } catch {}
+  const question = typeof payload?.question === "string" ? payload.question.trim() : "";
+  if (!question) {
+    quarantineMalformedQuestion(running, askFile, fingerprint, parentSessionId);
     return;
   }
+  malformedAsks.delete(askFile);
 
   const name = running.name; // unique per session (deduped at spawn) - targets the reply
+  // Producers write a unique id; the content fingerprint covers older children.
+  const questionId = typeof payload.id === "string" && payload.id.trim() ? payload.id.trim() : fingerprint;
+  const id = deliveryId(parentSessionId, running.id, "question", questionId);
   const sessionId = existsSync(running.sessionFile) ? getSessionId(running.sessionFile) : null;
   const elapsed = Math.floor((Date.now() - running.startTime) / 1000);
-  const replyHint = `\n\nReply with subagent_message({ name: "${name}", message: "…" }) - the same name works whether it is still running or has since exited. It stays open until you reply.`;
 
-  latestPi?.sendMessage(
-    {
+  try {
+    enqueueDelivery({
+      id,
       customType: "subagent_question",
-      content: `Sub-agent "${name}" asks (${formatElapsed(elapsed)}):\n\n${payload.question}${replyHint}`,
-      display: true,
+      content: `Sub-agent "${name}" asks (${formatElapsed(elapsed)}):\n\n${question}${questionReplyHint(name)}`,
       details: {
         name,
         agent: running.agent,
-        question: payload.question,
+        question,
+        runId: running.id,
+        questionId,
         ...(sessionId ? { sessionId } : {}),
       },
-    },
-    { triggerTurn: true, deliverAs: "steer" },
-  );
+    });
+  } catch (err: any) {
+    warnOnce(`ask:${id}`, `Could not record question from "${name}" (run ${running.id}); keeping ${askFile} and retrying: ${err?.message ?? String(err)}`);
+    return;
+  }
+  try {
+    unlinkSync(askFile);
+  } catch {
+    // A later tick re-reads the same question; its stable ID suppresses a resend.
+  }
+}
+
+/**
+ * Set aside a `.ask` file that stays unreadable, and tell the parent once that
+ * the child may be waiting. A just-written file gets time to settle first.
+ */
+function quarantineMalformedQuestion(
+  running: RunningSubagent,
+  askFile: string,
+  fingerprint: string,
+  parentSessionId: string,
+): void {
+  const now = Date.now();
+  const seen = malformedAsks.get(askFile);
+  if (!seen || seen.fingerprint !== fingerprint) {
+    malformedAsks.set(askFile, { fingerprint, since: now });
+    return;
+  }
+  if (now - seen.since < MALFORMED_ASK_SETTLE_MS) return;
+
+  const name = running.name;
+  const quarantinedFile = `${askFile}.malformed-${fingerprint}`;
+  const id = deliveryId(parentSessionId, running.id, "question-malformed", fingerprint);
+  try {
+    enqueueDelivery({
+      id,
+      customType: "subagent_question",
+      content:
+        `Sub-agent "${name}" tried to ask a question, but its question file was unreadable. ` +
+        `It was set aside at ${quarantinedFile}. The sub-agent may be waiting for a reply.${questionReplyHint(name)}`,
+      details: {
+        name,
+        agent: running.agent,
+        question: `(Unreadable question; set aside at ${quarantinedFile})`,
+        runId: running.id,
+        malformed: true,
+        quarantinedFile,
+      },
+    });
+  } catch (err: any) {
+    warnOnce(`ask:${id}`, `Could not report the unreadable question from "${name}" (run ${running.id}); keeping ${askFile}: ${err?.message ?? String(err)}`);
+    return;
+  }
+  try {
+    renameSync(askFile, quarantinedFile);
+    malformedAsks.delete(askFile);
+  } catch (err: any) {
+    warnOnce(`quarantine:${askFile}`, `Could not set aside unreadable question file ${askFile}: ${err?.message ?? String(err)}`);
+  }
 }
 
 async function watchSubagent(
@@ -1785,8 +2132,17 @@ async function watchSubagent(
   try {
     const result = await pollForExit(surface, AbortSignal.any([signal, getModuleAbortSignal()]), {
       interval: 1000,
+      agentName: running.herdrAgentName,
       sessionFile,
       sentinelFile: running.sentinelFile,
+      // Pi children mark their activity "done" before an orderly exit (auto-exit
+      // or quit). Claude children confirm through the stop-hook sentinel.
+      cleanExitConfirmed: running.activityFile
+        ? () => {
+            const read = readSubagentActivityFile(running.activityFile!, running.id);
+            return read.ok && read.activity.phase === "done";
+          }
+        : undefined,
       onTick() {
         observeRunningSubagent(running);
         deliverPendingQuestion(running);
@@ -1812,7 +2168,7 @@ async function watchSubagent(
       }
 
       if (!summary) {
-        summary = result.exitCode !== 0
+        summary = result.exitCode !== 0 && result.exitCode !== null
           ? `Claude Code exited with code ${result.exitCode}`
           : "Claude Code exited without output";
       }
@@ -1880,18 +2236,18 @@ async function watchSubagent(
     // Pi subagent result extraction
     let summary: string;
     if (existsSync(sessionFile)) {
-      const allEntries = getNewEntries(sessionFile, 0);
+      const allEntries = getNewEntries(sessionFile, running.startEntryCount);
       summary =
         findLastAssistantMessage(allEntries) ??
         (result.errorMessage
           ? `Subagent error: ${result.errorMessage}`
-          : result.exitCode !== 0
+          : result.exitCode !== 0 && result.exitCode !== null
             ? `Sub-agent exited with code ${result.exitCode}`
             : "Sub-agent exited without output");
     } else {
       summary = result.errorMessage
         ? `Subagent error: ${result.errorMessage}`
-        : result.exitCode !== 0
+        : result.exitCode !== 0 && result.exitCode !== null
           ? `Sub-agent exited with code ${result.exitCode}`
           : "Sub-agent exited without output";
     }
@@ -1942,11 +2298,105 @@ async function watchSubagent(
   }
 }
 
+async function reconcileParentRuns(pi: ExtensionAPI, ctx: ExtensionContext, parentSessionId: string, artifactDir: string, isCurrent: () => boolean): Promise<void> {
+  if (!isCurrent()) return;
+  const registry = readNameRegistry(artifactDir);
+  const candidates = Object.entries(registry).filter(([, entry]) => entry.running && entry.runMetadata?.parentSessionId === parentSessionId);
+  if (candidates.length === 0) return;
+  for (const [name, entry] of candidates) {
+    const meta = entry.runMetadata!;
+    if (!isCurrent()) return;
+    if (!meta.capacity) {
+      try {
+        meta.capacity = restoreCapacity(artifactDir, name, meta.runId, maximumConcurrent);
+        updateRegisteredRun(artifactDir, name, meta.runId, { runMetadata: meta });
+      } catch (error: any) {
+        warnOnce(`capacity-recovery:${parentSessionId}:${meta.runId}`,
+          `Could not restore capacity for "${name}"; observation will still recover, while new launches remain guarded: ${error?.message ?? String(error)}`);
+      }
+    }
+    if (runningSubagents.has(meta.runId)) continue;
+    let livePanes: Set<string>;
+    try {
+      const agent = await getRunningAgentSurface(meta.herdrAgentName, { surface: meta.surface, sessionFile: meta.sessionFile });
+      if (!isCurrent()) return;
+      if (agent) {
+        meta.surface = agent.surface;
+        meta.herdrTabId = agent.tabId;
+      }
+      livePanes = new Set(agent ? [agent.surface] : []);
+    } catch (error: any) {
+      if (!isCurrent()) return;
+      updateRegisteredRun(artifactDir, name, meta.runId, {
+        running: true, runMetadata: { ...meta, launchConfirmed: meta.launchConfirmed ?? meta.state === "running", state: "unknown" },
+      });
+      console.error(`[interactive-subagents] Herdr status unavailable for "${name}"; leaving it UNKNOWN: ${error?.message ?? String(error)}`);
+      continue;
+    }
+    if (!livePanes.has(meta.surface) && meta.state === "launching") {
+      const unknown = { ...meta, state: "unknown" as const };
+      try { updateRegisteredRun(artifactDir, name, meta.runId, { running: true, runMetadata: unknown }); } catch {}
+      continue; // A delayed launch may still appear; never report it exited or resume it.
+    }
+    if (!livePanes.has(meta.surface) && meta.state === "unknown" && !meta.launchConfirmed) continue;
+    if (livePanes.has(meta.surface) && meta.state === "launching") {
+      meta.state = "running";
+      meta.launchConfirmed = true;
+      try { updateRegisteredRun(artifactDir, name, meta.runId, { running: true, runMetadata: meta }); } catch {}
+      if (meta.ownerToken && meta.cli === "pi") {
+        try { updateTranscriptOwnership(meta.sessionFile, meta.ownerToken, "running"); } catch {}
+      }
+    }
+
+    const current = resolveNameInRegistry(artifactDir, name);
+    if (current?.runId !== meta.runId || !current.running || !isCurrent()) continue;
+    const running: RunningSubagent = {
+      id: meta.runId, name, task: current.taskBrief ?? meta.task, agent: meta.profile, surface: meta.surface,
+      herdrTabId: meta.herdrTabId, herdrAgentName: meta.herdrAgentName, startTime: meta.startTime,
+      startEntryCount: meta.transcriptOffset, sessionFile: meta.sessionFile,
+      activityFile: meta.activityFile, askFile: meta.askFile, pendingFile: meta.pendingFile,
+      sentinelFile: meta.sentinelFile, usageFile: meta.usageFile, cli: meta.cli,
+      interactive: meta.interactive ?? true, parentSessionId, parentArtifactDir: artifactDir,
+      ownershipToken: meta.ownerToken, runMetadata: meta,
+      statusState: createStatusState({ source: meta.cli, startTimeMs: meta.startTime }),
+    };
+    runningSubagents.set(running.id, running);
+    const watcherAbort = new AbortController();
+    running.abortController = watcherAbort;
+    watchSubagent(running, watcherAbort.signal).then((result) => {
+      if (result.detached) return;
+      const summary = result.summary;
+      completeRun(artifactDir, running, () => {
+        deliverSubagentResult(pi, running.id, resolveResultPresentation({ ...result, summary }, name), {
+          parentSessionId, name, task: running.task, agent: running.agent, exitCode: result.exitCode,
+          elapsed: result.elapsed, sessionFile: result.sessionFile ?? meta.sessionFile,
+          ...(entry.sessionId ? { sessionId: entry.sessionId } : {}),
+          ...(result.errorMessage ? { errorMessage: result.errorMessage } : {}),
+          ...(result.handoffInterrupted ? { handoffInterrupted: true, handoffPhase: result.handoffPhase } : {}),
+          ...(result.claudeSessionId ? { claudeSessionId: result.claudeSessionId } : {}),
+          ...(result.stats ? { stats: result.stats } : {}),
+          ...(result.terminationConfirmed === false ? { error: result.error } : {}),
+        }, result.terminationConfirmed !== false);
+      }, result.terminationConfirmed !== false);
+    }).catch((error: any) => {
+      const unknown = { ...meta, state: "unknown" as const };
+      try { updateRegisteredRun(artifactDir, name, meta.runId, { running: true, runMetadata: unknown }); } catch {}
+      console.error(`[interactive-subagents] Recovered watcher for "${name}" failed without confirming exit: ${error?.message ?? String(error)}`);
+    });
+  }
+  if (runningSubagents.size > 0) {
+    startWidgetRefresh();
+    startStatusRefresh(pi);
+  }
+}
+
 export default function subagentsExtension(pi: ExtensionAPI) {
   latestPi = pi;
+  let sessionEpoch = 0;
   // Capture the UI context for widget updates
   pi.on("session_start", (_event, ctx) => {
     latestCtx = ctx;
+    const epoch = ++sessionEpoch;
     // pi runs multiple sessions in one process. A prior session's shutdown
     // aborts the shared module poll-abort controller; install a fresh one so
     // subagents spawned in this session aren't watched against a dead signal.
@@ -1955,10 +2405,58 @@ export default function subagentsExtension(pi: ExtensionAPI) {
     if (!prevAbort || prevAbort.signal.aborted) {
       (globalThis as any)[POLL_ABORT_KEY] = new AbortController();
     }
+
+    // Bind this session's durable mailbox and replay anything a previous
+    // runtime recorded but the transcript never persisted.
+    if (ctx.sessionManager.getSessionFile()) {
+      const parentSessionId = ctx.sessionManager.getSessionId();
+      const artifactDir = getArtifactDir(ctx.sessionManager.getSessionDir(), parentSessionId);
+      bindMailbox({
+        parentSessionId,
+        store: createFileDeliveryStore(join(artifactDir, "subagent-mailbox")),
+        send(item) {
+          pi.sendMessage(
+            { customType: item.customType, content: item.content, display: true, details: item.details },
+            { triggerTurn: true, deliverAs: "steer" },
+          );
+        },
+        getEntries: () => ctx.sessionManager.getEntries(),
+        isIdle: () => ctx.isIdle(),
+      });
+      try {
+        capacityScope(artifactDir, maximumConcurrent);
+      } catch (error: any) {
+        warnOnce(`capacity-startup:${parentSessionId}`,
+          `Could not initialize launch capacity; mailbox replay and run recovery will still proceed: ${error?.message ?? String(error)}`);
+      }
+      // Bind before reconciliation: any terminal result recovered below must
+      // target this session's mailbox, never a later session's binding.
+      setTimeout(() => {
+        if (epoch !== sessionEpoch || currentParentSessionId() !== parentSessionId) return;
+        void reconcileParentRuns(pi, ctx, parentSessionId, artifactDir,
+          () => epoch === sessionEpoch && currentParentSessionId() === parentSessionId,
+        ).catch((error) => console.error(`[interactive-subagents] Recovery failed: ${error?.message ?? String(error)}`));
+        replayPending();
+      }, 0);
+    } else {
+      unbindMailbox();
+    }
+  });
+
+  // Acknowledge mailbox items once their transcript entries are persisted.
+  pi.on("message_end", (event) => {
+    observeMessageEnd((event as any).message);
+  });
+
+  // Model-free idle inspection: retry items whose earlier send never reached
+  // the transcript. Delivery itself wakes the parent; no recap is generated.
+  pi.on("agent_settled", () => {
+    replayPending();
   });
 
   // Clean up on session shutdown
   pi.on("session_shutdown", (_event, _ctx) => {
+    sessionEpoch++;
     if (widgetInterval) {
       clearInterval(widgetInterval);
       widgetInterval = null;
@@ -1978,6 +2476,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       agent.abortController?.abort();
     }
     runningSubagents.clear();
+    unbindMailbox();
   });
 
   // The spawning tools are always registered here. Whether a child process can
@@ -2129,7 +2628,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         // subagent after it finishes (and after a pi restart). Done at launch,
         // not completion, so the handle exists even if the parent dies mid-run.
         try {
-          registerName(parentArtifactDir, running.name, {
+          updateRegisteredRun(parentArtifactDir, running.name, running.id, {
             sessionFile: running.sessionFile,
             sessionId: getSessionId(running.sessionFile),
             ...(running.activityFile ? { activityFile: running.activityFile } : {}),
@@ -2137,6 +2636,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
             running: true,
             runId: running.id,
             taskBrief: running.task,
+            ...(running.runMetadata ? { runMetadata: running.runMetadata } : {}),
           });
         } catch (err: any) {
           console.error(`[interactive-subagents] Could not persist registry entry for "${running.name}" (run ${running.id}): ${err?.message ?? String(err)}`);
@@ -2159,7 +2659,8 @@ export default function subagentsExtension(pi: ExtensionAPI) {
               const presentation = result.terminationConfirmed === false
                 ? `Sub-agent "${running.name}" watcher failed; child termination is unknown: ${result.error}`
                 : resolveResultPresentation(result, running.name);
-              sendSubagentResult(pi, presentation, {
+              deliverSubagentResult(pi, running.id, presentation, {
+                parentSessionId: running.parentSessionId,
                 name: running.name,
                 task: running.task,
                 agent: running.agent,
@@ -2172,16 +2673,17 @@ export default function subagentsExtension(pi: ExtensionAPI) {
                 ...(result.handoffInterrupted ? { handoffInterrupted: true, handoffPhase: result.handoffPhase } : {}),
                 ...(result.claudeSessionId ? { claudeSessionId: result.claudeSessionId } : {}),
                 ...(result.stats ? { stats: result.stats } : {}),
-              });
+              }, result.terminationConfirmed !== false);
             }, result.terminationConfirmed !== false);
           })
           .catch((err) => {
             completeRun(parentArtifactDir, running, () => {
-              sendSubagentResult(pi, `Sub-agent "${running.name}" watcher error; child termination is unknown: ${err?.message ?? String(err)}`, {
+              deliverSubagentResult(pi, running.id, `Sub-agent "${running.name}" watcher error; child termination is unknown: ${err?.message ?? String(err)}`, {
+                parentSessionId: running.parentSessionId,
                 name: running.name,
                 task: running.task,
                 error: err?.message,
-              });
+              }, false);
             }, false);
           });
 
@@ -2402,7 +2904,10 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 
         // ── Steer a running subagent ──
         // A name that matches a currently-running subagent always steers it.
-        const runningMatch = Array.from(runningSubagents.values()).find((r) => r.name === requestedName);
+        const currentParentSessionIdValue = currentParentSessionId();
+        const runningMatch = Array.from(runningSubagents.values()).find((r) =>
+          r.name === requestedName && (!r.parentSessionId || r.parentSessionId === currentParentSessionIdValue),
+        );
         if (runningMatch) {
           const intent = params.intent;
           const envelope = intent ? formatSubagentMessage(intent, requestedName, message) : message;
@@ -2440,6 +2945,35 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         if (finishedError) return { content: [{ type: "text" as const, text: finishedError }], details: { error: "not running" }, isError: true };
 
         const sessionPath = entry.sessionFile;
+        let herdrConfirmedAbsent = false;
+        const priorRun = entry.runMetadata;
+        const ownership = inspectTranscriptOwnership(sessionPath);
+        if (entry.running) {
+          const meta = priorRun;
+          if (!meta || meta.state === "launching" || meta.state === "unknown") {
+            const err = `Cannot safely resume "${requestedName}": its prior run is still UNKNOWN; an incomplete Herdr launch may appear later. Reopen the original parent session to reconcile it, or verify externally before retrying.`;
+            return { content: [{ type: "text" as const, text: err }], details: { error: "run state unknown" }, isError: true };
+          }
+          try {
+            if (await getRunningAgentSurface(meta.herdrAgentName, { surface: meta.surface, sessionFile: meta.sessionFile })) {
+              return { content: [{ type: "text" as const, text: `Subagent "${requestedName}" is still live in Herdr; refusing to resume its transcript.` }], details: { error: "child live" }, isError: true };
+            }
+            herdrConfirmedAbsent = true;
+          } catch (error: any) {
+            const err = `Cannot safely resume "${requestedName}": Herdr status is unavailable, so child liveness is UNKNOWN (${error?.message ?? String(error)}).`;
+            return { content: [{ type: "text" as const, text: err }], details: { error: "Herdr unavailable" }, isError: true };
+          }
+        } else if (ownership && priorRun?.state === "finished") {
+          try {
+            if (await getRunningAgentSurface(priorRun.herdrAgentName, { surface: priorRun.surface, sessionFile: priorRun.sessionFile })) {
+              return { content: [{ type: "text" as const, text: `Subagent "${requestedName}" still has a live Herdr process; refusing to resume its transcript.` }], details: { error: "child live" }, isError: true };
+            }
+            herdrConfirmedAbsent = true;
+          } catch (error: any) {
+            const err = `Cannot safely reclaim transcript ownership for "${requestedName}": Herdr status is UNKNOWN (${error?.message ?? String(error)}).`;
+            return { content: [{ type: "text" as const, text: err }], details: { error: "Herdr unavailable" }, isError: true };
+          }
+        }
         if (!sessionPath || !existsSync(sessionPath)) {
           const err =
             `Subagent "${requestedName}" is registered but its session file is gone ` +
@@ -2520,15 +3054,68 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         childEnv.PI_SUBAGENT_ACTIVITY_FILE = activityFile;
         if (autoExit) childEnv.PI_SUBAGENT_AUTO_EXIT = "1";
 
-        const allocatedSurface = createSubagentSurface(name, {
-          cwd: loadout.cwd ?? ctx.cwd,
-          env: childEnv,
-        });
-        const { surface, tabId } = allocatedSurface;
+        const scope = capacityScope(artifactDir, maximumConcurrent);
+        if (entry.running === false || herdrConfirmedAbsent) {
+          releasePriorCapacity(scope, parentArtifactDir, name, entry.runId, priorRun?.capacity);
+        }
+        const capacity = await reserveCapacity(scope);
+        childEnv[CAPACITY_SCOPE_ENV] = capacity.scope;
+        let allocatedSurface: ReturnType<typeof createSubagentSurface>;
         try {
+          allocatedSurface = createSubagentSurface(name, {
+            cwd: loadout.cwd ?? ctx.cwd,
+            env: childEnv,
+          });
+        } catch (error) {
+          releaseUnsubmittedCapacity(capacity);
+          throw error;
+        }
+        const { surface, tabId } = allocatedSurface;
+        const parentSessionId = ctx.sessionManager.getSessionId();
+        let ownerToken: string;
+        try {
+          ownerToken = acquireTranscriptOwnership({
+            sessionFile: sessionPath, runId: id, herdrAgentName, surface, state: "launching",
+            canRecoverStale: !!priorRun && (entry.running === true || priorRun.state === "finished"),
+            expectedPriorRunId: priorRun?.runId,
+            herdrConfirmedAbsent,
+          });
+        } catch (error) {
+          releaseUnsubmittedCapacity(capacity);
+          closeSurfaceAndTab(surface, tabId);
+          throw error;
+        }
+        const runMetadata: RunMetadata = {
+          version: 1, state: "launching", parentSessionId, runId: id, herdrAgentName,
+          surface, ...(tabId ? { herdrTabId: tabId } : {}), sessionFile: sessionPath,
+          transcriptOffset: entryCountBefore, ownerToken, activityFile,
+          askFile: `${sessionPath}.ask`, pendingFile: `${sessionPath}.pending`, profile: loadout.agent ?? undefined,
+          task: message, startTime, cli: "pi", interactive, capacity,
+        };
+        let registryClaimed = false;
+        let launchSubmitted = false;
+        try {
+          claimRegisteredRun(parentArtifactDir, name, { ...entry, running: true, runId: id, runMetadata }, entry);
+          registryClaimed = true;
+          // Old error/question sidecars must not be mistaken for this new run.
+          for (const suffix of [".exit", ".ask", ".pending"]) {
+            const stale = `${sessionPath}${suffix}`;
+            if (existsSync(stale)) renameSync(stale, `${stale}.prior-${id}`);
+          }
+          attachCapacity(capacity, parentArtifactDir, name, id);
+          launchSubmitted = true;
           await startAgent(herdrAgentName, "pi", surface, parts);
           if (resumeMsgFile) promptAgent(herdrAgentName, formatResumeTaskPrompt(resumeMsgFile));
+          runMetadata.state = "running";
+          runMetadata.launchConfirmed = true;
+          updateTranscriptOwnership(sessionPath, ownerToken, "running");
+          updateRegisteredRun(parentArtifactDir, name, id, { sessionFile: sessionPath, sessionId: resumedSessionId, running: true, taskBrief: params.intent === "task" ? message : entry.taskBrief, runMetadata });
         } catch (error) {
+          if (!launchSubmitted) {
+            rollbackUnsubmittedResume(parentArtifactDir, name, entry, id, sessionPath, ownerToken, capacity, registryClaimed);
+          } else {
+            releaseUnsubmittedCapacity(capacity);
+          }
           closeSurfaceAndTab(surface, tabId);
           throw error;
         }
@@ -2545,7 +3132,13 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           startEntryCount: entryCountBefore,
           sessionFile: sessionPath,
           activityFile,
+          askFile: `${sessionPath}.ask`,
+          pendingFile: `${sessionPath}.pending`,
           interactive,
+          parentSessionId,
+          parentArtifactDir,
+          ownershipToken: ownerToken,
+          runMetadata,
           statusState: createStatusState({
             source: "pi",
             startTimeMs: startTime,
@@ -2558,6 +3151,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           activityFile,
           running: true,
           runId: running.id,
+          runMetadata,
         };
         let resumeToolResult = {
           content: [{ type: "text" as const, text: `Session "${name}" resumed.` }],
@@ -2567,7 +3161,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           resumeToolResult = persistDeliveredTaskBrief(running, parentArtifactDir, message, resumeToolResult, true, resumeMetadata);
         } else {
           try {
-            registerName(parentArtifactDir, name, { ...entry, ...resumeMetadata });
+            updateRegisteredRun(parentArtifactDir, name, running.id, resumeMetadata);
           } catch (err: any) {
             console.error(`[interactive-subagents] Could not persist registry entry for "${name}" (run ${running.id}): ${err?.message ?? String(err)}`);
           }
@@ -2587,7 +3181,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
               const summary = findLastAssistantMessage(allEntries) ??
                 (result.errorMessage
                   ? `Subagent error: ${result.errorMessage}`
-                  : result.exitCode !== 0
+                  : result.exitCode !== 0 && result.exitCode !== null
                     ? `Resumed session exited with code ${result.exitCode}`
                     : "Resumed session exited without new output");
               const presentation = result.terminationConfirmed === false
@@ -2597,7 +3191,8 @@ export default function subagentsExtension(pi: ExtensionAPI) {
                     name,
                   );
 
-              sendSubagentResult(pi, presentation, {
+              deliverSubagentResult(pi, running.id, presentation, {
+                parentSessionId: running.parentSessionId,
                 name,
                 task: running.task,
                 exitCode: result.exitCode,
@@ -2609,16 +3204,17 @@ export default function subagentsExtension(pi: ExtensionAPI) {
                 ...(result.terminationConfirmed === false ? { error: result.error } : {}),
                 ...(result.handoffInterrupted ? { handoffInterrupted: true, handoffPhase: result.handoffPhase } : {}),
                 ...(result.stats ? { stats: result.stats } : {}),
-              });
+              }, result.terminationConfirmed !== false);
             }, result.terminationConfirmed !== false);
           })
           .catch((err) => {
             completeRun(parentArtifactDir, running, () => {
-              sendSubagentResult(pi, `Resume watcher error; child termination is unknown: ${err?.message ?? String(err)}`, {
+              deliverSubagentResult(pi, running.id, `Resume watcher error; child termination is unknown: ${err?.message ?? String(err)}`, {
+                parentSessionId: running.parentSessionId,
                 name,
                 resumed: true,
                 error: err?.message,
-              });
+              }, false);
             }, false);
           });
 
@@ -2684,8 +3280,14 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           !!details.errorMessage ||
           !!details.error ||
           details.handoffInterrupted === true;
-        const icon = theme.fg(failed ? "error" : "success", failed ? "✗" : "✓");
-        const action = theme.fg("dim", failed ? " - failed" : " - completed");
+        const unconfirmed = !failed && details.exitCode === null;
+        const icon = failed
+          ? theme.fg("error", "✗")
+          : unconfirmed ? theme.fg("warning", "?") : theme.fg("success", "✓");
+        const action = theme.fg(
+          "dim",
+          failed ? " - failed" : unconfirmed ? " - exited, outcome unconfirmed" : " - completed",
+        );
         const label = `${icon} ${theme.fg("toolTitle", theme.bold(name))}${action}`;
         const contentLines = [label];
         if (options.expanded) {
