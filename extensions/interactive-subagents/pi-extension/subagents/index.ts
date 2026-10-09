@@ -951,11 +951,42 @@ function renderMinimalSubagentWidgetLine(agents: RunningSubagent[], width: numbe
   return [truncateToWidth(`↳ ${agents.length} subagents · ${summary}`, width)];
 }
 
+function renderCompactSubagentWidgetLines(agents: RunningSubagent[], width: number): string[] {
+  if (width <= 0) return [];
+  const now = Date.now();
+  const rows = agents.map((agent) => {
+    const snapshot = classifyStatus(agent.statusState, now);
+    const kind = statusConfig.enabled ? snapshot.kind : "running";
+    const name = `${agent.name}${agent.agent ? ` (${agent.agent})` : ""}`.replace(/\s+/g, " ");
+    const status = kind === "active"
+      ? snapshot.activityLabel ?? snapshot.activeScope ?? "active"
+      : kind;
+    return {
+      identity: `${widgetIcon(kind)} ${name}`,
+      elapsed: formatElapsedMMSS(agent.startTime),
+      status: truncateToWidth(status.replace(/\s+/g, " ").trim(), 24),
+    };
+  });
+  const identityWidth = Math.max(0, ...rows.map((row) => visibleWidth(row.identity)));
+  const elapsedWidth = Math.max(0, ...rows.map((row) => visibleWidth(row.elapsed)));
+  const statusWidth = Math.max(0, ...rows.map((row) => visibleWidth(row.status)));
+  // Align short rows without stretching them across the terminal. Reserve room
+  // for elapsed time and status; on tiny terminals keep the agent identity first.
+  const availableIdentity = width - elapsedWidth - statusWidth - 4;
+  return rows.map((row) => {
+    if (availableIdentity < 8) return truncateToWidth(`${row.identity}  ${row.elapsed}  ${row.status}`, width);
+    const columns = Math.min(identityWidth, availableIdentity);
+    const identity = truncateToWidth(row.identity, columns);
+    return `${identity}${" ".repeat(columns - visibleWidth(identity) + 2)}${row.elapsed.padStart(elapsedWidth)}  ${row.status}`;
+  });
+}
+
 function renderSubagentWidgetLines(
   agents: RunningSubagent[],
   width: number,
-  mode: "minimal" | "full" = statusConfig.mode,
+  mode: "compact" | "minimal" | "full" = statusConfig.mode,
 ): string[] {
+  if (mode === "compact") return renderCompactSubagentWidgetLines(agents, width);
   if (mode === "minimal") return renderMinimalSubagentWidgetLine(agents, width);
   const count = agents.length;
   const title = "Subagents";
