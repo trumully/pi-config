@@ -8,8 +8,7 @@
   },
   "scripts": {
     "test": "node --test extensions/interactive-subagents/test/test.ts",
-    "test:surface": "node --test --test-concurrency=1 extensions/interactive-subagents/test/integration/herdr-surface.test.ts",
-    "test:integration": "node --test --test-concurrency=1 extensions/interactive-subagents/test/integration/subagent-lifecycle.test.ts"
+    "test:surface": "node --test --test-concurrency=1 extensions/interactive-subagents/test/integration/herdr-surface.test.ts"
   },
   "dependencies": {
     "@ast-grep/cli": "0.41.0",

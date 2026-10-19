@@ -1,30 +1,24 @@
 /**
  * Integration test harness for pi-interactive-subagents.
  *
- * Provides utilities to detect Herdr, create isolated agent definitions,
- * create panes, launch real Pi sessions, read terminal output, and clean up.
+ * Provides utilities to detect Herdr, create panes, run shell commands,
+ * read terminal output, and clean up. It does not launch agents or call models.
  */
 import { execFileSync } from "node:child_process";
 import {
   mkdtempSync,
-  mkdirSync,
-  cpSync,
-  readdirSync,
   rmSync,
   existsSync,
   readFileSync,
   unlinkSync,
 } from "node:fs";
-import { join, resolve, dirname } from "node:path";
-import { fileURLToPath } from "node:url";
+import { join } from "node:path";
 import { tmpdir } from "node:os";
 import {
   isHerdrAvailable,
   createSurfaceSplit,
   createSubagentSurface,
   closeSubagentTab,
-  startAgent,
-  promptAgent,
   sendCommand,
   readScreen,
   readScreenAsync,
@@ -35,8 +29,6 @@ export {
   createSurfaceSplit,
   createSubagentSurface,
   closeSubagentTab,
-  startAgent,
-  promptAgent,
   sendCommand,
   readScreen,
   readScreenAsync,
@@ -55,17 +47,7 @@ function herdrJson(args: string[]): any {
   return JSON.parse(stdout.trim());
 }
 
-// ── Paths ──
-
-const HARNESS_DIR = dirname(fileURLToPath(import.meta.url));
-const PROJECT_ROOT = resolve(HARNESS_DIR, "../..");
-const TEST_AGENTS_SRC = join(HARNESS_DIR, "agents");
-const EXTENSION_SOURCE = join(PROJECT_ROOT, "pi-extension", "subagents", "index.ts");
-
 // ── Configuration ──
-
-/** Model used for integration tests. Override with PI_TEST_MODEL env var. */
-export const TEST_MODEL = process.env.PI_TEST_MODEL ?? "anthropic/claude-haiku-4-5";
 
 /** Per-test timeout in ms. Override with PI_TEST_TIMEOUT env var. */
 export const PI_TIMEOUT = Number(process.env.PI_TEST_TIMEOUT ?? "120000");
@@ -120,13 +102,6 @@ export interface TestEnv {
 
 export function createTestEnv(): TestEnv {
   const dir = mkdtempSync(join(tmpdir(), "pi-integ-"));
-  const agentsDir = join(dir, ".pi", "agents");
-  mkdirSync(agentsDir, { recursive: true });
-  if (existsSync(TEST_AGENTS_SRC)) {
-    for (const file of readdirSync(TEST_AGENTS_SRC)) {
-      if (file.endsWith(".md")) cpSync(join(TEST_AGENTS_SRC, file), join(agentsDir, file));
-    }
-  }
   return { dir, surfaces: [], tabs: [], surfaceTabs: new Map(), tempFiles: [] };
 }
 
@@ -173,23 +148,6 @@ export function untrackSurface(env: TestEnv, surface: string): void {
   if (tabId && !Array.from(env.surfaceTabs.values()).includes(tabId)) {
     env.tabs = env.tabs.filter((candidate) => candidate !== tabId);
   }
-}
-
-// ── Pi session management ──
-
-/** Start a Pi agent in a pane and submit its first prompt through Herdr. */
-export async function startPi(
-  surface: string,
-  _testDir: string,
-  task: string,
-  opts?: { model?: string; extraArgs?: string[] },
-): Promise<string> {
-  const model = opts?.model ?? TEST_MODEL;
-  const agentName = `pi-test-${uniqueId().replace(/[^a-z0-9]/gi, "").slice(-12).toLowerCase()}`;
-  const args = ["-ne", "-e", EXTENSION_SOURCE, "--model", model, ...(opts?.extraArgs ?? [])];
-  await startAgent(agentName, "pi", surface, args);
-  promptAgent(agentName, task);
-  return agentName;
 }
 
 // ── Cross-platform commands for pane surface tests ──

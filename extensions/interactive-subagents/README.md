@@ -87,10 +87,11 @@ Status controls the agent-state display. `mode` defaults to `compact`: one borde
 Run these from the repository root in a normal shell, not a restricted child session:
 
 ```sh
-npm test                 # Unit tests; no Herdr panes or model calls
-npm run test:surface     # Herdr pane and command tests; live Herdr checks, no model calls
-npm run test:integration # Pi/LLM lifecycle tests; live checks and may incur API costs
+npm test             # Offline unit tests; no Herdr panes or model calls
+npm run test:surface # Optional live Herdr pane and command tests; no model calls
 ```
+
+There are no tests that launch Pi or call a model. The pane tests require Herdr and create real tabs and panes; run them explicitly when checking terminal integration. Model-driven lifecycle tests were removed because they incurred API costs and depended on model behavior. Full agent lifecycle behavior still needs manual verification when changed.
 
 ## License
 
