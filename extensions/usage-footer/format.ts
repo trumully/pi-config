@@ -24,6 +24,8 @@ export interface UsageFooterSnapshot {
   subagentCost: number | null;
   /** True when a known child cost comes from Claude Code's estimate. */
   subagentCostEstimated: boolean;
+  /** False when the subtotal excludes children whose cost is unavailable. */
+  subagentCostComplete?: boolean;
   showSubagentCost: boolean;
   proactiveCompactionEnabled: boolean;
   compactionCount: number | null;
@@ -165,12 +167,13 @@ export function formatUsageFooterLines(
   let cost: string | null = null;
   let split: string | null = null;
   const estimatePrefix = snapshot.subagentCostEstimated ? "~" : "";
+  const incompleteSuffix = snapshot.subagentCostComplete === false ? "+?" : "";
   if (snapshot.showSubagentCost) {
     if (snapshot.mainCost !== null && snapshot.subagentCost !== null) {
-      cost = `~${formatCost(snapshot.mainCost + snapshot.subagentCost)}`;
-      split = `main ${formatCost(snapshot.mainCost)} + sub ${estimatePrefix}${formatCost(snapshot.subagentCost)}`;
+      cost = `~${formatCost(snapshot.mainCost + snapshot.subagentCost)}${incompleteSuffix}`;
+      split = `main ${formatCost(snapshot.mainCost)} + sub ${estimatePrefix}${formatCost(snapshot.subagentCost)}${incompleteSuffix}`;
     } else if (snapshot.mainCost !== null) cost = `~${formatCost(snapshot.mainCost)}+?`;
-    else if (snapshot.subagentCost !== null) cost = `~?+${estimatePrefix}${formatCost(snapshot.subagentCost)}`;
+    else if (snapshot.subagentCost !== null) cost = `~?+${estimatePrefix}${formatCost(snapshot.subagentCost)}${incompleteSuffix}`;
     else cost = "~?";
   } else if (snapshot.mainCost !== null) cost = `~${formatCost(snapshot.mainCost)}`;
   else cost = "~?";

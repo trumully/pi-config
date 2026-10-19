@@ -8,7 +8,7 @@ Spawn Pi agents in Herdr tabs while the parent session keeps working. Child resu
 
 This extension requires [Herdr](https://herdr.dev/) to create agent panes. Use it through this repository's Pi package or a local checkout; tailor enabled extensions with `pi config` or package filtering in the [root README](../../README.md#using). For an editable local checkout, use `/reload` after changing the extension or agent profiles.
 
-The bundled `worker` profile needs Pi's `codemode` tool. The bundled `worker` and `scout` profiles also need the local [`ast_grep` extension](../ast-grep/README.md). Herdr passes launch arguments directly; it does not need tmux, psmux, or a Bash launch shell. Restricted children load Herdr's reporter explicitly because `--no-extensions` disables global extension discovery.
+The bundled `worker` and `researcher` profiles need Pi's `codemode` tool. The researcher uses it to batch web calls and filter structured results while retaining source URLs and checking returned errors. The bundled `worker` and `scout` profiles also need the local [`ast_grep` extension](../ast-grep/README.md). Herdr passes launch arguments directly; it does not need tmux, psmux, or a Bash launch shell. Restricted children load Herdr's reporter explicitly because `--no-extensions` disables global extension discovery.
 
 ## Use it
 
@@ -19,6 +19,8 @@ Call `subagent({ agent, task, name?, model?, cwd? })` or run `/subagent <agent> 
 Completion notices and questions are recorded in a per-parent mailbox before delivery and acknowledged from the parent transcript. Pending notices replay after reload or idle retries without extra recap turns. Delivery is at-least-once, not exactly-once; stable delivery IDs suppress a replay when the parent transcript already contains the result. The extension persists versioned run metadata and reattaches observers to confirmed-live Herdr children after startup/reload. A run left in the middle of launch, an unreadable record, or an unavailable Herdr status remains UNKNOWN and cannot be resumed automatically; a single missing agent-list entry is not proof that a delayed launch has stopped. Existing registry records remain readable, but legacy running entries without metadata are not guessed back into watchers or resumed.
 
 Pi child transcripts have an exclusive ownership sidecar before launch/resume. It remains in place while the child may still be alive, including when the parent shuts down; stale ownership is reclaimed only after the recorded owner is safely recoverable and Herdr confirms the child is absent. Registry updates are serialized across processes. A stale registry lock or uncertain ownership fails closed and may require manual inspection. If result storage fails, delivery falls back to a non-recoverable direct send and logs a warning. A child that disappears without a completion signal is reported as having an unconfirmed outcome.
+
+The usage footer sums costs recorded in Pi child transcripts. It retains the original usage data in `<sessionFile>.recorded-usage.jsonl` during polling and at completion, so known amounts survive a missing or unreadable transcript. Retained-only usage is a subtotal, marked `+?`, not proof of the final bill. New forked sessions record inherited entry IDs to exclude parent usage even if the parent transcript disappears. A child with no recorded cost stays unknown; it is not assumed free. Claude Code list-price estimates remain separately labelled with `~`.
 
 Children can use `ask_question()` to pause for a parent reply. Herdr keeps their work visible in tabs or nested splits. Inside a child, press Ctrl+Alt+O to show or hide its identity and available-tools panel; it starts hidden. In full mode, the parent widget can also show compact live counts: `↳ N` for a child's active direct children and `● C/T` for its non-deleted TODO tasks. These optional counts disappear when unavailable or stale; they do not replace the child's lifecycle status.
 
@@ -87,10 +89,11 @@ Status controls the agent-state display. `mode` defaults to `compact`: one borde
 Run these from the repository root in a normal shell, not a restricted child session:
 
 ```sh
-npm test                 # Unit tests; no Herdr panes or model calls
-npm run test:surface     # Herdr pane and command tests; live Herdr checks, no model calls
-npm run test:integration # Pi/LLM lifecycle tests; live checks and may incur API costs
+npm test             # Offline unit tests; no Herdr panes or model calls
+npm run test:surface # Optional live Herdr pane and command tests; no model calls
 ```
+
+There are no tests that launch Pi or call a model. The pane tests require Herdr and create real tabs and panes; run them explicitly when checking terminal integration. Model-driven lifecycle tests were removed because they incurred API costs and depended on model behavior. Full agent lifecycle behavior still needs manual verification when changed.
 
 ## License
 

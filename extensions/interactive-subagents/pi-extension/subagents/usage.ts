@@ -2,6 +2,7 @@ import { existsSync, readdirSync, statSync } from "node:fs";
 import { basename, dirname, join, resolve } from "node:path";
 import { readSubagentActivityFile } from "./activity.ts";
 import { readClaudeUsageSidecar } from "./claude-usage.ts";
+import { persistRecordedUsage, readRecordedUsage } from "./recorded-usage.ts";
 import {
   getInheritedSessionEntryIds,
   getSessionId,
@@ -48,16 +49,25 @@ function readCachedStats(sessionFile: string): SessionStats | null {
       return cached.stats;
     }
 
-    const stats = summarizeSessionStats(sessionFile, {
-      excludeEntryIds: getInheritedSessionEntryIds(sessionFile),
-    });
-    if (!stats) return cached?.stats ?? null;
+    const excludedIds = getInheritedSessionEntryIds(sessionFile);
+    const stats = summarizeSessionStats(sessionFile, { excludeEntryIds: excludedIds });
+    if (!stats) {
+      const retained = cached?.stats ?? readRecordedUsage(sessionFile);
+      return retained ? { ...retained, costComplete: false } : null;
+    }
+    if (stats.costAvailable) persistRecordedUsage(sessionFile, excludedIds);
 
     sessionStatsCache.set(key, { size: file.size, mtimeMs: file.mtimeMs, stats });
     return stats;
   } catch {
-    return null;
+    const retained = readRecordedUsage(sessionFile);
+    return retained ? { ...retained, costComplete: false } : null;
   }
+}
+
+/** Capture full-session usage at completion, independently of footer polling. */
+export function captureSubagentUsage(sessionFile: string): void {
+  readCachedStats(sessionFile);
 }
 
 function activityIsRunning(activityFile: string): boolean | undefined {
@@ -149,7 +159,7 @@ export function collectSubagentUsage(rootArtifactDir: string): SubagentUsageTota
         } else {
           totals.costComplete = false;
         }
-      } else if (existsSync(sessionFile)) {
+      } else {
         const stats = readCachedStats(sessionFile);
         if (stats) {
           totals.inputTokens += stats.inputTokens;
@@ -158,14 +168,11 @@ export function collectSubagentUsage(rootArtifactDir: string): SubagentUsageTota
           totals.cacheWriteTokens += stats.cacheWriteTokens;
           totals.cost += stats.cost;
           totals.costAvailable ||= stats.costAvailable;
-          if (!stats.costAvailable) totals.costComplete = false;
+          if (!stats.costAvailable || stats.costComplete === false) totals.costComplete = false;
         } else {
+          // No readable transcript or retained usage. Never infer a free run.
           totals.costComplete = false;
         }
-      } else {
-        // A registered child without a transcript or usage sidecar has unknown
-        // cost, including while it is still running.
-        totals.costComplete = false;
       }
 
       const sessionId = child.sessionId ?? (existsSync(sessionFile) ? getSessionId(sessionFile) : null);

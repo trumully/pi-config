@@ -73,7 +73,13 @@ export function seedSubagentSessionFile(params: {
   };
   const contentLines =
     params.mode === "fork" ? getForkContentLines(params.parentSessionFile) : [];
-  const lines = [JSON.stringify(header), ...contentLines];
+  const inheritedEntryIds = contentLines.flatMap((line) => {
+    try {
+      const entry = JSON.parse(line);
+      return typeof entry.id === "string" ? [entry.id] : [];
+    } catch { return []; }
+  });
+  const lines = [JSON.stringify({ ...header, inheritedEntryIds }), ...contentLines];
 
   mkdirSync(dirname(params.childSessionFile), { recursive: true });
   writeFileSync(params.childSessionFile, lines.join("\n") + "\n", "utf8");
@@ -348,7 +354,10 @@ export function getInheritedSessionEntryIds(sessionFile: string): Set<string> {
 
   let parentSessionFile: string | undefined;
   try {
-    const header = JSON.parse(firstLine) as { parentSession?: unknown };
+    const header = JSON.parse(firstLine) as { parentSession?: unknown; inheritedEntryIds?: unknown };
+    if (Array.isArray(header.inheritedEntryIds) && header.inheritedEntryIds.every((id) => typeof id === "string")) {
+      return new Set(header.inheritedEntryIds as string[]);
+    }
     if (typeof header.parentSession === "string") parentSessionFile = header.parentSession;
   } catch {
     return new Set();
@@ -367,8 +376,9 @@ export function getInheritedSessionEntryIds(sessionFile: string): Set<string> {
       }
     }
   } catch {
-    // The parent transcript may no longer be available. Keep the child's own
-    // usage visible rather than failing the entire aggregate.
+    // Without copied IDs or the parent, child-only cost cannot be proven.
+    // The usage collector can fall back to a previously retained record.
+    throw new Error("Cannot separate inherited usage without the parent transcript");
   }
   return ids;
 }
@@ -456,6 +466,8 @@ export interface SessionStats {
   outputAvailable: boolean;
   /** True when at least one usage record supplied a cost. */
   costAvailable: boolean;
+  /** False when some usage records have no finite, non-negative recorded cost. */
+  costComplete?: boolean;
   /** Actual compaction entries in the summarized session/run. */
   compactionCount: number;
 }
@@ -491,11 +503,15 @@ export function summarizeSessionStats(
     inputAvailable: false,
     outputAvailable: false,
     costAvailable: false,
+    costComplete: true,
     compactionCount: 0,
   };
 
   const addUsage = (value: unknown): void => {
-    if (!value || typeof value !== "object") return;
+    if (!value || typeof value !== "object") {
+      stats.costComplete = false;
+      return;
+    }
     const usage = value as Record<string, unknown>;
     const num = (v: unknown): number => (typeof v === "number" && Number.isFinite(v) ? v : 0);
     if (typeof usage.input === "number" && Number.isFinite(usage.input)) stats.inputAvailable = true;
@@ -506,10 +522,12 @@ export function summarizeSessionStats(
     stats.cacheReadTokens += num(usage.cacheRead);
     stats.cacheWriteTokens += num(usage.cacheWrite);
     const cost = usage.cost;
-    if (cost && typeof cost === "object") {
-      const total = (cost as Record<string, unknown>).total;
-      if (typeof total === "number" && Number.isFinite(total)) stats.costAvailable = true;
-      stats.cost += num(total);
+    const total = cost && typeof cost === "object" ? (cost as Record<string, unknown>).total : undefined;
+    if (typeof total === "number" && Number.isFinite(total) && total >= 0) {
+      stats.costAvailable = true;
+      stats.cost += total;
+    } else {
+      stats.costComplete = false;
     }
   };
 

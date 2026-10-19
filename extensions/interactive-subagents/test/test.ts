@@ -243,6 +243,16 @@ describe("interactive subagents smoke tests", () => {
     assert.match(worker, /^tools:.*\btodo\b/m);
   });
 
+  it("grants the bundled researcher codemode without shell, files, or spawning tools", () => {
+    const profilePath = resolve(dirname(fileURLToPath(import.meta.url)), "../agents/researcher.md");
+    const profile = readFileSync(profilePath, "utf8");
+    const tools = profile.match(/^tools: (.+)$/m)?.[1].split(",").map((tool) => tool.trim());
+    assert.deepEqual(tools, ["codemode", "web_search", "source_check", "fetch_content", "get_search_content"]);
+    assert.doesNotMatch(profile, /^subagent_agents:/m);
+    assert.match(profile, /Check these error fields even when the call resolves/);
+    assert.match(profile, /Return source URLs with the relevant excerpts/);
+  });
+
   it("passes Claude auto-exit behavior to the stop hook", () => {
     const testApi = (subagentsModule as any).__test__;
     assert.deepEqual(testApi.buildClaudeLaunchEnv("/tmp/claude-done", true), {

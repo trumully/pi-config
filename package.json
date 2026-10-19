@@ -8,19 +8,18 @@
   },
   "scripts": {
     "test": "node --test extensions/interactive-subagents/test/test.ts",
-    "test:surface": "node --test --test-concurrency=1 extensions/interactive-subagents/test/integration/herdr-surface.test.ts",
-    "test:integration": "node --test --test-concurrency=1 extensions/interactive-subagents/test/integration/subagent-lifecycle.test.ts"
+    "test:surface": "node --test --test-concurrency=1 extensions/interactive-subagents/test/integration/herdr-surface.test.ts"
   },
   "dependencies": {
     "@ast-grep/cli": "0.41.0",
-    "@juicesharp/rpiv-ask-user-question": "2.12.0",
-    "@juicesharp/rpiv-todo": "2.12.0",
-    "pi-codemode-compact": "0.1.1",
-    "pi-web-access": "0.36.0"
+    "@juicesharp/rpiv-ask-user-question": "2.13.9",
+    "@juicesharp/rpiv-todo": "2.13.9",
+    "pi-codemode-compact": "0.3.0",
+    "pi-web-access": "0.42.0"
   },
   "devDependencies": {
-    "@earendil-works/pi-coding-agent": "^1.1.0",
-    "@earendil-works/pi-tui": "^1.1.0",
+    "@earendil-works/pi-coding-agent": "^1.3.0",
+    "@earendil-works/pi-tui": "^1.3.0",
     "typebox": "^1.3.27"
   },
   "peerDependencies": {

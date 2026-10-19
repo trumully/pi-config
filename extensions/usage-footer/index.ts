@@ -127,9 +127,10 @@ export default function usageFooter(pi: ExtensionAPI) {
       inputTokens: mainUsage.hasInput ? mainUsage.input : null,
       outputTokens: mainUsage.hasOutput ? mainUsage.output : null,
       mainCost: mainUsage.hasCost ? mainUsage.cost : null,
-      subagentCost: children.sessionCount === 0 ? 0 : children.costComplete ? children.cost : null,
+      subagentCost: children.sessionCount === 0 ? 0 : children.costAvailable ? children.cost : null,
       subagentCostEstimated: children.costEstimated,
-      showSubagentCost: supportsSubagents,
+      subagentCostComplete: children.costComplete,
+      showSubagentCost: supportsSubagents || children.sessionCount > 0 || children.runningCount > 0,
       proactiveCompactionEnabled: proactiveEnabled,
       compactionCount: proactiveEnabled
         ? entries.filter((entry) => entry.type === "compaction").length
