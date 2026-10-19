@@ -38,6 +38,7 @@ import {
   reconcileClaudeCostEstimates,
   writeClaudeUsageSidecar,
 } from "./claude-usage.ts";
+import { captureSubagentUsage } from "./usage.ts";
 import {
   isHerdrAvailable,
   herdrSetupHint,
@@ -2207,6 +2208,9 @@ async function watchSubagent(
 
       return { name, task: running.task, summary, exitCode: result.exitCode, elapsed, ...(sessionId ? { claudeSessionId: sessionId } : {}) };
     }
+
+    // Retain recorded usage before closing the pane, even if no footer poll ran.
+    captureSubagentUsage(sessionFile);
 
     // A child that exits during self_compact must never look like a successful
     // task result. Keep only the handoff status and checkpoint recovery route;
