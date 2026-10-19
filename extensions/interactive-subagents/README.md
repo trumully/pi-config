@@ -8,7 +8,7 @@ Spawn Pi agents in Herdr tabs while the parent session keeps working. Child resu
 
 This extension requires [Herdr](https://herdr.dev/) to create agent panes. Use it through this repository's Pi package or a local checkout; tailor enabled extensions with `pi config` or package filtering in the [root README](../../README.md#using). For an editable local checkout, use `/reload` after changing the extension or agent profiles.
 
-The bundled `worker` profile needs Pi's `codemode` tool. The bundled `worker` and `scout` profiles also need the local [`ast_grep` extension](../ast-grep/README.md). Herdr passes launch arguments directly; it does not need tmux, psmux, or a Bash launch shell. Restricted children load Herdr's reporter explicitly because `--no-extensions` disables global extension discovery.
+The bundled `worker` and `researcher` profiles need Pi's `codemode` tool. The researcher uses it to batch web calls and filter structured results while retaining source URLs and checking returned errors. The bundled `worker` and `scout` profiles also need the local [`ast_grep` extension](../ast-grep/README.md). Herdr passes launch arguments directly; it does not need tmux, psmux, or a Bash launch shell. Restricted children load Herdr's reporter explicitly because `--no-extensions` disables global extension discovery.
 
 ## Use it
 
