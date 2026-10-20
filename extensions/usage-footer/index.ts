@@ -1,7 +1,7 @@
 import { join, resolve } from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
-import { getGitBranch } from "./git.ts";
+import { getGitFooterInfo, invalidateGitFooterInfo } from "./git.ts";
 import { collectSubagentUsage } from "../interactive-subagents/pi-extension/subagents/usage.ts";
 import {
   loadProactiveCompactionConfig,
@@ -116,10 +116,12 @@ export default function usageFooter(pi: ExtensionAPI) {
     const childSessionFile = getCurrentPiChildSessionFile(ctx);
     // The proactive handoff implementation is active only in Pi child sessions.
     const proactiveEnabled = childSessionFile !== null && proactiveConfig?.enabled === true;
+    const gitInfo = getGitFooterInfo(ctx.cwd);
 
     snapshot = {
       cwd: ctx.cwd,
-      gitBranch: getGitBranch(ctx.cwd),
+      gitBranch: gitInfo.branch,
+      gitRebasing: gitInfo.rebasing,
       model: ctx.model?.id ?? "no-model",
       effort: ctx.thinkingLevel ?? "default",
       contextWindow: context?.contextWindow ?? ctx.model?.contextWindow ?? 0,
@@ -132,7 +134,7 @@ export default function usageFooter(pi: ExtensionAPI) {
       subagentCostComplete: children.costComplete,
       showSubagentCost: supportsSubagents || children.sessionCount > 0 || children.runningCount > 0,
       proactiveCompactionEnabled: proactiveEnabled,
-      compactionCount: proactiveEnabled
+      compactionCount: childSessionFile !== null
         ? entries.filter((entry) => entry.type === "compaction").length
         : null,
       proactiveStatus: getProactiveStatus(childSessionFile),
@@ -154,7 +156,10 @@ export default function usageFooter(pi: ExtensionAPI) {
       const rerender = () => tui.requestRender();
       requestRender = rerender;
       const unsubscribe = footerData.onBranchChange(() => {
-        if (latestCtx) refreshStatus(latestCtx);
+        if (latestCtx) {
+          invalidateGitFooterInfo(latestCtx.cwd);
+          refreshStatus(latestCtx);
+        }
       });
       return {
         dispose() {

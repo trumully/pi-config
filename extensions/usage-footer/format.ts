@@ -14,6 +14,7 @@ function formatEffort(effort: string): string {
 export interface UsageFooterSnapshot {
   cwd: string;
   gitBranch: string | null;
+  gitRebasing?: boolean | null;
   model: string;
   effort: string;
   contextWindow: number;
@@ -149,7 +150,9 @@ export function formatUsageFooterLines(
   if (width <= 0) return [];
 
   const directory = directoryName(snapshot.cwd);
-  const location = snapshot.gitBranch ? `${directory} (${snapshot.gitBranch})` : directory;
+  const location = snapshot.gitBranch
+    ? `${directory} (${snapshot.gitBranch})${snapshot.gitRebasing ? " · rebasing" : ""}`
+    : directory;
   const model = snapshot.model || "no-model";
   const effort = snapshot.effort || "default";
   const line1 = fit(`${location} · ${formatEffort(effort)} ${model}`, width, text);
@@ -185,41 +188,55 @@ export function formatUsageFooterLines(
     "checkpoint requested": "requested",
     "proactive compaction": "compacting",
     resuming: "resuming",
-    "checkpoint handoff failed": "checkpoint failed",
+    "checkpoint handoff failed": "failed",
   };
   const statusText = actionableStatus
     ? `↻ ${statusLabels[actionableStatus.label] ?? actionableStatus.label}`
     : null;
+  const autoText = !statusText && snapshot.proactiveBoundaryPercent !== null
+    ? `↻ auto ≥${snapshot.proactiveBoundaryPercent}%`
+    : null;
+  const compactionCount = snapshot.compactionCount !== null
+    ? `compactions ${snapshot.compactionCount}`
+    : null;
   const activeTimer = snapshot.runDurationLabel?.startsWith("Running ")
     ? snapshot.runDurationLabel
     : null;
-  const base = fit(context, width, text);
-  let line = base;
-  const append = (value: string | null): boolean => {
+  const compactStatusLabels: Record<string, string> = {
+    "checkpoint requested": "↻ req",
+    "proactive compaction": "↻ compact",
+    resuming: "↻ resume",
+    "checkpoint handoff failed": "↻ failed",
+  };
+  const fullStatusFitsWithContext = statusText !== null &&
+    text.visibleWidth(`${context} · ${statusText}`) <= width;
+  const selectedStatus = statusText && !fullStatusFitsWithContext
+    ? compactStatusLabels[actionableStatus!.label] ?? statusText
+    : statusText;
+  const visibleStatus = selectedStatus ? fit(selectedStatus, width, text) : null;
+  const contextFits = text.visibleWidth(visibleStatus ? `${context} · ${visibleStatus}` : context) <= width;
+  const percentFits = text.visibleWidth(visibleStatus ? `${percent} · ${visibleStatus}` : percent) <= width;
+  const base = contextFits ? context : percentFits ? percent : "";
+  let line = "";
+  const styledParts: string[] = [];
+  const append = (value: string | null, color = "dim", separator = " · "): boolean => {
     if (!value) return false;
-    const candidate = `${line} · ${value}`;
+    const prefix = line ? separator : "";
+    const candidate = `${line}${prefix}${value}`;
     if (text.visibleWidth(candidate) > width) return false;
     line = candidate;
+    styledParts.push(theme.fg(color, `${prefix}${value}`));
     return true;
   };
-  const visibleCost = cost !== null && append(cost);
-  let visibleStatus: string | null = null;
-  if (statusText) {
-    const remaining = width - text.visibleWidth(line) - (line ? 3 : 0);
-    if (remaining > 0) {
-      const status = fit(statusText, remaining, text);
-      if (status && append(status)) visibleStatus = status;
-    }
-  }
-  const visibleSplit = split !== null && text.visibleWidth(`${line} (${split})`) <= width;
-  if (visibleSplit) line = `${line} (${split})`;
-  const visibleTimer = append(activeTimer);
 
-  const styledParts = [theme.fg(contextColor, base)];
-  if (visibleCost) styledParts.push(theme.fg("dim", ` · ${cost}`));
-  if (visibleStatus) styledParts.push(theme.fg(actionableStatus!.color, ` · ${visibleStatus}`));
-  if (visibleSplit) styledParts.push(theme.fg("dim", ` (${split})`));
-  if (visibleTimer) styledParts.push(theme.fg("dim", ` · ${activeTimer}`));
+  if (base) append(base, contextColor);
+  if (visibleStatus) append(visibleStatus, actionableStatus?.color ?? "dim");
+  // Actionable state outranks cost; cost outranks idle automation hints and counts.
+  append(cost);
+  if (!visibleStatus) append(autoText);
+  append(compactionCount);
+  if (split !== null) append(`(${split})`, "dim", " ");
+  append(activeTimer);
 
   return [theme.fg("muted", line1), styledParts.join("")];
 }
