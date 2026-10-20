@@ -337,6 +337,20 @@ function parseCommaList(value: string | undefined): string[] | undefined {
   return list.length > 0 ? list : undefined;
 }
 
+/** Describe the tool behavior the launcher applies to a profile. */
+function describeAgentTools(agent: Pick<AgentDefaults, "tools" | "subagentAgents" | "cli">): string {
+  if (agent.cli === "claude") return "Claude Code default toolset (Pi tool settings not applied)";
+
+  const requested = parseCommaList(agent.tools) ?? [];
+  const grantsSpawning = (agent.subagentAgents?.length ?? 0) > 0;
+  if (requested.length === 0 && !grantsSpawning) return "not declared (default toolset)";
+
+  const additions = grantsSpawning ? " + spawning and child-control tools" : "";
+  return requested.length > 0
+    ? `${requested.join(", ")}${additions}`
+    : "spawning and child-control tools only (restricted)";
+}
+
 function parseSessionMode(value: string | undefined): SubagentSessionMode | undefined {
   if (value === "standalone" || value === "lineage-only" || value === "fork") {
     return value;
@@ -2499,7 +2513,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         "DO NOT write polling loops, sleep/wait commands, tail/watch scripts, or repeatedly read session/log files to detect completion. DO NOT call subagents_list or any other tool to 'check' status. All of that is wasted work - the harness handles delivery for you. " +
         "Wait for the completion message before reporting results. Once it arrives, use the findings to answer the user's request. " +
         "After spawning, either end your turn immediately, or work on other independent tasks (including spawning more subagents in parallel). The harness will wake you with the result when it is ready. " +
-        "For reliable delegation, give each child a self-contained brief with the goal, bounded scope/ownership, relevant context, permissions, completion criteria, and concise return format. Use short names, delegate independent work in parallel, keep nesting shallow, and avoid redundant status or review requests. Ask only about material scope, correctness, permission, or cost decisions; otherwise make reasonable scoped assumptions. If a child is blocked, ask for useful partial findings and the smallest next step.",
+        "For reliable delegation, give each child a self-contained brief with the goal, bounded scope/ownership, relevant context, permissions, completion criteria, and concise return format. Before assigning work, compare its required actions with the agent's declared tools and stated limits. If part of the work does not fit, split it off or choose a suitable agent; preserve every permission and scope restriction. Use short names, delegate independent work in parallel, keep nesting shallow, and avoid redundant status or review requests. Ask only about material scope, correctness, permission, or cost decisions; otherwise make reasonable scoped assumptions. If a child is blocked, ask for useful partial findings and the smallest next step.",
       promptSnippet:
         "Spawn a sub-agent in Herdr. Nested agents share a branch tab when it can fit a readable split; otherwise they get their own tab. " +
         "This is a fire-and-forget async tool: the call returns immediately with only an acknowledgement. " +
@@ -2507,7 +2521,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         "DO NOT write polling loops, sleep/wait commands, tail/watch scripts, or repeatedly read session/log files to detect completion. DO NOT call subagents_list or any other tool to 'check' status. All of that is wasted work - the harness handles delivery for you. " +
         "Wait for the completion message before reporting results. Once it arrives, use the findings to answer the user's request. " +
         "After spawning, either end your turn immediately, or work on other independent tasks (including spawning more subagents in parallel). The harness will wake you with the result when it is ready. " +
-        "For reliable delegation, give each child a self-contained brief with the goal, bounded scope/ownership, relevant context, permissions, completion criteria, and concise return format. Use short names, delegate independent work in parallel, keep nesting shallow, and avoid redundant status or review requests. Ask only about material scope, correctness, permission, or cost decisions; otherwise make reasonable scoped assumptions. If a child is blocked, ask for useful partial findings and the smallest next step.",
+        "For reliable delegation, give each child a self-contained brief with the goal, bounded scope/ownership, relevant context, permissions, completion criteria, and concise return format. Before assigning work, compare its required actions with the agent's declared tools and stated limits. If part of the work does not fit, split it off or choose a suitable agent; preserve every permission and scope restriction. Use short names, delegate independent work in parallel, keep nesting shallow, and avoid redundant status or review requests. Ask only about material scope, correctness, permission, or cost decisions; otherwise make reasonable scoped assumptions. If a child is blocked, ask for useful partial findings and the smallest next step.",
       parameters: SubagentParams,
 
       async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
@@ -2803,7 +2817,8 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           const badge = a.source === "project" ? " (project)" : "";
           const desc = a.description ? ` - ${a.description}` : "";
           const model = a.model ? ` [${a.model}]` : "";
-          return `• ${a.name}${badge}${model}${desc}`;
+          const tools = ` [tools: ${describeAgentTools(a)}]`;
+          return `• ${a.name}${badge}${model}${tools}${desc}`;
         });
 
         return {
@@ -2822,7 +2837,8 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           const badge = a.source === "project" ? theme.fg("accent", " (project)") : "";
           const desc = a.description ? theme.fg("dim", ` - ${a.description}`) : "";
           const model = a.model ? theme.fg("dim", ` [${a.model}]`) : "";
-          return `  ${theme.fg("toolTitle", theme.bold(a.name))}${badge}${model}${desc}`;
+          const tools = theme.fg("dim", ` [tools: ${describeAgentTools(a)}]`);
+          return `  ${theme.fg("toolTitle", theme.bold(a.name))}${badge}${model}${tools}${desc}`;
         });
         return new Text(lines.join("\n"), 0, 0);
       },
