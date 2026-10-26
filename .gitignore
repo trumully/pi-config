@@ -19,6 +19,7 @@
 # Local executables and dependency installations
 /bin/
 node_modules/
+/extensions/whistle-dictate/.venv/
 
 # Local notes and editor/OS files
 /research/

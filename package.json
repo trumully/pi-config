@@ -7,7 +7,7 @@
     "npm": "11.19.0"
   },
   "scripts": {
-    "test": "node --test extensions/interactive-subagents/test/test.ts",
+    "test": "node --test extensions/interactive-subagents/test/test.ts extensions/whistle-dictate/test.ts",
     "test:surface": "node --test --test-concurrency=1 extensions/interactive-subagents/test/integration/herdr-surface.test.ts"
   },
   "dependencies": {
@@ -53,6 +53,7 @@
       "./extensions/gh-readonly/index.ts",
       "./extensions/prompt-snippets/index.ts",
       "./extensions/usage-footer/index.ts",
+      "./extensions/whistle-dictate/index.ts",
       "./node_modules/@juicesharp/rpiv-ask-user-question/index.ts",
       "./node_modules/@juicesharp/rpiv-todo/index.ts",
       "./node_modules/pi-web-access/dist/index.js",
