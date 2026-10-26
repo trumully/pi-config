@@ -18,6 +18,8 @@ Interactive subagents require Herdr. Start Pi inside Herdr, with the Herdr CLI a
 
 Some bundled agent profiles need extra tools; see their definitions for details. Claude Code agents need [uv](https://docs.astral.sh/uv/getting-started/installation/).
 
+[Whistle dictation](extensions/whistle-dictate/README.md) uses uv to manage its locked Python dependencies.
+
 ## Extensions
 
 | Extension | Description |
@@ -27,6 +29,7 @@ Some bundled agent profiles need extra tools; see their definitions for details.
 | [`prompt-snippets`](extensions/prompt-snippets/README.md) | Add reusable instructions to a message. |
 | [`interactive-subagents`](extensions/interactive-subagents/README.md) | Delegate work to agents in Herdr panes. |
 | [`usage-footer`](extensions/usage-footer/index.ts) | Display session usage. |
+| [`whistle-dictate`](extensions/whistle-dictate/README.md) | Local voice dictation with Cactus Whistle. |
 
 ## Community packages
 
