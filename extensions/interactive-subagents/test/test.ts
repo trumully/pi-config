@@ -698,6 +698,21 @@ describe("interactive subagents smoke tests", () => {
     }
   });
 
+  it("rejects every Claude model override before checking the terminal or reserving a run", async () => {
+    const tool = registerSubagents().registeredTools.find((tool: any) => tool.name === "subagent");
+    for (const agent of ["cc-worker", "cc-reviewer"]) {
+      for (const model of ["other-model", "claude-opus-5-5", ""]) {
+        const result = await tool.execute("cc-override", { agent, task: "Do not launch", model }, undefined, undefined, {});
+        assert.equal(result.isError, true);
+        assert.equal(result.details.error, "Claude model override forbidden");
+        assert.match(result.content[0].text, /Omit model/);
+      }
+    }
+    assert.match(tool.description, /Never supply a model override for a Claude Code profile/);
+    assert.match(tool.promptSnippet, /model argument is Pi-only/);
+    assert.match(tool.parameters.properties.model.description, /Forbidden for Claude Code/);
+  });
+
   it("waits for Claude to start processing the initial prompt", () => {
     assert.deepEqual(buildPromptAgentArgs("sub-cc-worker", "Do the task", true), [
       "agent", "prompt", "sub-cc-worker", "Do the task",

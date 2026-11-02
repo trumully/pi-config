@@ -14,7 +14,7 @@ Tailor the config with `pi config` or [package filtering](https://github.com/ear
 
 ## Prerequisites
 
-Interactive subagents require Herdr. Start Pi inside Herdr, with the Herdr CLI available.
+Interactive subagents require Herdr. Start Pi inside `herdr-app` with `hc` on PATH, or inside legacy Herdr with its `herdr` CLI available.
 
 Some bundled agent profiles need extra tools; see their definitions for details. Claude Code agents need [uv](https://docs.astral.sh/uv/getting-started/installation/).
 

@@ -10,6 +10,7 @@ import { promisify } from "node:util";
 import { existsSync, readFileSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { canonicalSessionPath } from "./lifecycle.ts";
+import { herdrCore, isHerdrCoreEnvironment } from "./herdr-core.ts";
 
 const execFileAsync = promisify(execFile);
 const MAX_BUFFER = 10 * 1024 * 1024;
@@ -77,6 +78,7 @@ let commandAvailable: boolean | undefined;
 
 /** True only inside a Herdr pane with a working Herdr CLI on PATH. */
 export function isHerdrAvailable(): boolean {
+  if (isHerdrCoreEnvironment()) return herdrCore.isAvailable();
   if (process.env.HERDR_ENV !== "1" || !process.env.HERDR_PANE_ID) return false;
   if (commandAvailable !== undefined) return commandAvailable;
   try {
@@ -93,7 +95,7 @@ export function isHerdrAvailable(): boolean {
 }
 
 export function herdrSetupHint(): string {
-  return "Start Pi inside Herdr so HERDR_ENV and HERDR_PANE_ID are available.";
+  return "Start Pi inside herdr-app with hc on PATH and HC_TERMINAL_ID set, or inside legacy Herdr with HERDR_ENV and HERDR_PANE_ID set.";
 }
 
 function requireHerdr(): void {
@@ -111,6 +113,8 @@ export function getHerdrIntegrationPath(agentConfigDir: string): string {
 export interface SurfaceOptions {
   cwd?: string;
   env?: Record<string, string>;
+  /** Stable hc terminal name, reserved before transcript ownership is claimed. */
+  runName?: string;
 }
 
 function appendSurfaceOptions(args: string[], options?: SurfaceOptions): void {
@@ -147,6 +151,7 @@ export interface SubagentSurface {
  */
 export function createSubagentSurface(name: string, options?: SurfaceOptions): SubagentSurface {
   requireHerdr();
+  if (isHerdrCoreEnvironment()) return herdrCore.createSurface(name, options);
   if (process.env.PI_SUBAGENT_ID) {
     const sourcePane = process.env.HERDR_PANE_ID;
     const split = sourcePane ? nestedSplitForPane(sourcePane) : null;
@@ -295,11 +300,16 @@ export async function startAgent(
   kind: "pi" | "claude",
   paneId: string,
   args: string[],
+  prompts: string[] = [],
 ): Promise<void> {
   requireHerdr();
+  if (isHerdrCoreEnvironment()) return herdrCore.startAgent(name, kind, paneId, args, prompts);
   const commandArgs = ["agent", "start", name, "--kind", kind, "--pane", paneId, "--", ...args];
   const stdout = await runHerdr(commandArgs, 35_000);
   parseResponse(stdout, "agent start");
+  for (const prompt of prompts) {
+    if (prompt) promptAgent(name, prompt, { waitForWorking: kind === "claude" });
+  }
 }
 
 export function buildPromptAgentArgs(target: string, prompt: string, waitForWorking = false): string[] {
@@ -315,6 +325,7 @@ export function promptAgent(
   options: { waitForWorking?: boolean } = {},
 ): void {
   requireHerdr();
+  if (isHerdrCoreEnvironment()) return herdrCore.prompt(target, prompt);
   runHerdrSync(buildPromptAgentArgs(target, prompt, options.waitForWorking));
 }
 
@@ -327,6 +338,7 @@ export function sendCommand(surface: string, command: string): void {
 /** Read recent terminal output from a pane as plain text. */
 export function readScreen(surface: string, lines = 50): string {
   requireHerdr();
+  if (isHerdrCoreEnvironment()) return herdrCore.read(surface, lines);
   return runHerdrSync([
     "pane",
     "read",
@@ -341,6 +353,7 @@ export function readScreen(surface: string, lines = 50): string {
 /** Async variant for watcher loops. */
 export async function readScreenAsync(surface: string, lines = 50): Promise<string> {
   requireHerdr();
+  if (isHerdrCoreEnvironment()) return herdrCore.readAsync(surface, lines);
   return runHerdr([
     "pane",
     "read",
@@ -355,12 +368,14 @@ export async function readScreenAsync(surface: string, lines = 50): Promise<stri
 /** Close a Herdr pane. */
 export function closeSurface(surface: string): void {
   requireHerdr();
+  if (isHerdrCoreEnvironment()) return herdrCore.close(surface);
   runHerdrSync(["pane", "close", surface]);
 }
 
 /** Whether Herdr still recognizes an agent in the subagent's pane. */
 export async function listRunningAgentPanes(): Promise<Set<string>> {
   requireHerdr();
+  if (isHerdrCoreEnvironment()) return herdrCore.runningSurfaces();
   const stdout = await runHerdr(["agent", "list"]);
   const response = parseResponse<{ agents?: Array<{ pane_id?: string }> }>(stdout, "agent list");
   if (!Array.isArray(response.result?.agents)) throw new Error("herdr agent list returned no agents array");
@@ -376,6 +391,7 @@ export async function getRunningAgentSurface(
   target: string, fallback?: { surface: string; sessionFile: string },
 ): Promise<{ surface: string; tabId?: string } | null> {
   requireHerdr();
+  if (isHerdrCoreEnvironment()) return herdrCore.getRunningSurface(target, fallback);
   let stdout: string;
   try {
     ({ stdout } = await execFileAsync(herdrBinary(), ["agent", "get", target], {

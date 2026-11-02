@@ -56,7 +56,8 @@ export const PI_TIMEOUT = Number(process.env.PI_TEST_TIMEOUT ?? "120000");
 
 /** Detect whether the Herdr CLI is available in this process's pane. */
 export function getAvailableBackends(): string[] {
-  return isHerdrAvailable() ? ["herdr"] : [];
+  // herdr-app/hc has separate native-terminal checks in herdr-core.test.ts.
+  return !process.env.HC_TERMINAL_ID && isHerdrAvailable() ? ["herdr"] : [];
 }
 
 export function getFocusedSurface(): string | null {

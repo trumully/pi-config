@@ -145,7 +145,7 @@ const SubagentParams = Type.Object({
         "use subagent_message to continue an existing agent. Has no effect on which agent runs - use `agent` for that.",
     }),
   ),
-  model: Type.Optional(Type.String({ description: "Model override (overrides agent default)" })),
+  model: Type.Optional(Type.String({ description: "Pi-only model override. Forbidden for Claude Code profiles; their model is fixed by the profile." })),
   cwd: Type.Optional(
     Type.String({
       description:
@@ -1633,7 +1633,14 @@ function startWidgetRefresh() {
  */
 type LaunchContext = { sessionManager: { getSessionFile(): string | null; getSessionId(): string; getSessionDir(): string }; cwd: string };
 
+function assertModelOverrideAllowed(params: { model?: string }, agent: AgentDefaults | null): void {
+  if (agent?.cli === "claude" && params.model !== undefined) {
+    throw new Error("Claude Code subagents do not accept a model override. Omit model; the Claude profile fixes its model.");
+  }
+}
+
 async function launchSubagent(params: typeof SubagentParams.static, ctx: LaunchContext): Promise<RunningSubagent> {
+  assertModelOverrideAllowed(params, params.agent ? loadAgentDefaults(params.agent) : null);
   const artifactDir = getArtifactDir(ctx.sessionManager.getSessionDir(), ctx.sessionManager.getSessionId());
   const capacity = await reserveCapacity(capacityScope(artifactDir, maximumConcurrent));
   try {
@@ -1652,7 +1659,7 @@ async function launchReservedSubagent(
   const herdrAgentName = herdrAgentNameFor(params.name, id);
 
   const agentDefs = params.agent ? loadAgentDefaults(params.agent) : null;
-  const effectiveModel = params.model ?? agentDefs?.model;
+  const effectiveModel = agentDefs?.cli === "claude" ? agentDefs.model : params.model ?? agentDefs?.model;
   const effectiveEffort = agentDefs?.effort;
   const effectiveTools = agentDefs?.tools;
   const effectiveSkills = agentDefs?.skills;
@@ -1727,6 +1734,7 @@ async function launchReservedSubagent(
     });
 
     const allocatedSurface = createSubagentSurface(params.name, {
+      runName: herdrAgentName,
       cwd: targetCwdForSession,
       env: { ...buildClaudeLaunchEnv(sentinelFile, agentDefs?.autoExit), [CAPACITY_SCOPE_ENV]: capacity.scope },
     });
@@ -1751,10 +1759,7 @@ async function launchReservedSubagent(
     }
     try {
       attachCapacity(capacity, parentArtifactDir, params.name, id);
-      await startAgent(herdrAgentName, "claude", surface, args);
-      // Start without a positional task so Herdr can return as soon as the
-      // agent is ready; submit work separately and confirm it entered a turn.
-      promptAgent(herdrAgentName, params.task, { waitForWorking: true });
+      await startAgent(herdrAgentName, "claude", surface, args, [params.task]);
       claudeMetadata.state = "running";
       claudeMetadata.launchConfirmed = true;
       updateRegisteredRun(parentArtifactDir, params.name, id, {
@@ -1797,8 +1802,7 @@ async function launchReservedSubagent(
 
   // ── Pi CLI path ──
 
-  // Build Pi CLI argv. Herdr receives argv directly; no shell quoting or
-  // launcher script is needed on Windows or Unix.
+  // Build Pi CLI argv. Both terminal backends pass argv without a shell.
   const parts: string[] = ["--session", subagentSessionFile];
 
   const subagentDonePath = join(SUBAGENTS_DIR, "subagent-done.ts");
@@ -1861,6 +1865,7 @@ async function launchReservedSubagent(
     taskArg: fullTask,
   });
   const allocatedSurface = createSubagentSurface(params.name, {
+    runName: herdrAgentName,
     cwd: targetCwdForSession,
     env: childEnv,
   });
@@ -1895,12 +1900,7 @@ async function launchReservedSubagent(
   }
   try {
     attachCapacity(capacity, parentArtifactDir, params.name, id);
-    await startAgent(herdrAgentName, "pi", surface, parts);
-    // Herdr starts the Pi TUI ready for input. Submit skill commands and task
-    // text separately so Pi can expand skills before processing the task.
-    for (const promptArg of promptArgs) {
-      if (promptArg !== "") promptAgent(herdrAgentName, promptArg);
-    }
+    await startAgent(herdrAgentName, "pi", surface, parts, promptArgs);
     runMetadata.state = "running";
     runMetadata.launchConfirmed = true;
     updateTranscriptOwnership(subagentSessionFile, ownerToken, "running");
@@ -2507,7 +2507,8 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       name: "subagent",
       label: "Subagent",
       description:
-        "Spawn a sub-agent in Herdr. Nested agents share a branch tab when it can fit a readable split; otherwise they get their own tab. " +
+        "Spawn a Pi or Claude Code sub-agent in Herdr. In herdr-app, children appear in the native agents list and can be peeked or kept as panes. Legacy Herdr uses tabs and nested splits. " +
+        "The model argument is Pi-only. Never supply a model override for a Claude Code profile; its model is fixed by the profile and overrides are rejected. " +
         "This is a fire-and-forget async tool: the call returns immediately with only an acknowledgement. " +
         "When the sub-agent finishes, the harness AUTOMATICALLY delivers its result as a steer message that wakes you up and starts a new turn - you do not need to do anything to receive it. " +
         "DO NOT write polling loops, sleep/wait commands, tail/watch scripts, or repeatedly read session/log files to detect completion. DO NOT call subagents_list or any other tool to 'check' status. All of that is wasted work - the harness handles delivery for you. " +
@@ -2515,7 +2516,8 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         "After spawning, either end your turn immediately, or work on other independent tasks (including spawning more subagents in parallel). The harness will wake you with the result when it is ready. " +
         "For reliable delegation, give each child a self-contained brief with the goal, bounded scope/ownership, relevant context, permissions, completion criteria, and concise return format. Before assigning work, compare its required actions with the agent's declared tools and stated limits. If part of the work does not fit, split it off or choose a suitable agent; preserve every permission and scope restriction. Use short names, delegate independent work in parallel, keep nesting shallow, and avoid redundant status or review requests. Ask only about material scope, correctness, permission, or cost decisions; otherwise make reasonable scoped assumptions. If a child is blocked, ask for useful partial findings and the smallest next step.",
       promptSnippet:
-        "Spawn a sub-agent in Herdr. Nested agents share a branch tab when it can fit a readable split; otherwise they get their own tab. " +
+        "Spawn a Pi or Claude Code sub-agent in Herdr. In herdr-app, children appear in the native agents list and can be peeked or kept as panes. Legacy Herdr uses tabs and nested splits. " +
+        "The model argument is Pi-only. Never supply a model override for a Claude Code profile; its model is fixed by the profile and overrides are rejected. " +
         "This is a fire-and-forget async tool: the call returns immediately with only an acknowledgement. " +
         "When the sub-agent finishes, the harness AUTOMATICALLY delivers its result as a steer message that wakes you up and starts a new turn - you do not need to do anything to receive it. " +
         "DO NOT write polling loops, sleep/wait commands, tail/watch scripts, or repeatedly read session/log files to detect completion. DO NOT call subagents_list or any other tool to 'check' status. All of that is wasted work - the harness handles delivery for you. " +
@@ -2587,6 +2589,16 @@ export default function subagentsExtension(pi: ExtensionAPI) {
             details: {
               error: SUBAGENT_ALLOWLIST ? "agent not in allowlist" : "unknown agent",
             },
+          };
+        }
+
+        try {
+          assertModelOverrideAllowed(params, loadAgentDefaults(params.agent));
+        } catch (error: any) {
+          return {
+            content: [{ type: "text", text: error.message }],
+            details: { error: "Claude model override forbidden" },
+            isError: true,
           };
         }
 
@@ -3083,6 +3095,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         let allocatedSurface: ReturnType<typeof createSubagentSurface>;
         try {
           allocatedSurface = createSubagentSurface(name, {
+            runName: herdrAgentName,
             cwd: loadout.cwd ?? ctx.cwd,
             env: childEnv,
           });
@@ -3124,8 +3137,8 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           }
           attachCapacity(capacity, parentArtifactDir, name, id);
           launchSubmitted = true;
-          await startAgent(herdrAgentName, "pi", surface, parts);
-          if (resumeMsgFile) promptAgent(herdrAgentName, formatResumeTaskPrompt(resumeMsgFile));
+          await startAgent(herdrAgentName, "pi", surface, parts,
+            resumeMsgFile ? [formatResumeTaskPrompt(resumeMsgFile)] : []);
           runMetadata.state = "running";
           runMetadata.launchConfirmed = true;
           updateTranscriptOwnership(sessionPath, ownerToken, "running");
