@@ -9,7 +9,7 @@ import { convertToLlm } from "@earendil-works/pi-coding-agent";
 import * as subagentsModule from "../pi-extension/subagents/index.ts";
 import { buildPromptAgentArgs } from "../pi-extension/subagents/herdr.ts";
 import { bindMailbox, createFileDeliveryStore, unbindMailbox } from "../pi-extension/subagents/delivery.ts";
-import { finishRegisteredRun, readNameRegistry, registerName } from "../pi-extension/subagents/session.ts";
+import { finishRegisteredRun, readNameRegistry, readSubagentLoadout, registerName, writeSubagentLoadout, type SubagentLoadout } from "../pi-extension/subagents/session.ts";
 import { collectSubagentUsage } from "../pi-extension/subagents/usage.ts";
 import {
   readClaudeCostEstimate,
@@ -702,7 +702,7 @@ describe("interactive subagents smoke tests", () => {
     const tool = registerSubagents().registeredTools.find((tool: any) => tool.name === "subagent");
     for (const agent of ["cc-worker", "cc-reviewer"]) {
       for (const model of ["other-model", "claude-opus-5-5", ""]) {
-        const result = await tool.execute("cc-override", { agent, task: "Do not launch", model }, undefined, undefined, {});
+        const result = await tool.execute("cc-override", { agent, task: "Do not launch", model, effort: "high" }, undefined, undefined, {});
         assert.equal(result.isError, true);
         assert.equal(result.details.error, "Claude model override forbidden");
         assert.match(result.content[0].text, /Omit model/);
@@ -711,6 +711,74 @@ describe("interactive subagents smoke tests", () => {
     assert.match(tool.description, /Never supply a model override for a Claude Code profile/);
     assert.match(tool.promptSnippet, /model argument is Pi-only/);
     assert.match(tool.parameters.properties.model.description, /Forbidden for Claude Code/);
+  });
+
+  it("overrides Claude effort for one launch and otherwise preserves the profile default", () => {
+    const testApi = (subagentsModule as any).__test__;
+    const profile = { cli: "claude", model: "claude-opus-5-5", effort: "medium" };
+    for (const effort of ["low", "medium", "high", "xhigh", "max"]) {
+      const args = testApi.buildClaudeCliArgs({
+        model: profile.model,
+        effort: testApi.resolveSubagentEffort({ effort }, profile),
+      });
+      assert.deepEqual(args, ["--permission-mode", "auto", "--model", "claude-opus-5-5", "--effort", effort]);
+    }
+    assert.equal(profile.effort, "medium", "a launch override must not change the profile");
+    assert.equal(testApi.resolveSubagentEffort({}, profile), "medium");
+    const noEffort = testApi.resolveSubagentEffort({}, { cli: "claude" });
+    assert.equal(noEffort, undefined);
+    assert.deepEqual(testApi.buildClaudeCliArgs({ effort: noEffort }), ["--permission-mode", "auto"]);
+  });
+
+  it("maps Pi effort to thinking independently of the model and retains it for resume", () => {
+    const testApi = (subagentsModule as any).__test__;
+    const directory = mkdtempSync(join(tmpdir(), "pi-effort-override-"));
+    const sessionFile = join(directory, "child.jsonl");
+    const profile = { thinking: "low" };
+    try {
+      for (const effort of ["off", "minimal", "low", "medium", "high", "xhigh", "max"]) {
+        for (const model of [null, "provider/model:low"]) {
+          const loadout: SubagentLoadout = {
+            agent: "scout", toolAllowlist: null, model,
+            thinking: testApi.resolveSubagentEffort({ effort }, profile),
+            systemPromptMode: null, identity: null, spawnable: null,
+            autoExit: true, cwd: null, agentDir: null,
+          };
+          writeSubagentLoadout(sessionFile, loadout);
+          const restored = readSubagentLoadout(sessionFile);
+          assert.ok(restored);
+          for (const snapshot of [loadout, restored]) {
+            const args: string[] = [];
+            testApi.applySandboxToParts(args, snapshot, { artifactDir: directory, name: "scout" });
+            assert.ok(args.includes("--thinking"));
+            assert.equal(args[args.indexOf("--thinking") + 1], effort);
+            if (model) assert.equal(args[args.indexOf("--model") + 1], model);
+            else assert.ok(!args.includes("--model"));
+          }
+        }
+      }
+      assert.equal(profile.thinking, "low");
+      assert.equal(testApi.resolveSubagentEffort({}, profile), "low");
+      assert.equal(testApi.resolveSubagentEffort({}, null), undefined);
+    } finally { rmSync(directory, { recursive: true, force: true }); }
+  });
+
+  it("rejects invalid effort overrides before checking the terminal or reserving a run", async () => {
+    const tool = registerSubagents().registeredTools.find((tool: any) => tool.name === "subagent");
+    for (const agent of ["scout", "cc-worker"]) {
+      const invalid = ["", "HIGH", "invalid", null, 3, ...(agent === "cc-worker" ? ["off", "minimal"] : [])];
+      for (const effort of invalid) {
+        const result = await tool.execute("effort-override", { task: "Do not launch", agent, effort }, undefined, undefined, {});
+        assert.equal(result.isError, true);
+        assert.equal(result.details.error, "invalid effort override");
+        assert.match(result.content[0].text, agent === "scout" ? /Invalid Pi effort/ : /Invalid Claude Code effort/);
+      }
+    }
+    const schema = tool.parameters.properties.effort;
+    assert.deepEqual(schema.anyOf.map((variant: any) => variant.const), ["off", "minimal", "low", "medium", "high", "xhigh", "max"]);
+    for (const guidance of [tool.description, tool.promptSnippet, schema.description]) {
+      assert.match(guidance, /only when the user explicitly requests/i);
+    }
   });
 
   it("waits for Claude to start processing the initial prompt", () => {

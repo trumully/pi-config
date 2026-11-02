@@ -12,7 +12,20 @@ The bundled `worker` and `researcher` profiles need Pi's `codemode` tool. The re
 
 ## Use it
 
-Call `subagent({ agent, task, name?, model?, cwd? })` or run `/subagent <agent> <task>`. `model` overrides are allowed only for Pi profiles. Claude Code profiles always use their configured model; supplying any `model` argument for one is rejected before launch. Spawns are asynchronous. Names are unique within the parent session, including finished agents: omitted names get a unique default; explicit duplicates are rejected. Use `subagent_message({ name, message, intent? })` to steer a running agent or resume a finished one, and `subagents_list()` to list available profiles. A finished agent can resume only while its registered session exists; its saved tools, model, prompt, and working directory are reused.
+Call `subagent({ agent, task, name?, model?, effort?, cwd? })` or run `/subagent <agent> <task>`. `model` overrides are allowed only for Pi profiles. Claude Code profiles always use their configured model; supplying any `model` argument for one is rejected before launch.
+
+Supply `effort` only when the user explicitly requests an effort level, never based on task complexity. Omit it to use the profile default: `thinking` for Pi or `effort` for Claude Code. This explicit-request rule is agent guidance, not a runtime approval check. The override does not edit the profile and works with both legacy Herdr and herdr-app.
+
+Pi accepts `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, and `max`, passed as `--thinking` independently of the model. Its saved loadout retains the chosen level for resume. Claude Code accepts `low`, `medium`, `high`, `xhigh`, and `max`, passed as `--effort`. Unsupported values are rejected before launch; the selected CLI/model may further restrict available levels.
+
+For an explicit request to use high effort:
+
+```ts
+subagent({ agent: "scout", task: "Find the authentication entry points", effort: "high" })
+subagent({ agent: "cc-worker", task: "Fix the scoped bug", effort: "high" })
+```
+
+Spawns are asynchronous. Names are unique within the parent session, including finished agents: omitted names get a unique default; explicit duplicates are rejected. Use `subagent_message({ name, message, intent? })` to steer a running agent or resume a finished one, and `subagents_list()` to list available profiles. A finished agent can resume only while its registered session exists; its saved tools, model, prompt, and working directory are reused.
 
 `intent` may be `task`, `context`, or `reply`; omit it for the existing automatic steer/resume behavior. `task` replaces the child's current assignment in full (rather than accumulating corrections); `context` adds information and `reply` answers the child. Context and replies target a running child only, while a task can steer a running child or resume a finished one. For example, `subagent_message({ name: "api", message: "Implement the bounded API change and report files and checks.", intent: "task" })` assigns/replaces its brief; `subagent_message({ name: "api", message: "Use the existing response shape.", intent: "context" })` adds context, and `subagent_message({ name: "api", message: "Yes, that scope is approved.", intent: "reply" })` answers it. A saved brief is a record of the assignment, not proof that the child complied.
 

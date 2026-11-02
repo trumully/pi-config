@@ -130,6 +130,9 @@ function getModuleAbortSignal(): AbortSignal {
   return ((globalThis as any)[POLL_ABORT_KEY] as AbortController).signal;
 }
 
+const PI_EFFORT_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const;
+const CLAUDE_EFFORT_LEVELS = ["low", "medium", "high", "xhigh", "max"] as const;
+
 const SubagentParams = Type.Object({
   agent: Type.String({
     description:
@@ -146,6 +149,9 @@ const SubagentParams = Type.Object({
     }),
   ),
   model: Type.Optional(Type.String({ description: "Pi-only model override. Forbidden for Claude Code profiles; their model is fixed by the profile." })),
+  effort: Type.Optional(Type.Union(PI_EFFORT_LEVELS.map((level) => Type.Literal(level)), {
+    description: "Effort override for this launch: Pi thinking level or Claude Code effort. Supply only when the user explicitly requests an effort level; otherwise omit it to use the profile default. Do not infer an override from task complexity. Pi accepts off, minimal, low, medium, high, xhigh, max; Claude Code accepts low, medium, high, xhigh, max.",
+  })),
   cwd: Type.Optional(
     Type.String({
       description:
@@ -1115,10 +1121,8 @@ function applySandboxToParts(
   loadout: SubagentLoadout,
   opts: { artifactDir: string; name: string },
 ): void {
-  if (loadout.model) {
-    const model = loadout.thinking ? `${loadout.model}:${loadout.thinking}` : loadout.model;
-    parts.push("--model", model);
-  }
+  if (loadout.model) parts.push("--model", loadout.model);
+  if (loadout.thinking) parts.push("--thinking", loadout.thinking);
 
   if (loadout.identity) {
     const flag = loadout.systemPromptMode === "replace" ? "--system-prompt" : "--append-system-prompt";
@@ -1528,6 +1532,7 @@ export const __test__ = {
   buildSubagentToolAllowlist,
   applySandboxToParts,
   buildClaudeCliArgs,
+  resolveSubagentEffort,
   buildClaudeLaunchEnv,
   quoteClaudeShellPath,
   writeClaudeSystemPromptFile,
@@ -1639,8 +1644,20 @@ function assertModelOverrideAllowed(params: { model?: string }, agent: AgentDefa
   }
 }
 
+function resolveSubagentEffort(params: { effort?: string }, agent: AgentDefaults | null): string | undefined {
+  const isClaude = agent?.cli === "claude";
+  if (params.effort === undefined) return isClaude ? agent?.effort : agent?.thinking;
+  const levels = isClaude ? CLAUDE_EFFORT_LEVELS : PI_EFFORT_LEVELS;
+  if (!levels.some((level) => level === params.effort)) {
+    throw new Error(`Invalid ${isClaude ? "Claude Code" : "Pi"} effort. Use one of: ${levels.join(", ")}.`);
+  }
+  return params.effort;
+}
+
 async function launchSubagent(params: typeof SubagentParams.static, ctx: LaunchContext): Promise<RunningSubagent> {
-  assertModelOverrideAllowed(params, params.agent ? loadAgentDefaults(params.agent) : null);
+  const agent = params.agent ? loadAgentDefaults(params.agent) : null;
+  assertModelOverrideAllowed(params, agent);
+  resolveSubagentEffort(params, agent);
   const artifactDir = getArtifactDir(ctx.sessionManager.getSessionDir(), ctx.sessionManager.getSessionId());
   const capacity = await reserveCapacity(capacityScope(artifactDir, maximumConcurrent));
   try {
@@ -1660,10 +1677,10 @@ async function launchReservedSubagent(
 
   const agentDefs = params.agent ? loadAgentDefaults(params.agent) : null;
   const effectiveModel = agentDefs?.cli === "claude" ? agentDefs.model : params.model ?? agentDefs?.model;
-  const effectiveEffort = agentDefs?.effort;
+  const effectiveEffort = resolveSubagentEffort(params, agentDefs);
   const effectiveTools = agentDefs?.tools;
   const effectiveSkills = agentDefs?.skills;
-  const effectiveThinking = agentDefs?.thinking;
+  const effectiveThinking = agentDefs?.cli === "claude" ? undefined : effectiveEffort;
   const effectiveInteractive = resolveEffectiveInteractive(params, agentDefs);
 
   const sessionFile = ctx.sessionManager.getSessionFile();
@@ -2509,6 +2526,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       description:
         "Spawn a Pi or Claude Code sub-agent in Herdr. In herdr-app, children appear in the native agents list and can be peeked or kept as panes. Legacy Herdr uses tabs and nested splits. " +
         "The model argument is Pi-only. Never supply a model override for a Claude Code profile; its model is fixed by the profile and overrides are rejected. " +
+        "Supply effort only when the user explicitly requests an effort level; otherwise omit it to use the profile default. It sets Pi's thinking level or Claude Code's effort. Do not infer an override from task complexity. " +
         "This is a fire-and-forget async tool: the call returns immediately with only an acknowledgement. " +
         "When the sub-agent finishes, the harness AUTOMATICALLY delivers its result as a steer message that wakes you up and starts a new turn - you do not need to do anything to receive it. " +
         "DO NOT write polling loops, sleep/wait commands, tail/watch scripts, or repeatedly read session/log files to detect completion. DO NOT call subagents_list or any other tool to 'check' status. All of that is wasted work - the harness handles delivery for you. " +
@@ -2518,6 +2536,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       promptSnippet:
         "Spawn a Pi or Claude Code sub-agent in Herdr. In herdr-app, children appear in the native agents list and can be peeked or kept as panes. Legacy Herdr uses tabs and nested splits. " +
         "The model argument is Pi-only. Never supply a model override for a Claude Code profile; its model is fixed by the profile and overrides are rejected. " +
+        "Supply effort only when the user explicitly requests an effort level; otherwise omit it to use the profile default. It sets Pi's thinking level or Claude Code's effort. Do not infer an override from task complexity. " +
         "This is a fire-and-forget async tool: the call returns immediately with only an acknowledgement. " +
         "When the sub-agent finishes, the harness AUTOMATICALLY delivers its result as a steer message that wakes you up and starts a new turn - you do not need to do anything to receive it. " +
         "DO NOT write polling loops, sleep/wait commands, tail/watch scripts, or repeatedly read session/log files to detect completion. DO NOT call subagents_list or any other tool to 'check' status. All of that is wasted work - the harness handles delivery for you. " +
@@ -2598,6 +2617,16 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           return {
             content: [{ type: "text", text: error.message }],
             details: { error: "Claude model override forbidden" },
+            isError: true,
+          };
+        }
+
+        try {
+          resolveSubagentEffort(params, loadAgentDefaults(params.agent));
+        } catch (error: any) {
+          return {
+            content: [{ type: "text", text: error.message }],
+            details: { error: "invalid effort override" },
             isError: true,
           };
         }

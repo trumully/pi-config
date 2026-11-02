@@ -105,7 +105,7 @@ export interface SubagentLoadout {
   toolAllowlist: string | null;
   /** Model id (without thinking suffix), or null to use the session default. */
   model: string | null;
-  /** Thinking level appended to the model as `model:level`, or null. */
+  /** Thinking level passed via `--thinking`, or null to use the session default. */
   thinking: string | null;
   /** How the identity text was applied: append/replace, or null. */
   systemPromptMode: "append" | "replace" | null;
