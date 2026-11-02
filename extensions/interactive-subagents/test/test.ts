@@ -914,6 +914,17 @@ describe("interactive subagents smoke tests", () => {
       rmSync(directory, { recursive: true, force: true });
     }
   });
+  it("generates Herdr names without a sub prefix while retaining unique run suffixes", () => {
+    const { herdrAgentNameFor } = (subagentsModule as any).__test__;
+    assert.equal(herdrAgentNameFor("Scout", "a1b2c3d4"), "scout-a1b2c3d4");
+    assert.equal(herdrAgentNameFor("Scout", "e5f6a7b8"), "scout-e5f6a7b8");
+    assert.equal(herdrAgentNameFor("  API / Review!  ", "a1b2c3d4"), "api-review-a1b2c3d4");
+    assert.equal(herdrAgentNameFor("???", "a1b2c3d4"), "agent-a1b2c3d4");
+    const longName = herdrAgentNameFor("a".repeat(100), "a1b2c3d4");
+    assert.match(longName, /^[a-z0-9_-]{1,32}$/);
+    assert.ok(longName.endsWith("-a1b2c3d4"));
+  });
+
   it("rejects parallel explicit duplicate names before the second launch", async () => {
     const testApi = (subagentsModule as any).__test__;
     const name = "parallel-name-test";

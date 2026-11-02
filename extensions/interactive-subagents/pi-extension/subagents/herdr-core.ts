@@ -89,7 +89,7 @@ export class HerdrCoreBackend {
   /** Reserve a stable terminal name before claiming the transcript or submitting a launch. */
   createSurface(name: string, options: CoreSurfaceOptions = {}): { surface: string } {
     const slug = name.toLowerCase().replace(/[^a-z0-9_-]+/g, "-").slice(0, 18) || "agent";
-    const surface = options.runName ?? `sub-${slug}-${randomUUID().slice(0, 8)}`;
+    const surface = options.runName ?? `${slug}-${randomUUID().slice(0, 8)}`;
     if (!/^[a-z0-9_-]{1,32}$/.test(surface)) throw new Error("Invalid hc subagent terminal name");
     if (this.pending.has(surface)) throw new Error(`Terminal ${surface} is already reserved`);
     this.pending.set(surface, options);

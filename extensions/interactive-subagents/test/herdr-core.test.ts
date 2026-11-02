@@ -30,14 +30,30 @@ function harness(sync: CoreCommands["sync"] = () => "{}") {
 }
 
 describe("herdr-app core backend", () => {
+  it("reserves unprefixed unique names and preserves explicitly supplied legacy names", () => {
+    const h = harness();
+    const first = h.backend.createSurface("Scout").surface;
+    const second = h.backend.createSurface("Scout").surface;
+    const legacy = h.backend.createSurface("Scout", { runName: "sub-scout-existing" }).surface;
+    try {
+      assert.match(first, /^scout-[a-f0-9]{8}$/);
+      assert.match(second, /^scout-[a-f0-9]{8}$/);
+      assert.notEqual(first, second);
+      assert.equal(legacy, "sub-scout-existing");
+    } finally {
+      for (const surface of [first, second, legacy]) h.backend.close(surface);
+    }
+    assert.deepEqual(h.calls, []);
+  });
+
   for (const kind of ["pi", "claude"] as const) {
     it(`launches ${kind} with argv, environment, initial work and no startup send`, async () => {
       const h = harness(() => notFound());
       const task = `Inspect \"quoted\" $HOME & Unicode 日本語\n${"x".repeat(40_000)}`;
       const { surface } = h.backend.createSurface("child", {
-        runName: "sub-child-123", cwd: "C:/a folder/repo", env: { PI_SUBAGENT_SESSION: "C:/a folder/run.jsonl", EXAMPLE: "a=b; $HOME" },
+        runName: "child-123", cwd: "C:/a folder/repo", env: { PI_SUBAGENT_SESSION: "C:/a folder/run.jsonl", EXAMPLE: "a=b; $HOME" },
       });
-      assert.equal(surface, "sub-child-123");
+      assert.equal(surface, "child-123");
       assert.deepEqual(h.calls, [], "reserving an identity must not submit a launch");
       const originalArgvEntry = process.argv[1];
       if (kind === "pi") {
@@ -50,7 +66,7 @@ describe("herdr-app core backend", () => {
         assert.ok(args.includes("--bg"));
         assert.ok(args.includes("--no-notify"), "the plugin owns completion delivery");
         assert.ok(args.includes("--outlive-parent"));
-        assert.ok(args.includes("pi.subagent=sub-child-123"));
+        assert.ok(args.includes("pi.subagent=child-123"));
         assert.ok(args.includes("pi.session=C:/a folder/run.jsonl"));
         assert.equal(args[args.indexOf("--cwd") + 1], "C:/a folder/repo");
         assert.ok(args.join(" ").length < 4_000, "large tasks belong in the descriptor, not the Windows command line");
@@ -90,7 +106,7 @@ describe("herdr-app core backend", () => {
     assert.deepEqual(h.calls, [["send", "--json", "child", "continue"]]);
   });
 
-  it("keeps a live run identified by its own label, even without OSC status yet", async () => {
+  it("recovers a saved prefixed name by its own label, even without OSC status yet", async () => {
     const h = harness(() => JSON.stringify({ address: "t42", name: "sub-child-123", state: "live", labels: { "pi.subagent": "sub-child-123", "pi.session": "/run.jsonl" } }));
     assert.deepEqual(await h.backend.getRunningSurface("sub-child-123", { surface: "sub-child-123", sessionFile: "/run.jsonl" }), { surface: "sub-child-123" });
   });

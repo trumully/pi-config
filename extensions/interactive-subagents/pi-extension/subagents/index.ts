@@ -1308,7 +1308,7 @@ function herdrAgentNameFor(name: string, id: string): string {
     .replace(/^[-_]+|[-_]+$/g, "")
     .slice(0, 18);
   const suffix = id.toLowerCase().replace(/[^a-z0-9]/g, "").slice(0, 8) || "agent";
-  return `sub-${slug || "agent"}-${suffix}`;
+  return `${slug || "agent"}-${suffix}`;
 }
 
 function resolveRunningByName(name: string):
