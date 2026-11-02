@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { HerdrCoreBackend, type CoreCommands } from "../pi-extension/subagents/herdr-core.ts";
 
@@ -39,6 +39,10 @@ describe("herdr-app core backend", () => {
       });
       assert.equal(surface, "sub-child-123");
       assert.deepEqual(h.calls, [], "reserving an identity must not submit a launch");
+      const originalArgvEntry = process.argv[1];
+      if (kind === "pi") {
+        process.argv[1] = join(dirname(fileURLToPath(import.meta.resolve("@earendil-works/pi-coding-agent"))), "bundle", "cli.js");
+      }
       try {
         await h.backend.startAgent(surface, kind, surface, ["--model", "profile-model"], [task]);
         const args = h.calls[0];
@@ -53,7 +57,7 @@ describe("herdr-app core backend", () => {
         assert.equal(h.launch.env.EXAMPLE, "a=b; $HOME");
         if (kind === "pi") {
           assert.deepEqual(h.launch.argv.slice(-4), ["--model", "profile-model", "--", task]);
-          assert.ok(h.launch.moduleEntryPoint.endsWith("cli.js"));
+          assert.equal(h.launch.moduleEntryPoint, process.argv[1]);
         } else {
           assert.equal(h.launch.argv[0], "claude");
           assert.deepEqual(h.launch.argv.slice(1, 3), ["--model", "profile-model"]);
@@ -63,7 +67,10 @@ describe("herdr-app core backend", () => {
           assert.ok(h.launch.argv.join(" ").length < 8_000);
         }
         assert.ok(!h.calls.some((args) => args[0] === "send"));
-      } finally { h.backend.close(surface); }
+      } finally {
+        process.argv[1] = originalArgvEntry;
+        h.backend.close(surface);
+      }
       assert.equal(existsSync(h.descriptor), false);
     });
   }

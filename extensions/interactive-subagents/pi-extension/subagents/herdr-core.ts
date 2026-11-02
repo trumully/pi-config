@@ -1,7 +1,7 @@
 /** herdr-app's terminal backend. The app discovers children through hc's parent link. */
 import { execFile, execFileSync } from "node:child_process";
 import { promisify } from "node:util";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { randomUUID } from "node:crypto";
@@ -11,6 +11,24 @@ import { canonicalSessionPath } from "./lifecycle.ts";
 const execFileAsync = promisify(execFile);
 const executionOptions = { encoding: "utf8" as const, timeout: 35_000, maxBuffer: 10 * 1024 * 1024, windowsHide: true };
 const runner = fileURLToPath(new URL("./herdr-core-launcher.mjs", import.meta.url));
+
+function piCliEntryPoint(): string {
+  const runningEntryPoint = process.argv[1];
+  if (runningEntryPoint) {
+    let directory = dirname(runningEntryPoint);
+    while (true) {
+      try {
+        const manifest = JSON.parse(readFileSync(join(directory, "package.json"), "utf8"));
+        if (manifest.name === "@earendil-works/pi-coding-agent") return runningEntryPoint;
+      } catch {}
+      const parent = dirname(directory);
+      if (parent === directory) break;
+      directory = parent;
+    }
+  }
+  // Standalone Node tests may not be running from Pi's CLI; use ESM resolution there.
+  return join(dirname(fileURLToPath(import.meta.resolve("@earendil-works/pi-coding-agent"))), "cli.js");
+}
 
 export interface CoreSurfaceOptions {
   cwd?: string;
@@ -79,10 +97,8 @@ export class HerdrCoreBackend {
   }
 
   async startAgent(name: string, kind: "pi" | "claude", surface: string, args: string[], prompts: string[] = []): Promise<void> {
-    // Invoke the installed Pi JS entry point, not a .cmd shim that spawn cannot execute on Windows.
-    const command = kind === "pi"
-      ? [process.execPath, join(dirname(fileURLToPath(import.meta.resolve("@earendil-works/pi-coding-agent"))), "cli.js")]
-      : ["claude"];
+    // Reuse Pi's running JS entry point to avoid package-root resolution through the extension loader.
+    const command = kind === "pi" ? [process.execPath, piCliEntryPoint()] : ["claude"];
     await this.startProgram(surface, [...command, ...args, ...(prompts.length ? ["--", ...prompts.filter(Boolean)] : [])], name,
       kind === "pi" ? command[1] : undefined, kind === "claude" ? prompts.filter(Boolean) : undefined);
   }
