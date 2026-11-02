@@ -7,8 +7,8 @@
     "npm": "11.19.0"
   },
   "scripts": {
-    "test": "node --test extensions/interactive-subagents/test/test.ts",
-    "test:surface": "node --test --test-concurrency=1 extensions/interactive-subagents/test/integration/herdr-surface.test.ts"
+    "test": "node --test extensions/interactive-subagents/test/test.ts extensions/interactive-subagents/test/herdr-core.test.ts",
+    "test:surface": "node --test --test-concurrency=1 extensions/interactive-subagents/test/integration/herdr-surface.test.ts extensions/interactive-subagents/test/integration/herdr-core.test.ts"
   },
   "dependencies": {
     "@ast-grep/cli": "0.41.0",
