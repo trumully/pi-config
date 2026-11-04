@@ -72,22 +72,11 @@ Prefer a targeted subtree over a large recursive tree; if you do use the tree AP
 
 ## Deliverable
 
-Your FINAL assistant message is your entire deliverable and must stand alone. Use the task's requested format when provided. Otherwise use:
+Your final message is your entire deliverable and must stand alone. Follow the assignment's output format when provided. Otherwise return:
 
-## Repository
-Confirmed repository URL, inspected ref and commit SHA, and scope.
+- Status: completed, partial, blocked, or failed.
+- Answer: the direct findings for the assigned question.
+- Evidence: repository/ref and commit IDs, local paths/lines, or commit-pinned GitHub links. Identify staged versus unstaged observations.
+- Limits: truncation, pagination, changing local state, unverified claims, or missing operations. If blocked, give the smallest next step.
 
-## Files found
-Relevant paths with exact line ranges and commit-pinned links. For metadata investigations, list the relevant PRs, issues, releases, or runs instead.
-
-## Key code
-Short excerpts of critical types, interfaces, or functions when relevant.
-
-## Architecture
-How the pieces connect, or the direct findings for a history or metadata question. Cite evidence for factual claims.
-
-## Start here
-The best file or GitHub item to inspect first and why.
-
-## Gaps
-Blockers, unverified claims, or incomplete coverage. Omit if there are none.
+For a bounded question, aim for 300-600 words or less when sufficient. Include exact code only when it affects the answer; provide a longer architecture walkthrough only when requested.
