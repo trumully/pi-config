@@ -51,6 +51,9 @@ import {
   getRunningAgentSurface,
   closeSurface,
   readScreen,
+  interruptAndPrompt,
+  ReplaceTurnError,
+  type ReplaceTurnResult,
 } from "./herdr.ts";
 
 import {
@@ -68,6 +71,7 @@ import {
   seedSubagentSessionFile,
   summarizeSessionStats,
   writeSubagentLoadout,
+  type ClaudeResumeRecord,
   type NameRegistryEntry,
   type SessionStats,
   type SubagentLoadout,
@@ -195,6 +199,9 @@ interface AgentDefinition extends AgentDefaults {
 
 interface ListedAgentDefinition extends AgentDefinition {
   source: AgentSource;
+  definitionPath: string;
+  declaredName: string;
+  shadowedPaths: string[];
 }
 
 /**
@@ -302,6 +309,10 @@ function getToolExtensionPath(tool: string): string | undefined {
       getBundledSiblingPath("gh-readonly/index.ts"),
       join(extBase, "gh-readonly", "index.ts"),
     ),
+    git_readonly: resolveBundledOrGlobalPath(
+      getBundledSiblingPath("git-readonly/index.ts"),
+      join(extBase, "git-readonly", "index.ts"),
+    ),
   };
   // Prefer the built-in path, but fall back to a runtime-registered extension
   // when that path no longer exists on disk (e.g. a built-in tool extension
@@ -357,6 +368,21 @@ function describeAgentTools(agent: Pick<AgentDefaults, "tools" | "subagentAgents
     : "spawning and child-control tools only (restricted)";
 }
 
+function describeAgentDetails(agent: ListedAgentDefinition): string {
+  const claude = agent.cli === "claude";
+  const tuning = claude ? `Effort: ${agent.effort ?? "not set"}` : `Thinking: ${agent.thinking ?? "not set"}`;
+  return [
+    `File: ${agent.definitionPath}`,
+    ...(agent.declaredName !== agent.name ? [`Declared name: ${agent.declaredName}; launch name: ${agent.name} (filename)`] : []),
+    `Shadowed files: ${agent.shadowedPaths.join(", ") || "none"}`,
+    `${tuning}; session mode: ${claude ? "Claude Code session" : agent.sessionMode ?? "standalone"}`,
+    `Question tool: ${claude ? "mcp__plugin_pi-auto-exit_pi__ask_question (requires plugin/uv)" : "ask_question"}`,
+    claude
+      ? "Permissions: Claude Code auto mode and effective Claude settings; Pi tools/subagent_agents do not apply."
+      : "Permissions: Pi tool grants apply; prose restrictions are instructions, not filesystem isolation.",
+  ].join("\n");
+}
+
 function parseSessionMode(value: string | undefined): SubagentSessionMode | undefined {
   if (value === "standalone" || value === "lineage-only" || value === "fork") {
     return value;
@@ -409,12 +435,19 @@ function discoverAgentDefinitions(): ListedAgentDefinition[] {
   for (const { path: dir, source } of dirs) {
     if (!existsSync(dir)) continue;
     for (const file of readdirSync(dir).filter((entry) => entry.endsWith(".md"))) {
-      const parsed = parseAgentDefinition(
-        readFileSync(join(dir, file), "utf8"),
-        file.replace(/\.md$/, ""),
-      );
+      // Launch lookup uses the filename, not the optional frontmatter label.
+      const name = file.replace(/\.md$/, "");
+      const parsed = parseAgentDefinition(readFileSync(join(dir, file), "utf8"), name);
       if (!parsed) continue;
-      agents.set(parsed.name, { ...parsed, source });
+      const previous = agents.get(name);
+      agents.set(name, {
+        ...parsed,
+        name,
+        declaredName: parsed.name,
+        source,
+        definitionPath: resolve(dir, file),
+        shadowedPaths: previous ? [...previous.shadowedPaths, previous.definitionPath] : [],
+      });
     }
   }
 
@@ -1402,6 +1435,69 @@ function handleSubagentSteer(
   };
 }
 
+/**
+ * Interrupt a running child's current turn and submit a complete replacement
+ * assignment. Success means hc observed the turn stop (or the child was not
+ * working) and typed the replacement as a new turn. It does not mean the
+ * prior turn's side effects were undone or that every process it started has
+ * stopped. The child keeps running; capacity and completion are unchanged.
+ */
+async function handleSubagentReplace(
+  running: RunningSubagent,
+  envelope: string,
+  replace: (target: string, prompt: string) => Promise<ReplaceTurnResult> = interruptAndPrompt,
+) {
+  const now = Date.now();
+  observeRunningSubagent(running, now);
+  const flattened = envelope.replace(/\s*\n\s*/g, " ").trim();
+  let outcome: ReplaceTurnResult;
+  try {
+    outcome = await replace(running.herdrAgentName, flattened);
+  } catch (error: any) {
+    const code = error instanceof ReplaceTurnError ? error.code : "uncertain";
+    const stopKeyPressed = error instanceof ReplaceTurnError ? error.stopKeyPressed : false;
+    const sent = code === "send_uncertain"
+      ? "The replacement may or may not have arrived; inspect the child's pane before retrying."
+      : "The replacement was not sent; the saved brief is unchanged.";
+    const turn = stopKeyPressed && code !== "exited"
+      ? " The stop key was pressed, so the child's current turn may have ended."
+      : "";
+    const exited = code === "exited" ? " Its result, if any, arrives through normal delivery." : "";
+    const hint = code === "blocked"
+      ? " Resolve the dialog in the child's pane, then retry."
+      : code === "unsupported" || code === "not_live" || code === "exited" || code === "send_uncertain"
+        ? ""
+        : " Retry, or omit interrupt to queue the replacement for the next turn boundary.";
+    const err = `Could not interrupt-and-replace subagent "${running.name}": ${error?.message ?? String(error)}${exited} ${sent}${turn}${hint}`;
+    return {
+      content: [{ type: "text" as const, text: err }],
+      details: { error: err, code, stopKeyPressed, id: running.id, name: running.name },
+      isError: true,
+    };
+  }
+
+  running.statusState = forceStatusAfterInterrupt(running.statusState, now);
+  updateWidget();
+  const how = outcome.interrupt
+    ? `hc pressed ${outcome.interrupt.key || "the stop key"}, observed the turn stop (status now "${outcome.interrupt.statusAfter}"), then submitted the replacement as a new turn.`
+    : `The child was not working (status "${outcome.statusBefore}"), so no stop key was pressed; the replacement was submitted as a new turn.`;
+  return {
+    content: [{
+      type: "text" as const,
+      text:
+        `Replacement assignment submitted to running subagent "${running.name}". ${how} ` +
+        `Stopping a turn does not undo its side effects or prove that every process it started has stopped. ` +
+        `If it exits, its result still arrives as a steer message.`,
+    }],
+    details: {
+      id: running.id, name: running.name, status: "replaced",
+      interrupted: !!outcome.interrupt, statusBefore: outcome.statusBefore,
+      ...(outcome.interrupt ? { interruptOutcome: outcome.interrupt.outcome, interruptKey: outcome.interrupt.key } : {}),
+      statusAtSend: outcome.statusAtSend,
+    },
+  };
+}
+
 function startStatusRefresh(pi: ExtensionAPI) {
   if (!statusConfig.enabled || statusInterval) return;
 
@@ -1468,6 +1564,16 @@ function finishedIntentError(intent?: string): string | null {
   return intent === "context" || intent === "reply"
     ? `Intent "${intent}" only applies to a running subagent; finished agents are not resumed for context or reply.`
     : null;
+}
+
+function interruptOptionError(params: { intent?: string; interrupt?: boolean }, running: boolean): string | null {
+  if (!params.interrupt) return null;
+  if (params.intent !== "task") {
+    return 'interrupt: true requires intent: "task"; only a complete replacement assignment may interrupt the current turn.';
+  }
+  return running
+    ? null
+    : "interrupt: true applies only to a running subagent. This one is not running; omit interrupt to resume it with the replacement assignment.";
 }
 
 function persistDeliveredTaskBrief(
@@ -1551,6 +1657,9 @@ export const __test__ = {
   reservedNames,
   steerSubagent,
   handleSubagentSteer,
+  handleSubagentReplace,
+  interruptOptionError,
+  claudeResumeError,
   deliverPendingQuestion,
   resolveResultPresentation,
   sendSubagentResult,
@@ -1741,6 +1850,13 @@ async function launchReservedSubagent(
     const systemPromptFile = agentDefs.body
       ? writeClaudeSystemPromptFile(artifactDir, id, agentDefs.body)
       : undefined;
+    // Resume replays these exact settings against Claude's own session.
+    const claudeRecord: ClaudeResumeRecord = {
+      launch: {
+        cwd: targetCwdForSession, model: effectiveModel ?? null, effort: effectiveEffort ?? null,
+        systemPromptFile: systemPromptFile ?? null, plugin: existsSync(pluginDir),
+      },
+    };
     const args = buildClaudeCliArgs({
       pluginDir: existsSync(pluginDir) ? pluginDir : undefined,
       model: effectiveModel,
@@ -1768,7 +1884,7 @@ async function launchReservedSubagent(
     try {
       claimRegisteredRun(parentArtifactDir, params.name, {
         sessionFile: subagentSessionFile, sessionId: null, usageFile: `${sentinelFile}.usage.json`,
-        running: true, runId: id, taskBrief: params.task, runMetadata: claudeMetadata,
+        running: true, runId: id, taskBrief: params.task, runMetadata: claudeMetadata, claude: claudeRecord,
       });
     } catch (error) {
       closeSurfaceAndTab(surface, tabId);
@@ -2004,6 +2120,191 @@ function handleClaudeLaunchError(
   throw error;
 }
 
+/**
+ * Why a finished Claude child cannot be resumed, or null when its saved
+ * session and launch settings are complete. Never falls back to a fresh
+ * session or to the profile's current settings.
+ */
+function claudeResumeError(name: string, entry: NameRegistryEntry, pluginDir: string): string | null {
+  const run = entry.runMetadata;
+  if (entry.running !== false || run?.state !== "finished") {
+    const state = run?.state === "finished" ? "still marked running" : (run?.state ?? "unknown").toUpperCase();
+    return `Cannot resume Claude subagent "${name}": its prior run is ${state}, not confirmed finished. ` +
+      "Reopen the original parent session so it reconciles that run, then retry.";
+  }
+  const record = entry.claude;
+  if (!record?.launch) {
+    return `Cannot resume Claude subagent "${name}": it was launched before Claude resume settings were recorded, so its model, effort, and system prompt cannot be replayed. Spawn a fresh subagent instead.`;
+  }
+  if (!record.sessionId || !record.transcriptPath) {
+    return `Cannot resume Claude subagent "${name}": Claude never reported a session transcript for its last run (the Stop hook records it after a completed turn), so there is no saved Claude session to continue. Spawn a fresh subagent instead.`;
+  }
+  if (!existsSync(record.transcriptPath)) {
+    return `Cannot resume Claude subagent "${name}": its Claude transcript ${record.transcriptPath} no longer exists. Spawn a fresh subagent instead.`;
+  }
+  if (!record.launch.cwd || !existsSync(record.launch.cwd)) {
+    return `Cannot resume Claude subagent "${name}": its working directory ${record.launch.cwd || "(not recorded)"} is unavailable, and Claude finds sessions by project directory.`;
+  }
+  if (record.launch.systemPromptFile && !existsSync(record.launch.systemPromptFile)) {
+    return `Cannot resume Claude subagent "${name}": its saved profile prompt ${record.launch.systemPromptFile} is missing.`;
+  }
+  if (record.launch.plugin && !existsSync(pluginDir)) {
+    return `Cannot resume Claude subagent "${name}": the pi-auto-exit plugin it ran with is missing at ${pluginDir}, so completion and questions would not reach the parent.`;
+  }
+  return null;
+}
+
+/**
+ * Resume a confirmed-finished Claude child with `claude --resume <id>` in its
+ * original directory and with its saved model, effort, system prompt, and the
+ * fixed subagent permissions. Like Pi resumes, it runs autonomously and
+ * delivers its result later.
+ */
+async function resumeClaudeSubagent(
+  pi: ExtensionAPI,
+  ctx: LaunchContext,
+  params: { intent?: "task" | "context" | "reply" },
+  name: string,
+  message: string,
+  entry: NameRegistryEntry,
+  parentArtifactDir: string,
+) {
+  const pluginDir = join(SUBAGENTS_DIR, "plugin");
+  const refused = claudeResumeError(name, entry, pluginDir);
+  if (refused) return { content: [{ type: "text" as const, text: refused }], details: { error: refused }, isError: true };
+  for (const r of runningSubagents.values()) {
+    if (r.name === name || resolve(r.sessionFile) === resolve(entry.sessionFile)) {
+      const err = `Claude subagent "${name}" is already running as run ${r.id}; message it instead of resuming.`;
+      return { content: [{ type: "text" as const, text: err }], details: { error: "child live" }, isError: true };
+    }
+  }
+  const prior = entry.runMetadata!;
+  // A Stop sentinel confirms a completed turn, not process termination. The
+  // watcher's close is best-effort, so independently rule out an orphan before
+  // opening another process against the same Claude transcript.
+  try {
+    const live = await getRunningAgentSurface(prior.herdrAgentName, {
+      surface: prior.surface, sessionFile: entry.sessionFile,
+    });
+    if (live) {
+      const err = `Cannot resume Claude subagent "${name}": its previous process is still live in Herdr. Inspect its pane and close it safely before retrying; no second Claude process was launched.`;
+      return { content: [{ type: "text" as const, text: err }], details: { error: "child live" }, isError: true };
+    }
+  } catch (error: any) {
+    const err = `Cannot resume Claude subagent "${name}": prior process liveness is UNKNOWN because Herdr status could not be confirmed (${error?.message ?? String(error)}). Inspect the original pane before retrying.`;
+    return { content: [{ type: "text" as const, text: err }], details: { error: "Herdr unavailable" }, isError: true };
+  }
+  const record = entry.claude!;
+  const claudeSessionId = record.sessionId!;
+  const startTime = Date.now();
+  const id = Math.random().toString(16).slice(2, 10);
+  const herdrAgentName = herdrAgentNameFor(name, id);
+  const sentinelFile = join(tmpdir(), `pi-claude-${id}-done`);
+  const usageFile = `${sentinelFile}.usage.json`;
+  const args = buildClaudeCliArgs({
+    pluginDir: record.launch.plugin ? pluginDir : undefined,
+    model: record.launch.model ?? undefined,
+    effort: record.launch.effort ?? undefined,
+    systemPromptFile: record.launch.systemPromptFile ?? undefined,
+    usageFile,
+    statuslineScript: join(pluginDir, "statusline.py"),
+  });
+  args.push("--resume", claudeSessionId);
+  const prompt = formatSubagentMessage(params.intent, name, message, entry.taskBrief);
+  const { autoExit, interactive } = resolveResumeLaunchBehavior();
+
+  const scope = capacityScope(parentArtifactDir, maximumConcurrent);
+  releasePriorCapacity(scope, parentArtifactDir, name, entry.runId, prior.capacity);
+  const capacity = await reserveCapacity(scope);
+  let allocated: ReturnType<typeof createSubagentSurface>;
+  try {
+    allocated = createSubagentSurface(name, {
+      runName: herdrAgentName,
+      cwd: record.launch.cwd,
+      env: { ...buildClaudeLaunchEnv(sentinelFile, autoExit), [CAPACITY_SCOPE_ENV]: capacity.scope },
+    });
+  } catch (error) {
+    releaseUnsubmittedCapacity(capacity);
+    throw error;
+  }
+  const { surface, tabId } = allocated;
+  const parentSessionId = ctx.sessionManager.getSessionId();
+  const runMetadata: RunMetadata = {
+    version: 1, state: "launching", parentSessionId, runId: id, herdrAgentName, surface,
+    ...(tabId ? { herdrTabId: tabId } : {}), sessionFile: entry.sessionFile, transcriptOffset: 0,
+    usageFile, askFile: `${sentinelFile}.ask`, pendingFile: `${sentinelFile}.pending`, sentinelFile,
+    ...(prior.profile ? { profile: prior.profile } : {}), task: message, startTime, cli: "claude", interactive, capacity,
+  };
+  const taskBrief = params.intent === "task" ? message : entry.taskBrief;
+  let registryClaimed = false;
+  let launchSubmitted = false;
+  try {
+    claimRegisteredRun(parentArtifactDir, name, { ...entry, usageFile, running: true, runId: id, runMetadata }, entry);
+    registryClaimed = true;
+    attachCapacity(capacity, parentArtifactDir, name, id);
+    launchSubmitted = true;
+    await startAgent(herdrAgentName, "claude", surface, args, [prompt]);
+    runMetadata.state = "running";
+    runMetadata.launchConfirmed = true;
+    updateRegisteredRun(parentArtifactDir, name, id, { usageFile, running: true, taskBrief, runMetadata });
+  } catch (error) {
+    if (!launchSubmitted) {
+      if (registryClaimed) {
+        try { updateRegisteredRun(parentArtifactDir, name, id, { ...entry }); } catch (rollback: any) {
+          warnOnce(`claude-resume-rollback:${id}`, `Could not restore the prior registry run for "${name}": ${rollback?.message ?? String(rollback)}`);
+        }
+      }
+      try { releaseCapacity(capacity); } catch {}
+      closeSurfaceAndTab(surface, tabId);
+      throw error;
+    }
+    // Submitted launches stay "launching" so reconciliation treats them as UNKNOWN.
+    handleClaudeLaunchError(error, herdrAgentName, surface, tabId);
+  }
+
+  const running: RunningSubagent = {
+    id, name, task: message, agent: prior.profile, surface, herdrTabId: tabId, herdrAgentName, startTime,
+    startEntryCount: 0, sessionFile: entry.sessionFile, cli: "claude", sentinelFile,
+    askFile: `${sentinelFile}.ask`, pendingFile: `${sentinelFile}.pending`, usageFile, interactive,
+    parentSessionId, parentArtifactDir, runMetadata,
+    statusState: createStatusState({ source: "claude", startTimeMs: startTime }),
+  };
+  runningSubagents.set(id, running);
+  startWidgetRefresh();
+  startStatusRefresh(pi);
+
+  const watcherAbort = new AbortController();
+  running.abortController = watcherAbort;
+  watchSubagent(running, watcherAbort.signal)
+    .then((result) => {
+      if (result.detached) return;
+      completeRun(parentArtifactDir, running, () => {
+        const presentation = result.terminationConfirmed === false
+          ? `Sub-agent "${name}" watcher failed; child termination is unknown: ${result.error}`
+          : resolveResultPresentation(result, name);
+        deliverSubagentResult(pi, running.id, presentation, {
+          parentSessionId, name, task: running.task, agent: running.agent, exitCode: result.exitCode,
+          elapsed: result.elapsed, resumed: true,
+          ...(result.errorMessage ? { errorMessage: result.errorMessage } : {}),
+          ...(result.terminationConfirmed === false ? { error: result.error } : {}),
+          ...(result.claudeSessionId ? { claudeSessionId: result.claudeSessionId } : {}),
+        }, result.terminationConfirmed !== false);
+      }, result.terminationConfirmed !== false);
+    })
+    .catch((err) => {
+      completeRun(parentArtifactDir, running, () => {
+        deliverSubagentResult(pi, running.id, `Resume watcher error; child termination is unknown: ${err?.message ?? String(err)}`, {
+          parentSessionId, name, resumed: true, error: err?.message,
+        }, false);
+      }, false);
+    });
+
+  return {
+    content: [{ type: "text" as const, text: `Claude session "${name}" resumed (Claude session ${claudeSessionId}).` }],
+    details: { id, name, claudeSessionId, status: "started" },
+  };
+}
+
 function readClaudeTranscriptPath(sentinelFile: string): string | null {
   try {
     const transcriptFile = sentinelFile + ".transcript";
@@ -2012,6 +2313,31 @@ function readClaudeTranscriptPath(sentinelFile: string): string | null {
     return transcriptPath && existsSync(transcriptPath) ? transcriptPath : null;
   } catch {
     return null;
+  }
+}
+
+const CLAUDE_SESSION_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/**
+ * Save the Claude session this run wrote, as reported by its Stop hook, so a
+ * later resume continues that exact session. A run without a reported
+ * transcript keeps any earlier record.
+ */
+function recordClaudeSession(running: RunningSubagent, transcriptPath: string | null): void {
+  if (!transcriptPath || !running.parentArtifactDir) return;
+  const sessionId = basename(transcriptPath).replace(/\.jsonl$/i, "");
+  if (!CLAUDE_SESSION_ID.test(sessionId)) {
+    console.error(`[interactive-subagents] Claude transcript ${transcriptPath} has no session ID; "${running.name}" cannot be resumed.`);
+    return;
+  }
+  try {
+    const current = resolveNameInRegistry(running.parentArtifactDir, running.name);
+    if (current?.runId !== running.id || !current.claude) return;
+    updateRegisteredRun(running.parentArtifactDir, running.name, running.id, {
+      claude: { ...current.claude, sessionId, transcriptPath },
+    });
+  } catch (error: any) {
+    console.error(`[interactive-subagents] Could not record Claude session for "${running.name}": ${error?.message ?? String(error)}`);
   }
 }
 
@@ -2227,6 +2553,7 @@ async function watchSubagent(
             console.error(`[interactive-subagents] Could not record Claude usage estimate for "${name}": ${error instanceof Error ? error.message : String(error)}`);
           }
         }
+        recordClaudeSession(running, readClaudeTranscriptPath(running.sentinelFile));
         sessionId = copyClaudeSession(running.sentinelFile);
         try { unlinkSync(running.sentinelFile); } catch {}
         try { unlinkSync(running.sentinelFile + ".transcript"); } catch {}
@@ -2835,36 +3162,37 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       name: "subagents_list",
       label: "List Subagents",
       description:
-        "List all available subagent definitions. " +
-        "Scans project-local .pi/agents/ and global ~/.pi/agent/agents/. " +
-        "Project-local agents override global ones with the same name.",
+        "List effective subagent profiles with their source, CLI, model and tool behavior. " +
+        "Project profiles override user profiles, which override bundled profiles. " +
+        "Pass name for the winning file path, shadowed definitions, profile defaults and question tool. CLI/model changes in profile files are intentional configuration, not errors.",
       promptSnippet:
-        "List all available subagent definitions. " +
-        "Scans project-local .pi/agents/ and global ~/.pi/agent/agents/. " +
-        "Project-local agents override global ones with the same name.",
-      parameters: Type.Object({}),
+        "List effective subagent profiles; pass name to inspect the winning file, overrides and runtime defaults before assigning work.",
+      parameters: Type.Object({
+        name: Type.Optional(Type.String({ minLength: 1, description: "Exact profile name for detailed effective configuration; omit for a compact list." })),
+      }),
 
-      async execute() {
-        const list = discoverAgentDefinitions().filter((agent) => !agent.disableModelInvocation);
+      async execute(_toolCallId, params) {
+        const list = discoverAgentDefinitions().filter((agent) => !agent.disableModelInvocation && (!params.name || agent.name === params.name));
 
         if (list.length === 0) {
           return {
-            content: [{ type: "text", text: "No subagent definitions found." }],
-            details: { agents: [] },
+            content: [{ type: "text", text: params.name ? `No available subagent profile named ${params.name}.` : "No subagent definitions found." }],
+            details: { agents: [], detailed: Boolean(params.name) },
           };
         }
 
         const lines = list.map((a) => {
-          const badge = a.source === "project" ? " (project)" : "";
+          const source = ` [${a.source}; cli: ${a.cli === "claude" ? "claude" : "pi"}]`;
           const desc = a.description ? ` - ${a.description}` : "";
           const model = a.model ? ` [${a.model}]` : "";
           const tools = ` [tools: ${describeAgentTools(a)}]`;
-          return `• ${a.name}${badge}${model}${tools}${desc}`;
+          const detail = params.name ? `\n${describeAgentDetails(a)}` : "";
+          return `• ${a.name}${source}${model}${tools}${desc}${detail}`;
         });
 
         return {
           content: [{ type: "text", text: lines.join("\n") }],
-          details: { agents: list },
+          details: { agents: list, detailed: Boolean(params.name) },
         };
       },
 
@@ -2875,11 +3203,12 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           return new Text(theme.fg("dim", "No subagent definitions found."), 0, 0);
         }
         const lines = agents.map((a: any) => {
-          const badge = a.source === "project" ? theme.fg("accent", " (project)") : "";
+          const source = theme.fg("accent", ` [${a.source}; cli: ${a.cli === "claude" ? "claude" : "pi"}]`);
           const desc = a.description ? theme.fg("dim", ` - ${a.description}`) : "";
           const model = a.model ? theme.fg("dim", ` [${a.model}]`) : "";
           const tools = theme.fg("dim", ` [tools: ${describeAgentTools(a)}]`);
-          return `  ${theme.fg("toolTitle", theme.bold(a.name))}${badge}${model}${tools}${desc}`;
+          const detail = details.detailed ? `\n${theme.fg("dim", describeAgentDetails(a))}` : "";
+          return `  ${theme.fg("toolTitle", theme.bold(a.name))}${source}${model}${tools}${desc}${detail}`;
         });
         return new Text(lines.join("\n"), 0, 0);
       },
@@ -2895,20 +3224,28 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         "Send a message to a subagent by name. Names are unique within your session and persist after a subagent finishes, " +
         "so the SAME name works whether the subagent is running or finished: if it is still running, your message steers its live session; " +
         "if it has finished, a legacy message or `intent: task` resumes that session, while `context` and `reply` are running-child-only. " +
+        "Claude Code children resume their recorded Claude session with their original settings; one with no recorded session cannot be resumed. " +
         "Optional intent: `task` replaces the complete assignment and saved current brief; `context` adds non-replacing information; `reply` answers a question without identity validation. Omitted intent retains legacy behavior. " +
+        "A running child normally picks up a message at its next turn boundary. With `intent: task`, `interrupt: true` (herdr-app only) first stops its current turn and fails without sending if that stop cannot be confirmed. " +
         "`name` and `message` are both required. " +
-        "Steering a running subagent returns immediately with a local acknowledgement and does NOT, by itself, emit a new result. " +
+        "Messaging a running subagent returns a local acknowledgement, not a new result; interrupt-and-replace waits for backend confirmation before acknowledging. " +
         "Resuming is a fire-and-forget async call: when the resumed sub-agent finishes, the harness AUTOMATICALLY delivers its result as a steer message that wakes you up. " +
         "DO NOT poll, sleep, tail logs, or read session files to detect completion - the harness handles delivery. " +
         "DO NOT fabricate or assume results. After calling, either end your turn or work on other independent tasks.",
       promptSnippet:
         "Message a subagent by name. Optional intent `task` replaces the full assignment, `context` adds information to a running child, and `reply` answers a running child; omitted intent retains legacy auto-steer/resume behavior. " +
-        "`name` and `message` are required. Steering returns immediately; resuming delivers its result later as a steer message. " +
+        "Add `interrupt: true` to a running child's `task` only when its current turn must stop first. " +
+        "`name` and `message` are required. Steering returns a local acknowledgement; interruption first waits for confirmation; resuming delivers its result later as a steer message. " +
         "Report completed results to the user instead of acknowledging them through this tool. Do not poll or fabricate results.",
       parameters: Type.Object({
         name: Type.String({ description: "Exact display name of the subagent." }),
         message: Type.String({ description: "Message payload. With intent=task, this is the complete replacement assignment." }),
         intent: Type.Optional(Type.Union([Type.Literal("task"), Type.Literal("context"), Type.Literal("reply")])),
+        interrupt: Type.Optional(Type.Boolean({
+          description:
+            'Only with intent "task" for a running child on herdr-app: stop its current turn, then submit the replacement as a new turn. ' +
+            "Fails without sending if the stop cannot be confirmed, the child is blocked on a dialog, or the backend cannot report status. Default false queues the message.",
+        })),
       }),
 
       renderCall(args, theme) {
@@ -2929,6 +3266,17 @@ export default function subagentsExtension(pi: ExtensionAPI) {
               " " +
               theme.fg("toolTitle", theme.bold(details.name ?? "subagent")) +
               theme.fg("dim", " - message delivered"),
+            0,
+            0,
+          );
+        }
+
+        if (details?.status === "replaced") {
+          return new Text(
+            theme.fg("success", "✓") +
+              " " +
+              theme.fg("toolTitle", theme.bold(details.name ?? "subagent")) +
+              theme.fg("dim", details.interrupted ? " - turn interrupted, replacement submitted" : " - replacement submitted (was not working)"),
             0,
             0,
           );
@@ -2969,9 +3317,19 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         const runningMatch = Array.from(runningSubagents.values()).find((r) =>
           r.name === requestedName && (!r.parentSessionId || r.parentSessionId === currentParentSessionIdValue),
         );
+        const interruptError = interruptOptionError(params, !!runningMatch);
+        if (interruptError) {
+          return { content: [{ type: "text" as const, text: interruptError }], details: { error: interruptError }, isError: true };
+        }
         if (runningMatch) {
           const intent = params.intent;
           const envelope = intent ? formatSubagentMessage(intent, requestedName, message) : message;
+          if (params.interrupt) {
+            const result = await handleSubagentReplace(runningMatch, envelope);
+            if ((result.details as any)?.status !== "replaced") return result;
+            const artifact = getArtifactDir(ctx.sessionManager.getSessionDir(), ctx.sessionManager.getSessionId());
+            return persistDeliveredTaskBrief(runningMatch, artifact, message, result, true);
+          }
           const result = handleSubagentSteer({ name: requestedName, message: envelope });
           if (intent === "task" && (result.details as any)?.status === "steered") {
             const artifact = getArtifactDir(ctx.sessionManager.getSessionDir(), ctx.sessionManager.getSessionId());
@@ -3004,6 +3362,12 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 
         const finishedError = finishedIntentError(params.intent);
         if (finishedError) return { content: [{ type: "text" as const, text: finishedError }], details: { error: "not running" }, isError: true };
+
+        // Claude children have no Pi transcript; they resume through their own
+        // recorded Claude session and launch settings.
+        if (entry.runMetadata?.cli === "claude" || entry.claude) {
+          return resumeClaudeSubagent(pi, ctx, params, name, message, entry, parentArtifactDir);
+        }
 
         const sessionPath = entry.sessionFile;
         let herdrConfirmedAbsent = false;

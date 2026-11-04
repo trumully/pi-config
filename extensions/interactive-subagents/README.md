@@ -29,6 +29,28 @@ Spawns are asynchronous. Names are unique within the parent session, including f
 
 `intent` may be `task`, `context`, or `reply`; omit it for the existing automatic steer/resume behavior. `task` replaces the child's current assignment in full (rather than accumulating corrections); `context` adds information and `reply` answers the child. Context and replies target a running child only, while a task can steer a running child or resume a finished one. For example, `subagent_message({ name: "api", message: "Implement the bounded API change and report files and checks.", intent: "task" })` assigns/replaces its brief; `subagent_message({ name: "api", message: "Use the existing response shape.", intent: "context" })` adds context, and `subagent_message({ name: "api", message: "Yes, that scope is approved.", intent: "reply" })` answers it. A saved brief is a record of the assignment, not proof that the child complied.
 
+A message to a running child is normally queued until its next turn boundary. To replace an assignment immediately, send `subagent_message({ name, message, intent: "task", interrupt: true })`. `interrupt` requires `intent: "task"` and a running child, and works only in `herdr-app`. The extension reads the child's reported status through `hc`:
+
+- If the child reports idle, the replacement is submitted without pressing any key.
+- If it is working, `hc interrupt` presses the stop key (`esc` for status-reporting programs). Submission requires `hc` to report the turn `stopped`, a fresh idle status, and an idle-only conditional send.
+- A done or error status is refused because `hc` cannot guard a send on those states. Use ordinary task messaging if no interruption is needed, or wait for normal completion and resume.
+- If it is blocked on a permission, question or auth dialog, nothing is typed. Resolve the dialog in its pane first.
+- If the stop outcome is `still_working`, `unknown` or `exited`, if `hc` errors, or if the program does not report status, the call fails without sending. A failed call leaves the saved brief unchanged and says whether the stop key was pressed.
+- If `hc send` fails after the stop and it is unclear whether the text arrived, the call says so. Inspect the pane before retrying.
+
+The status read and stop key are not atomic: if the child opens a dialog between them, the stop key may dismiss it. The extension never forces text into a blocked dialog and guards replacement submission with `--if idle`.
+
+The acknowledgement (`replaced`) confirms idle at submission, not that the model has read or completed the replacement. It is not a result. The run stays registered and keeps its capacity slot, and its result, mailbox and questions are delivered as usual. Stopping a turn does not undo its side effects or prove that every process it started has stopped. Pi returns queued, unconsumed messages to its editor on abort, so they may be submitted together with the replacement. Legacy Herdr has no interrupt command that reports its effect, so `interrupt: true` is rejected there. Omit it to queue the message.
+
+Claude Code children resume through their own Claude session rather than a Pi transcript. When a Claude turn completes, the Stop hook's transcript path is recorded, and at launch the extension saves the working directory, model, effort, profile prompt and whether the plugin was loaded. A resume relaunches `claude --resume <session-id>` with those saved settings and the same fixed `--permission-mode auto` and `ask_question` allowance. The profile's current settings are never substituted. Resume is refused, with a reason, when:
+
+- the prior run is not confirmed finished, including UNKNOWN or launching runs;
+- Herdr still reports the old process as live, or its absence cannot be confirmed, even if the registry says finished;
+- the child was launched before these settings were recorded, so earlier Claude children cannot be resumed;
+- no session was recorded, or its transcript, working directory, profile prompt or plugin is gone.
+
+Like a Pi resume, the resumed run is autonomous and delivers its result later.
+
 Completion notices and questions are recorded in a per-parent mailbox before delivery and acknowledged from the parent transcript. Pending notices replay after reload or idle retries without extra recap turns. Delivery is at-least-once, not exactly-once; stable delivery IDs suppress a replay when the parent transcript already contains the result. The extension persists versioned run metadata and reattaches observers to confirmed-live Herdr children after startup/reload. A run left in the middle of launch, an unreadable record, or an unavailable Herdr status remains UNKNOWN and cannot be resumed automatically; a single missing agent-list entry is not proof that a delayed launch has stopped. Existing registry records remain readable, but legacy running entries without metadata are not guessed back into watchers or resumed.
 
 Pi child transcripts have an exclusive ownership sidecar before launch/resume. It remains in place while the child may still be alive, including when the parent shuts down; stale ownership is reclaimed only after the recorded owner is safely recoverable and Herdr confirms the child is absent. Registry updates are serialized across processes. A stale registry lock or uncertain ownership fails closed and may require manual inspection. If result storage fails, delivery falls back to a non-recoverable direct send and logs a warning. A child that disappears without a completion signal is reported as having an unconfirmed outcome.
@@ -45,6 +67,8 @@ Children run with the tools allowed by their profile. `subagent_agents` controls
 
 Bundled profiles are `scout`, `worker`, `tasker`, `architect`, `writer`, `gh-scout`, `researcher`, `cc-worker`, and `cc-reviewer`. Project profiles in `.pi/agents/` override user profiles in `~/.pi/agent/agents/`, which override bundled profiles.
 
+`subagents_list()` shows each effective profile's source and CLI alongside its model and tool behavior. Use `subagents_list({ name: "gh-scout" })` for the winning file path, shadowed files, profile thinking/effort, session mode, and question tool. Intentional CLI/model edits are supported; the launcher does not rewrite them. When switching CLIs, align the prompt with the chosen CLI's actual tools and question bridge. Pi tool grants are not Claude Code permissions. Editing a bundled file does not change a user or project override. The filename without `.md` is the launch name; detailed listing flags a differing frontmatter `name` instead of treating it as another profile's override.
+
 | Profile | Default model | Purpose |
 | --- | --- | --- |
 | `scout` | `openai/gpt-6-luna` | Read-only local exploration and structural search |
@@ -52,12 +76,14 @@ Bundled profiles are `scout`, `worker`, `tasker`, `architect`, `writer`, `gh-sco
 | `tasker` | `openai/gpt-6-luna` | Tiny, well-specified edits, commands and lookups; low thinking, no children |
 | `architect` | `openai/gpt-6-luna` | Read-only design decisions and actionable plans; no shell or children |
 | `writer` | `openai/gpt-6-luna` | Scoped prose drafting/editing; no shell or children |
-| `gh-scout` | `openai/gpt-6-luna` | Read-only GitHub inspection with `gh` |
+| `gh-scout` | `openai/gpt-6-luna` | Local Git and remote GitHub inspection without a general shell |
 | `researcher` | `openai/gpt-6-luna` | Web research without local GitHub clones |
 | `cc-worker` | `claude-opus-5-5` | Claude Code implementation |
 | `cc-reviewer` | `claude-opus-5-5` | Read-only Claude Code review with triggering cases and refutation |
 
-Set `githubClone.enabled` to `false` in the active `pi-web-access` `web-search.json` to disable local repository clones. For GitHub repository inspection, researchers ask the parent to delegate to `gh-scout`. That profile has only [`gh_readonly`](../gh-readonly/README.md), a standalone, shell-free, allowlisted GitHub CLI extension; it cannot clone repositories or use general shell/local-file tools. Install `gh` and authenticate outside the agent before accessing private repositories.
+Set `githubClone.enabled` to `false` in the active `pi-web-access` `web-search.json` to disable local repository clones. Researchers ask the parent to delegate repository inspection to `gh-scout`. That profile has [`git_readonly`](../git-readonly/README.md) for local status, diffs, commits, and history, plus [`gh_readonly`](../gh-readonly/README.md) for GitHub. Both use shell-free, bounded operations; the profile cannot clone repositories or use general shell/file-editing tools. Local Git inspection needs Git 2.45+; install `gh` and authenticate outside the agent before accessing private GitHub repositories. Researcher returns cited findings; the parent handles saving local notes.
+
+If a user or project `gh-scout` overrides the bundled profile, it keeps its existing tools and instructions until explicitly edited. To enable local Git there, add `git_readonly` to its Pi `tools` field and adopt the local-inspection guidance from the bundled profile. Preserve intentional CLI/model choices; Claude Code profiles do not receive Pi tool grants.
 
 Use `tasker` for a small explicit job rather than a complex feature. `architect` returns a plan, not authorization to implement it. `writer` changes only authorized prose files and flags missing facts instead of inventing them. The new roles do not delegate; choose their use explicitly. Prompt adaptations and their upstream license are recorded in [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md).
 

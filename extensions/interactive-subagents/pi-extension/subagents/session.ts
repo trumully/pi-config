@@ -175,6 +175,25 @@ export interface NameRegistryEntry {
   taskBrief?: string;
   /** Versioned watcher reconstruction data; legacy records remain readable. */
   runMetadata?: RunMetadata;
+  /** Claude Code children only: what `subagent_message` needs to resume the Claude session. */
+  claude?: ClaudeResumeRecord;
+}
+
+export interface ClaudeResumeRecord {
+  /** Resolved settings from the first launch, replayed unchanged on every resume. */
+  launch: {
+    cwd: string;
+    model: string | null;
+    effort: string | null;
+    /** Profile body appended to Claude's system prompt, or null when the profile had none. */
+    systemPromptFile: string | null;
+    /** Whether the pi-auto-exit plugin (Stop hook, ask_question) was loaded. */
+    plugin: boolean;
+  };
+  /** Claude's own session ID, recorded from its Stop hook transcript when a run finishes. */
+  sessionId?: string;
+  /** Claude's transcript path for that session. */
+  transcriptPath?: string;
 }
 
 export type NameRegistry = Record<string, NameRegistryEntry>;
