@@ -10,7 +10,9 @@ import { promisify } from "node:util";
 import { existsSync, readFileSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { canonicalSessionPath } from "./lifecycle.ts";
-import { herdrCore, isHerdrCoreEnvironment } from "./herdr-core.ts";
+import { herdrCore, isHerdrCoreEnvironment, ReplaceTurnError, type ReplaceTurnResult } from "./herdr-core.ts";
+
+export { ReplaceTurnError, type ReplaceTurnResult } from "./herdr-core.ts";
 
 const execFileAsync = promisify(execFile);
 const MAX_BUFFER = 10 * 1024 * 1024;
@@ -327,6 +329,19 @@ export function promptAgent(
   requireHerdr();
   if (isHerdrCoreEnvironment()) return herdrCore.prompt(target, prompt);
   runHerdrSync(buildPromptAgentArgs(target, prompt, options.waitForWorking));
+}
+
+/**
+ * Stop the child's current turn if it is working, then submit `prompt`.
+ * herdr-app only: legacy Herdr has no interrupt command that reports its
+ * effect, and pressing keys blind could answer a dialog.
+ */
+export async function interruptAndPrompt(target: string, prompt: string): Promise<ReplaceTurnResult> {
+  requireHerdr();
+  if (!isHerdrCoreEnvironment()) {
+    throw new ReplaceTurnError("unsupported", "Legacy Herdr has no interrupt command that reports its effect; interrupt requires herdr-app (hc).", false);
+  }
+  return herdrCore.replaceTurn(target, prompt);
 }
 
 /** Run a normal shell command in a pane (used by surface-level tests). */

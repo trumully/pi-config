@@ -51,6 +51,9 @@ import {
   getRunningAgentSurface,
   closeSurface,
   readScreen,
+  interruptAndPrompt,
+  ReplaceTurnError,
+  type ReplaceTurnResult,
 } from "./herdr.ts";
 
 import {
@@ -1431,6 +1434,69 @@ function handleSubagentSteer(
   };
 }
 
+/**
+ * Interrupt a running child's current turn and submit a complete replacement
+ * assignment. Success means hc observed the turn stop (or the child was not
+ * working) and typed the replacement as a new turn. It does not mean the
+ * prior turn's side effects were undone or that every process it started has
+ * stopped. The child keeps running; capacity and completion are unchanged.
+ */
+async function handleSubagentReplace(
+  running: RunningSubagent,
+  envelope: string,
+  replace: (target: string, prompt: string) => Promise<ReplaceTurnResult> = interruptAndPrompt,
+) {
+  const now = Date.now();
+  observeRunningSubagent(running, now);
+  const flattened = envelope.replace(/\s*\n\s*/g, " ").trim();
+  let outcome: ReplaceTurnResult;
+  try {
+    outcome = await replace(running.herdrAgentName, flattened);
+  } catch (error: any) {
+    const code = error instanceof ReplaceTurnError ? error.code : "uncertain";
+    const stopKeyPressed = error instanceof ReplaceTurnError ? error.stopKeyPressed : false;
+    const sent = code === "send_uncertain"
+      ? "The replacement may or may not have arrived; inspect the child's pane before retrying."
+      : "The replacement was not sent; the saved brief is unchanged.";
+    const turn = stopKeyPressed && code !== "exited"
+      ? " The stop key was pressed, so the child's current turn may have ended."
+      : "";
+    const exited = code === "exited" ? " Its result, if any, arrives through normal delivery." : "";
+    const hint = code === "blocked"
+      ? " Resolve the dialog in the child's pane, then retry."
+      : code === "unsupported" || code === "not_live" || code === "exited" || code === "send_uncertain"
+        ? ""
+        : " Retry, or omit interrupt to queue the replacement for the next turn boundary.";
+    const err = `Could not interrupt-and-replace subagent "${running.name}": ${error?.message ?? String(error)}${exited} ${sent}${turn}${hint}`;
+    return {
+      content: [{ type: "text" as const, text: err }],
+      details: { error: err, code, stopKeyPressed, id: running.id, name: running.name },
+      isError: true,
+    };
+  }
+
+  running.statusState = forceStatusAfterInterrupt(running.statusState, now);
+  updateWidget();
+  const how = outcome.interrupt
+    ? `hc pressed ${outcome.interrupt.key || "the stop key"}, observed the turn stop (status now "${outcome.interrupt.statusAfter}"), then submitted the replacement as a new turn.`
+    : `The child was not working (status "${outcome.statusBefore}"), so no stop key was pressed; the replacement was submitted as a new turn.`;
+  return {
+    content: [{
+      type: "text" as const,
+      text:
+        `Replacement assignment submitted to running subagent "${running.name}". ${how} ` +
+        `Stopping a turn does not undo its side effects or prove that every process it started has stopped. ` +
+        `If it exits, its result still arrives as a steer message.`,
+    }],
+    details: {
+      id: running.id, name: running.name, status: "replaced",
+      interrupted: !!outcome.interrupt, statusBefore: outcome.statusBefore,
+      ...(outcome.interrupt ? { interruptOutcome: outcome.interrupt.outcome, interruptKey: outcome.interrupt.key } : {}),
+      statusAtSend: outcome.statusAtSend,
+    },
+  };
+}
+
 function startStatusRefresh(pi: ExtensionAPI) {
   if (!statusConfig.enabled || statusInterval) return;
 
@@ -1497,6 +1563,16 @@ function finishedIntentError(intent?: string): string | null {
   return intent === "context" || intent === "reply"
     ? `Intent "${intent}" only applies to a running subagent; finished agents are not resumed for context or reply.`
     : null;
+}
+
+function interruptOptionError(params: { intent?: string; interrupt?: boolean }, running: boolean): string | null {
+  if (!params.interrupt) return null;
+  if (params.intent !== "task") {
+    return 'interrupt: true requires intent: "task"; only a complete replacement assignment may interrupt the current turn.';
+  }
+  return running
+    ? null
+    : "interrupt: true applies only to a running subagent. This one is not running; omit interrupt to resume it with the replacement assignment.";
 }
 
 function persistDeliveredTaskBrief(
@@ -1580,6 +1656,8 @@ export const __test__ = {
   reservedNames,
   steerSubagent,
   handleSubagentSteer,
+  handleSubagentReplace,
+  interruptOptionError,
   deliverPendingQuestion,
   resolveResultPresentation,
   sendSubagentResult,
@@ -2927,19 +3005,26 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         "so the SAME name works whether the subagent is running or finished: if it is still running, your message steers its live session; " +
         "if it has finished, a legacy message or `intent: task` resumes that session, while `context` and `reply` are running-child-only. " +
         "Optional intent: `task` replaces the complete assignment and saved current brief; `context` adds non-replacing information; `reply` answers a question without identity validation. Omitted intent retains legacy behavior. " +
+        "A running child normally picks up a message at its next turn boundary. With `intent: task`, `interrupt: true` (herdr-app only) first stops its current turn and fails without sending if that stop cannot be confirmed. " +
         "`name` and `message` are both required. " +
-        "Steering a running subagent returns immediately with a local acknowledgement and does NOT, by itself, emit a new result. " +
+        "Messaging a running subagent returns a local acknowledgement, not a new result; interrupt-and-replace waits for backend confirmation before acknowledging. " +
         "Resuming is a fire-and-forget async call: when the resumed sub-agent finishes, the harness AUTOMATICALLY delivers its result as a steer message that wakes you up. " +
         "DO NOT poll, sleep, tail logs, or read session files to detect completion - the harness handles delivery. " +
         "DO NOT fabricate or assume results. After calling, either end your turn or work on other independent tasks.",
       promptSnippet:
         "Message a subagent by name. Optional intent `task` replaces the full assignment, `context` adds information to a running child, and `reply` answers a running child; omitted intent retains legacy auto-steer/resume behavior. " +
-        "`name` and `message` are required. Steering returns immediately; resuming delivers its result later as a steer message. " +
+        "Add `interrupt: true` to a running child's `task` only when its current turn must stop first. " +
+        "`name` and `message` are required. Steering returns a local acknowledgement; interruption first waits for confirmation; resuming delivers its result later as a steer message. " +
         "Report completed results to the user instead of acknowledging them through this tool. Do not poll or fabricate results.",
       parameters: Type.Object({
         name: Type.String({ description: "Exact display name of the subagent." }),
         message: Type.String({ description: "Message payload. With intent=task, this is the complete replacement assignment." }),
         intent: Type.Optional(Type.Union([Type.Literal("task"), Type.Literal("context"), Type.Literal("reply")])),
+        interrupt: Type.Optional(Type.Boolean({
+          description:
+            'Only with intent "task" for a running child on herdr-app: stop its current turn, then submit the replacement as a new turn. ' +
+            "Fails without sending if the stop cannot be confirmed, the child is blocked on a dialog, or the backend cannot report status. Default false queues the message.",
+        })),
       }),
 
       renderCall(args, theme) {
@@ -2960,6 +3045,17 @@ export default function subagentsExtension(pi: ExtensionAPI) {
               " " +
               theme.fg("toolTitle", theme.bold(details.name ?? "subagent")) +
               theme.fg("dim", " - message delivered"),
+            0,
+            0,
+          );
+        }
+
+        if (details?.status === "replaced") {
+          return new Text(
+            theme.fg("success", "✓") +
+              " " +
+              theme.fg("toolTitle", theme.bold(details.name ?? "subagent")) +
+              theme.fg("dim", details.interrupted ? " - turn interrupted, replacement submitted" : " - replacement submitted (was not working)"),
             0,
             0,
           );
@@ -3000,9 +3096,19 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         const runningMatch = Array.from(runningSubagents.values()).find((r) =>
           r.name === requestedName && (!r.parentSessionId || r.parentSessionId === currentParentSessionIdValue),
         );
+        const interruptError = interruptOptionError(params, !!runningMatch);
+        if (interruptError) {
+          return { content: [{ type: "text" as const, text: interruptError }], details: { error: interruptError }, isError: true };
+        }
         if (runningMatch) {
           const intent = params.intent;
           const envelope = intent ? formatSubagentMessage(intent, requestedName, message) : message;
+          if (params.interrupt) {
+            const result = await handleSubagentReplace(runningMatch, envelope);
+            if ((result.details as any)?.status !== "replaced") return result;
+            const artifact = getArtifactDir(ctx.sessionManager.getSessionDir(), ctx.sessionManager.getSessionId());
+            return persistDeliveredTaskBrief(runningMatch, artifact, message, result, true);
+          }
           const result = handleSubagentSteer({ name: requestedName, message: envelope });
           if (intent === "task" && (result.details as any)?.status === "steered") {
             const artifact = getArtifactDir(ctx.sessionManager.getSessionDir(), ctx.sessionManager.getSessionId());

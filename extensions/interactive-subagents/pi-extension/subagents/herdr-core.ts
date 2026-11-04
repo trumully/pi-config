@@ -41,7 +41,42 @@ interface CoreTerminal {
   name?: string | null;
   state: "live" | "finished";
   labels?: Record<string, string>;
+  /** Whether the program ever sent an OSC 7501 status report. */
+  reported?: boolean;
+  status?: { state?: string; kind?: string | null; msg?: string } | null;
 }
+
+/** Why an interrupt-and-replace did not submit the replacement, or cannot tell whether it did. */
+export type ReplaceTurnFailure =
+  | "unsupported" | "not_live" | "blocked" | "exited" | "uncertain" | "send_refused" | "send_uncertain";
+
+/**
+ * `stopKeyPressed` is true when the stop key may have reached the child, so
+ * its current turn may have ended even though nothing new was sent.
+ */
+export class ReplaceTurnError extends Error {
+  code: ReplaceTurnFailure;
+  stopKeyPressed: boolean;
+  constructor(code: ReplaceTurnFailure, message: string, stopKeyPressed: boolean) {
+    super(message);
+    this.code = code;
+    this.stopKeyPressed = stopKeyPressed;
+  }
+}
+
+export interface ReplaceTurnResult {
+  /** Status word hc reported before anything was pressed. */
+  statusBefore: string;
+  /** Present only when the child was working and the stop key was pressed. */
+  interrupt?: { key: string; outcome: string; statusAfter: string };
+  /** Status word when the text went in, per hc send. */
+  statusAtSend: string | null;
+}
+
+/** hc send errors raised before any text is typed. */
+const SEND_REFUSED = new Set(["not_found", "finished", "blocked", "status_mismatch", "invalid_params"]);
+/** hc interrupt errors raised before the stop key is pressed. */
+const INTERRUPT_REFUSED = new Set(["not_found", "finished", "invalid_params"]);
 
 export interface CoreCommands {
   sync(args: string[]): string;
@@ -137,6 +172,79 @@ export class HerdrCoreBackend {
   prompt(target: string, prompt: string): void {
     try { json(this.cli.sync(["send", "--json", target, prompt])); }
     catch (error) { throw coreError(error); }
+  }
+
+  /**
+   * Stop a working child's current turn, then submit `prompt` as a new turn.
+   * Only hc's observed status is trusted: the replacement is typed only when
+   * hc reports the stop key's outcome as `stopped` and the child as idle,
+   * or when the child was idle in the first place. Blocked,
+   * unreported, exited, or ambiguous states throw before anything is typed.
+   * Stopping a turn does not prove that processes the child started have
+   * stopped, and nothing the prior turn did is rolled back.
+   */
+  async replaceTurn(target: string, prompt: string, timeoutSeconds = 10): Promise<ReplaceTurnResult> {
+    let stopKeyPressed = false;
+    const fail = (code: ReplaceTurnFailure, message: string): never => {
+      throw new ReplaceTurnError(code, message, stopKeyPressed);
+    };
+    const observe = async (): Promise<CoreTerminal & { status: { state: string } }> => {
+      let terminal: CoreTerminal | null;
+      try { terminal = await this.get(target); }
+      catch (error: any) { return fail("uncertain", `Could not read hc status for ${target}: ${error?.message ?? String(error)}`); }
+      if (!terminal || terminal.state !== "live") return fail("not_live", `hc terminal ${target} is no longer live.`);
+      if (terminal.labels?.["pi.subagent"] !== target) return fail("uncertain", `Cannot confirm hc run identity ${target}.`);
+      const state = terminal.status?.state;
+      if (!terminal.reported || typeof state !== "string") {
+        return fail("unsupported", `hc terminal ${target} does not report its status, so an interrupt's effect cannot be confirmed.`);
+      }
+      if (state === "blocked") {
+        const kind = terminal.status?.kind ? ` (${terminal.status.kind})` : "";
+        return fail("blocked", `The child is blocked on a dialog${kind}; a person must resolve it in its pane. Nothing was typed into the dialog.`);
+      }
+      return terminal as CoreTerminal & { status: { state: string } };
+    };
+
+    const before = await observe();
+    let current = before;
+    let interrupt: ReplaceTurnResult["interrupt"];
+    if (before.status.state === "working") {
+      let reply: { key?: string; outcome?: string };
+      try {
+        stopKeyPressed = true;
+        reply = json(await this.cli.async(["interrupt", before.address, "--json", "--timeout", String(timeoutSeconds)]));
+      } catch (error) {
+        const parsed = coreError(error);
+        if (parsed.kind && INTERRUPT_REFUSED.has(parsed.kind)) stopKeyPressed = false;
+        return fail("uncertain", `hc interrupt failed (${parsed.message}).`);
+      }
+      if (reply.outcome === "exited") return fail("exited", "The child exited after the stop key.");
+      if (reply.outcome !== "stopped") {
+        return fail("uncertain", `hc reported interrupt outcome "${reply.outcome ?? "missing"}", not a confirmed stop.`);
+      }
+      current = await observe();
+      interrupt = { key: String(reply.key ?? ""), outcome: reply.outcome, statusAfter: current.status.state };
+    }
+    if (current.status.state !== "idle") {
+      return fail("uncertain", `hc reports status "${current.status.state}"; replacement requires idle so submission can be guarded with --if idle. Nothing new was sent.`);
+    }
+
+    // hc cannot conditionally send for done/error. Always guard the actual send
+    // instead of relying on a status read made before its typing delay.
+    const args = ["send", "--json", "--if", "idle", current.address, prompt];
+    let sent: { status?: string | null };
+    try {
+      sent = json(await this.cli.async(args));
+    } catch (error) {
+      const parsed = coreError(error);
+      return parsed.kind && SEND_REFUSED.has(parsed.kind)
+        ? fail("send_refused", `hc refused to type the replacement (${parsed.kind}): ${parsed.message}`)
+        : fail("send_uncertain", `hc send failed (${parsed.message}); the replacement may or may not have arrived.`);
+    }
+    if (sent.status !== "idle") {
+      return fail("send_uncertain", `hc did not confirm idle at submission (reported "${sent.status ?? "missing"}"); the replacement may or may not have arrived.`);
+    }
+    return { statusBefore: before.status.state, ...(interrupt ? { interrupt } : {}), statusAtSend: sent.status };
   }
 
   read(surface: string, lines: number): string {
