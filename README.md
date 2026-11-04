@@ -50,3 +50,5 @@ Restart Pi after updating. `settings.example.json` is a reference, not a setting
 ## Workflow
 
 Use [interactive subagents](extensions/interactive-subagents/README.md) to delegate focused tasks and [prompt snippets](extensions/prompt-snippets/README.md) to add reusable instructions to your messages. Open the snippets menu with `Alt+S` or `/snippets`.
+
+Profile files choose the CLI and model intentionally. Use `subagents_list({ name: "gh-scout" })` to inspect the winning definition and shadowed files before changing a bundled profile. User and project overrides remain in control.

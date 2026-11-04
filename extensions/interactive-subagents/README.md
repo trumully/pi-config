@@ -45,6 +45,8 @@ Children run with the tools allowed by their profile. `subagent_agents` controls
 
 Bundled profiles are `scout`, `worker`, `tasker`, `architect`, `writer`, `gh-scout`, `researcher`, `cc-worker`, and `cc-reviewer`. Project profiles in `.pi/agents/` override user profiles in `~/.pi/agent/agents/`, which override bundled profiles.
 
+`subagents_list()` shows each effective profile's source and CLI alongside its model and tool behavior. Use `subagents_list({ name: "gh-scout" })` for the winning file path, shadowed files, profile thinking/effort, session mode, and question tool. Intentional CLI/model edits are supported; the launcher does not rewrite them. When switching CLIs, align the prompt with the chosen CLI's actual tools and question bridge. Pi tool grants are not Claude Code permissions. Editing a bundled file does not change a user or project override. The filename without `.md` is the launch name; detailed listing flags a differing frontmatter `name` instead of treating it as another profile's override.
+
 | Profile | Default model | Purpose |
 | --- | --- | --- |
 | `scout` | `openai/gpt-6-luna` | Read-only local exploration and structural search |

@@ -195,6 +195,9 @@ interface AgentDefinition extends AgentDefaults {
 
 interface ListedAgentDefinition extends AgentDefinition {
   source: AgentSource;
+  definitionPath: string;
+  declaredName: string;
+  shadowedPaths: string[];
 }
 
 /**
@@ -357,6 +360,21 @@ function describeAgentTools(agent: Pick<AgentDefaults, "tools" | "subagentAgents
     : "spawning and child-control tools only (restricted)";
 }
 
+function describeAgentDetails(agent: ListedAgentDefinition): string {
+  const claude = agent.cli === "claude";
+  const tuning = claude ? `Effort: ${agent.effort ?? "not set"}` : `Thinking: ${agent.thinking ?? "not set"}`;
+  return [
+    `File: ${agent.definitionPath}`,
+    ...(agent.declaredName !== agent.name ? [`Declared name: ${agent.declaredName}; launch name: ${agent.name} (filename)`] : []),
+    `Shadowed files: ${agent.shadowedPaths.join(", ") || "none"}`,
+    `${tuning}; session mode: ${claude ? "Claude Code session" : agent.sessionMode ?? "standalone"}`,
+    `Question tool: ${claude ? "mcp__plugin_pi-auto-exit_pi__ask_question (requires plugin/uv)" : "ask_question"}`,
+    claude
+      ? "Permissions: Claude Code auto mode and effective Claude settings; Pi tools/subagent_agents do not apply."
+      : "Permissions: Pi tool grants apply; prose restrictions are instructions, not filesystem isolation.",
+  ].join("\n");
+}
+
 function parseSessionMode(value: string | undefined): SubagentSessionMode | undefined {
   if (value === "standalone" || value === "lineage-only" || value === "fork") {
     return value;
@@ -409,12 +427,19 @@ function discoverAgentDefinitions(): ListedAgentDefinition[] {
   for (const { path: dir, source } of dirs) {
     if (!existsSync(dir)) continue;
     for (const file of readdirSync(dir).filter((entry) => entry.endsWith(".md"))) {
-      const parsed = parseAgentDefinition(
-        readFileSync(join(dir, file), "utf8"),
-        file.replace(/\.md$/, ""),
-      );
+      // Launch lookup uses the filename, not the optional frontmatter label.
+      const name = file.replace(/\.md$/, "");
+      const parsed = parseAgentDefinition(readFileSync(join(dir, file), "utf8"), name);
       if (!parsed) continue;
-      agents.set(parsed.name, { ...parsed, source });
+      const previous = agents.get(name);
+      agents.set(name, {
+        ...parsed,
+        name,
+        declaredName: parsed.name,
+        source,
+        definitionPath: resolve(dir, file),
+        shadowedPaths: previous ? [...previous.shadowedPaths, previous.definitionPath] : [],
+      });
     }
   }
 
@@ -2835,36 +2860,37 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       name: "subagents_list",
       label: "List Subagents",
       description:
-        "List all available subagent definitions. " +
-        "Scans project-local .pi/agents/ and global ~/.pi/agent/agents/. " +
-        "Project-local agents override global ones with the same name.",
+        "List effective subagent profiles with their source, CLI, model and tool behavior. " +
+        "Project profiles override user profiles, which override bundled profiles. " +
+        "Pass name for the winning file path, shadowed definitions, profile defaults and question tool. CLI/model changes in profile files are intentional configuration, not errors.",
       promptSnippet:
-        "List all available subagent definitions. " +
-        "Scans project-local .pi/agents/ and global ~/.pi/agent/agents/. " +
-        "Project-local agents override global ones with the same name.",
-      parameters: Type.Object({}),
+        "List effective subagent profiles; pass name to inspect the winning file, overrides and runtime defaults before assigning work.",
+      parameters: Type.Object({
+        name: Type.Optional(Type.String({ minLength: 1, description: "Exact profile name for detailed effective configuration; omit for a compact list." })),
+      }),
 
-      async execute() {
-        const list = discoverAgentDefinitions().filter((agent) => !agent.disableModelInvocation);
+      async execute(_toolCallId, params) {
+        const list = discoverAgentDefinitions().filter((agent) => !agent.disableModelInvocation && (!params.name || agent.name === params.name));
 
         if (list.length === 0) {
           return {
-            content: [{ type: "text", text: "No subagent definitions found." }],
-            details: { agents: [] },
+            content: [{ type: "text", text: params.name ? `No available subagent profile named ${params.name}.` : "No subagent definitions found." }],
+            details: { agents: [], detailed: Boolean(params.name) },
           };
         }
 
         const lines = list.map((a) => {
-          const badge = a.source === "project" ? " (project)" : "";
+          const source = ` [${a.source}; cli: ${a.cli === "claude" ? "claude" : "pi"}]`;
           const desc = a.description ? ` - ${a.description}` : "";
           const model = a.model ? ` [${a.model}]` : "";
           const tools = ` [tools: ${describeAgentTools(a)}]`;
-          return `• ${a.name}${badge}${model}${tools}${desc}`;
+          const detail = params.name ? `\n${describeAgentDetails(a)}` : "";
+          return `• ${a.name}${source}${model}${tools}${desc}${detail}`;
         });
 
         return {
           content: [{ type: "text", text: lines.join("\n") }],
-          details: { agents: list },
+          details: { agents: list, detailed: Boolean(params.name) },
         };
       },
 
@@ -2875,11 +2901,12 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           return new Text(theme.fg("dim", "No subagent definitions found."), 0, 0);
         }
         const lines = agents.map((a: any) => {
-          const badge = a.source === "project" ? theme.fg("accent", " (project)") : "";
+          const source = theme.fg("accent", ` [${a.source}; cli: ${a.cli === "claude" ? "claude" : "pi"}]`);
           const desc = a.description ? theme.fg("dim", ` - ${a.description}`) : "";
           const model = a.model ? theme.fg("dim", ` [${a.model}]`) : "";
           const tools = theme.fg("dim", ` [tools: ${describeAgentTools(a)}]`);
-          return `  ${theme.fg("toolTitle", theme.bold(a.name))}${badge}${model}${tools}${desc}`;
+          const detail = details.detailed ? `\n${theme.fg("dim", describeAgentDetails(a))}` : "";
+          return `  ${theme.fg("toolTitle", theme.bold(a.name))}${source}${model}${tools}${desc}${detail}`;
         });
         return new Text(lines.join("\n"), 0, 0);
       },
