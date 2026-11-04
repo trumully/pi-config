@@ -305,6 +305,10 @@ function getToolExtensionPath(tool: string): string | undefined {
       getBundledSiblingPath("gh-readonly/index.ts"),
       join(extBase, "gh-readonly", "index.ts"),
     ),
+    git_readonly: resolveBundledOrGlobalPath(
+      getBundledSiblingPath("git-readonly/index.ts"),
+      join(extBase, "git-readonly", "index.ts"),
+    ),
   };
   // Prefer the built-in path, but fall back to a runtime-registered extension
   // when that path no longer exists on disk (e.g. a built-in tool extension

@@ -54,12 +54,14 @@ Bundled profiles are `scout`, `worker`, `tasker`, `architect`, `writer`, `gh-sco
 | `tasker` | `openai/gpt-6-luna` | Tiny, well-specified edits, commands and lookups; low thinking, no children |
 | `architect` | `openai/gpt-6-luna` | Read-only design decisions and actionable plans; no shell or children |
 | `writer` | `openai/gpt-6-luna` | Scoped prose drafting/editing; no shell or children |
-| `gh-scout` | `openai/gpt-6-luna` | Read-only GitHub inspection with `gh` |
+| `gh-scout` | `openai/gpt-6-luna` | Local Git and remote GitHub inspection without a general shell |
 | `researcher` | `openai/gpt-6-luna` | Web research without local GitHub clones |
 | `cc-worker` | `claude-opus-5-5` | Claude Code implementation |
 | `cc-reviewer` | `claude-opus-5-5` | Read-only Claude Code review with triggering cases and refutation |
 
-Set `githubClone.enabled` to `false` in the active `pi-web-access` `web-search.json` to disable local repository clones. For GitHub repository inspection, researchers ask the parent to delegate to `gh-scout`. That profile has only [`gh_readonly`](../gh-readonly/README.md), a standalone, shell-free, allowlisted GitHub CLI extension; it cannot clone repositories or use general shell/local-file tools. Install `gh` and authenticate outside the agent before accessing private repositories.
+Set `githubClone.enabled` to `false` in the active `pi-web-access` `web-search.json` to disable local repository clones. Researchers ask the parent to delegate repository inspection to `gh-scout`. That profile has [`git_readonly`](../git-readonly/README.md) for local status, diffs, commits, and history, plus [`gh_readonly`](../gh-readonly/README.md) for GitHub. Both use shell-free, bounded operations; the profile cannot clone repositories or use general shell/file-editing tools. Local Git inspection needs Git 2.45+; install `gh` and authenticate outside the agent before accessing private GitHub repositories. Researcher returns cited findings; the parent handles saving local notes.
+
+If a user or project `gh-scout` overrides the bundled profile, it keeps its existing tools and instructions until explicitly edited. To enable local Git there, add `git_readonly` to its Pi `tools` field and adopt the local-inspection guidance from the bundled profile. Preserve intentional CLI/model choices; Claude Code profiles do not receive Pi tool grants.
 
 Use `tasker` for a small explicit job rather than a complex feature. `architect` returns a plan, not authorization to implement it. `writer` changes only authorized prose files and flags missing facts instead of inventing them. The new roles do not delegate; choose their use explicitly. Prompt adaptations and their upstream license are recorded in [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md).
 

@@ -24,6 +24,7 @@ Some bundled agent profiles need extra tools; see their definitions for details.
 | --- | --- |
 | [`ast-grep`](extensions/ast-grep/README.md) | Structural code search. |
 | [`gh-readonly`](extensions/gh-readonly/README.md) | Read-only GitHub CLI inspection without a shell or local clone. |
+| [`git-readonly`](extensions/git-readonly/README.md) | Local Git status, diffs, commits, and history without shell access. |
 | [`prompt-snippets`](extensions/prompt-snippets/README.md) | Add reusable instructions to a message. |
 | [`interactive-subagents`](extensions/interactive-subagents/README.md) | Delegate work to agents in Herdr panes. |
 | [`usage-footer`](extensions/usage-footer/index.ts) | Display session usage. |
