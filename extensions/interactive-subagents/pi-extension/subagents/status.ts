@@ -20,8 +20,12 @@ export type StatusActivityPhase = "starting" | "active" | "waiting" | "done";
 export interface StatusConfig {
   enabled: boolean;
   mode: "compact" | "minimal" | "full";
+  icons: StatusIconSet;
   lineLimit: number;
 }
+
+/** unicode: portable symbols; nerd: Nerd Font private-use glyphs; ascii: plain ASCII. */
+export type StatusIconSet = "unicode" | "nerd" | "ascii";
 
 export type StatusObservation =
   | {
@@ -141,16 +145,21 @@ function activityLabel(snapshot: Pick<StatusSnapshot, "activityLabel" | "activeS
 export function parseStatusConfig(rawConfig: unknown, source = "config.json"): StatusConfig {
   const config = requireObject(rawConfig, source, "root");
   const status = requireObject(config.status, source, "status");
-  rejectUnsupportedKeys(status, ["enabled", "mode"], source, "status");
+  rejectUnsupportedKeys(status, ["enabled", "mode", "icons"], source, "status");
   const enabled = requireBoolean(status.enabled, source, "status.enabled");
   const mode = status.mode === undefined ? "compact" : status.mode;
   if (mode !== "compact" && mode !== "minimal" && mode !== "full") {
     invalidStatusConfig(source, 'status.mode must be "compact", "minimal", or "full"');
   }
+  const icons = status.icons === undefined ? "unicode" : status.icons;
+  if (icons !== "unicode" && icons !== "nerd" && icons !== "ascii") {
+    invalidStatusConfig(source, 'status.icons must be "unicode", "nerd", or "ascii"');
+  }
 
   return {
     enabled,
     mode,
+    icons,
     lineLimit: DEFAULT_STATUS_LINE_LIMIT,
   };
 }

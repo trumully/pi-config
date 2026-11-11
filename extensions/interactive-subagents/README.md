@@ -113,7 +113,7 @@ Copy `config.json.example` to `config.json` in this extension directory. It is g
 
 ```json
 {
-  "status": { "enabled": true, "mode": "compact" },
+  "status": { "enabled": true, "mode": "compact", "icons": "unicode" },
   "limits": { "maxConcurrent": 4 },
   "proactiveCompaction": { "enabled": true, "thresholdPercent": 70 }
 }
@@ -121,7 +121,19 @@ Copy `config.json.example` to `config.json` in this extension directory. It is g
 
 `limits.maxConcurrent` defaults to 4 and must be a positive integer. It caps one root parent's delegation tree, including startup, resumed children and nested launches. At capacity, launches fail clearly rather than queue; steering an existing child does not consume another slot. Unknown starts keep their slots until exit is confirmed, so a stale guard or unresolved run can require inspection. Existing children from before this change should be restarted to inherit the shared tree budget.
 
-Status controls the agent-state display. `mode` defaults to `compact`: one borderless row per agent with name, role, elapsed time, and a short status. It has no heading or progress counters. Use `minimal` for a single summary line, or `full` for the original bordered widget with progress details. Existing explicit mode settings are preserved; change them to `compact` to use the new layout. `enabled` still controls status detail/notifications. Proactive compaction applies to Pi children, not the parent or Claude CLI agents. If compaction fails or is interrupted, the child stays open; send a follow-up to continue from its checkpoint.
+Status controls the agent-state display. `mode` defaults to `compact`: one borderless row per agent. Each row shows a colored profile badge, a status glyph, the agent name, its lifecycle state and current activity on the left. Elapsed time, input/output tokens and cost sit on the right. It has no heading or progress counters. Use `minimal` for a single summary line, or `full` for the original bordered widget with progress details. Existing explicit mode settings are preserved; change them to `compact` to use the new layout. `enabled` still controls status detail/notifications. Colors come from the current Pi theme.
+
+On narrow terminals activity drops first, then cost, tokens and elapsed time. The lifecycle state and at least six columns of the name stay. The full profile badge stays while that much of the name fits beside it; past that the name keeps its full length and the badge is shortened, then dropped, followed by the status glyph. On terminals too narrow for the state and a short name, the name shrinks or drops and the state is cut last, so not every field can be shown at every width. A stall or snapshot-problem label counts as activity; the state word stays. Agent names, profiles and activity text are stripped of terminal control sequences before display.
+
+Compact usage never includes the agent's own children; the footer still shows the tree total. Pi rows read the child transcript and cover the current run only: a resumed agent counts from the resume, matching the elapsed time, and entries inherited from a forked parent are left out. Tool results, compactions and branch summaries that record no usage count as no spend; an assistant turn without usage, or usage without a cost, marks the cost incomplete.
+
+Claude Code rows show what the per-launch usage sidecar reports. Its cost is Claude Code's estimate, which after a resume may include spend from earlier runs of the same Claude session; the row does not subtract it. While Claude Code runs, the sidecar has a cost estimate but normally no cumulative token totals, so the row shows `~$…` without tokens. Final token counts arrive when the agent finishes and feed the footer and the result; the row usually disappears at that point, so do not rely on seeing them there.
+
+A row with no usage yet shows no metrics. An unknown cost is omitted, never shown as `$0`; `~` marks an estimate and `+?` marks a cost that leaves out some usage. Usage is re-read on the widget timer, at most every five seconds per agent and only when the file has changed.
+
+`icons` chooses the status glyphs: `unicode` (default, ⟳ and ○), `nerd` for Nerd Font glyphs, including a circle that advances as the widget refreshes, or `ascii` for plain ASCII glyphs, token labels and separators. Choose `nerd` only if the terminal font includes Nerd Font symbols; Pi cannot detect this. The badge layout and Nerd Font glyph choices follow [pi-subagent-manager](https://github.com/championswimmer/pi-subagent-manager) (MIT; see `THIRD-PARTY-NOTICES.md`).
+
+Proactive compaction applies to Pi children, not the parent or Claude CLI agents. If compaction fails or is interrupted, the child stays open; send a follow-up to continue from its checkpoint.
 
 ## Tests
 

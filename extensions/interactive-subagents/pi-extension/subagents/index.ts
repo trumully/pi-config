@@ -38,7 +38,15 @@ import {
   reconcileClaudeCostEstimates,
   writeClaudeUsageSidecar,
 } from "./claude-usage.ts";
-import { captureSubagentUsage } from "./usage.ts";
+import { captureSubagentUsage, readRunUsage, type RunUsageSnapshot } from "./usage.ts";
+import {
+  plainWidgetTheme,
+  renderCompactWidgetRows,
+  sanitizeDisplayText,
+  widgetStatusIcon,
+  type WidgetRow,
+  type WidgetTheme,
+} from "./widget.ts";
 import {
   isHerdrAvailable,
   herdrSetupHint,
@@ -594,24 +602,9 @@ function formatUsageSegments(stats: SessionStats): string[] {
   return segs;
 }
 
-/** ANSI colors for widget status icons (raw, since the widget bypasses theme). */
-const ICON_YELLOW = "\x1b[38;2;214;181;94m";
-const ICON_RED = "\x1b[38;2;224;108;117m";
-const ICON_DIM = "\x1b[38;2;128;128;128m";
-
-/** Map a live status kind to a colored single-char icon for the widget. */
-function widgetIcon(kind: StatusSnapshot["kind"]): string {
-  switch (kind) {
-    case "active":
-    case "running":
-      return `${ICON_YELLOW}⟳${RST}`;
-    case "stalled":
-      return `${ICON_RED}⟳${RST}`;
-    case "waiting":
-    case "starting":
-    default:
-      return `${ICON_DIM}○${RST}`;
-  }
+/** Map a live status kind to a themed icon from the configured icon set. */
+function widgetIcon(kind: StatusSnapshot["kind"], theme: WidgetTheme = plainWidgetTheme): string {
+  return widgetStatusIcon(kind, theme, statusConfig.icons, Date.now());
 }
 
 function herdrUnavailableResult() {
@@ -849,6 +842,9 @@ interface RunningSubagent {
   askFile?: string;
   pendingFile?: string;
   usageFile?: string;
+  /** This run's usage, refreshed on the widget timer and read by render. */
+  usage?: RunUsageSnapshot;
+  usageCheckedAt?: number;
   statusState: SubagentStatusState;
   /**
    * When true, status transitions (stalled/recovered) do not wake the parent
@@ -895,16 +891,16 @@ function formatElapsedMMSS(startTime: number): string {
   return `${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")}`;
 }
 
-const ACCENT = "\x1b[38;2;77;163;255m";
-const RST = "\x1b[0m";
+const BORDER_COLOR = "borderAccent";
 
 /**
  * Build a bordered content line: │left          right│
  * Left content is truncated if needed, right is preserved, padded to fill width.
  */
-function borderLine(left: string, right: string, width: number): string {
+function borderLine(left: string, right: string, width: number, theme: WidgetTheme = plainWidgetTheme): string {
+  const edge = theme.fg(BORDER_COLOR, "│");
   if (width <= 0) return "";
-  if (width === 1) return `${ACCENT}│${RST}`;
+  if (width === 1) return edge;
 
   // width = total visible chars for the whole line including │ and │
   const contentWidth = Math.max(0, width - 2); // space inside the two │ chars
@@ -915,23 +911,23 @@ function borderLine(left: string, right: string, width: number): string {
   if (rightVis >= contentWidth) {
     const truncRight = truncateToWidth(right, contentWidth);
     const rightPad = Math.max(0, contentWidth - visibleWidth(truncRight));
-    return `${ACCENT}│${RST}${truncRight}${" ".repeat(rightPad)}${ACCENT}│${RST}`;
+    return `${edge}${truncRight}${" ".repeat(rightPad)}${edge}`;
   }
 
   const maxLeft = Math.max(0, contentWidth - rightVis);
   const truncLeft = truncateToWidth(left, maxLeft);
   const leftVis = visibleWidth(truncLeft);
   const pad = Math.max(0, contentWidth - leftVis - rightVis);
-  return `${ACCENT}│${RST}${truncLeft}${" ".repeat(pad)}${right}${ACCENT}│${RST}`;
+  return `${edge}${truncLeft}${" ".repeat(pad)}${right}${edge}`;
 }
 
 /**
  * Build the bordered top line: ╭─ Title ──── info ─╮
  * All chars are accounted for within `width`.
  */
-function borderTop(title: string, info: string, width: number): string {
+function borderTop(title: string, info: string, width: number, theme: WidgetTheme = plainWidgetTheme): string {
   if (width <= 0) return "";
-  if (width === 1) return `${ACCENT}╭${RST}`;
+  if (width === 1) return theme.fg(BORDER_COLOR, "╭");
 
   // ╭─ Title ───...─── info ─╮
   // overhead: ╭─ (2) + space around title (2) + space around info (2) + ─╮ (2) = but we simplify
@@ -941,18 +937,18 @@ function borderTop(title: string, info: string, width: number): string {
   const fillLen = Math.max(0, inner - titlePart.length - infoPart.length);
   const fill = "─".repeat(fillLen);
   const content = `${titlePart}${fill}${infoPart}`.slice(0, inner).padEnd(inner, "─");
-  return `${ACCENT}╭${content}╮${RST}`;
+  return theme.fg(BORDER_COLOR, `╭${content}╮`);
 }
 
 /**
  * Build the bordered bottom line: ╰──────────────────╯
  */
-function borderBottom(width: number): string {
+function borderBottom(width: number, theme: WidgetTheme = plainWidgetTheme): string {
   if (width <= 0) return "";
-  if (width === 1) return `${ACCENT}╰${RST}`;
+  if (width === 1) return theme.fg(BORDER_COLOR, "╰");
 
   const inner = Math.max(0, width - 2);
-  return `${ACCENT}╰${"─".repeat(inner)}╯${RST}`;
+  return theme.fg(BORDER_COLOR, `╰${"─".repeat(inner)}╯`);
 }
 
 function renderMinimalSubagentWidgetLine(agents: RunningSubagent[], width: number): string[] {
@@ -971,56 +967,68 @@ function renderMinimalSubagentWidgetLine(agents: RunningSubagent[], width: numbe
   return [truncateToWidth(`↳ ${agents.length} subagents · ${summary}`, width)];
 }
 
-function renderCompactSubagentWidgetLines(agents: RunningSubagent[], width: number): string[] {
-  if (width <= 0) return [];
-  const now = Date.now();
-  const rows = agents.map((agent) => {
-    const snapshot = classifyStatus(agent.statusState, now);
-    const kind = statusConfig.enabled ? snapshot.kind : "running";
-    const name = `${agent.name}${agent.agent ? ` (${agent.agent})` : ""}`.replace(/\s+/g, " ");
-    const status = kind === "active"
-      ? snapshot.activityLabel ?? snapshot.activeScope ?? "active"
-      : kind;
-    return {
-      identity: `${widgetIcon(kind)} ${name}`,
-      elapsed: formatElapsedMMSS(agent.startTime),
-      status: truncateToWidth(status.replace(/\s+/g, " ").trim(), 24),
-    };
-  });
-  const identityWidth = Math.max(0, ...rows.map((row) => visibleWidth(row.identity)));
-  const elapsedWidth = Math.max(0, ...rows.map((row) => visibleWidth(row.elapsed)));
-  const statusWidth = Math.max(0, ...rows.map((row) => visibleWidth(row.status)));
-  // Align short rows without stretching them across the terminal. Reserve room
-  // for elapsed time and status; on tiny terminals keep the agent identity first.
-  const availableIdentity = width - elapsedWidth - statusWidth - 4;
-  return rows.map((row) => {
-    if (availableIdentity < 8) return truncateToWidth(`${row.identity}  ${row.elapsed}  ${row.status}`, width);
-    const columns = Math.min(identityWidth, availableIdentity);
-    const identity = truncateToWidth(row.identity, columns);
-    return `${identity}${" ".repeat(columns - visibleWidth(identity) + 2)}${row.elapsed.padStart(elapsedWidth)}  ${row.status}`;
-  });
+/** Busy transcripts change every second; parsing them that often is wasteful. */
+const WIDGET_USAGE_REFRESH_MS = 5000;
+
+/**
+ * Re-read this run's usage when its transcript or Claude sidecar changed,
+ * at most every five seconds. Called from the widget timer so render never
+ * touches the filesystem.
+ */
+function refreshWidgetUsage(agent: RunningSubagent, now = Date.now()): void {
+  if (agent.usageCheckedAt !== undefined && now - agent.usageCheckedAt < WIDGET_USAGE_REFRESH_MS) return;
+  agent.usageCheckedAt = now;
+  // A Claude transcript is not a Pi session; without its sidecar, usage is unknown.
+  if (agent.cli === "claude" && !agent.usageFile) return;
+  agent.usage = readRunUsage({
+    sessionFile: agent.sessionFile,
+    startEntryCount: agent.startEntryCount,
+    usageFile: agent.usageFile,
+  }, agent.usage);
+}
+
+function toWidgetRow(agent: RunningSubagent, now: number): WidgetRow {
+  const snapshot = classifyStatus(agent.statusState, now);
+  const kind = statusConfig.enabled ? snapshot.kind : "running";
+  const activity = !statusConfig.enabled
+    ? null
+    : kind === "active"
+      ? snapshot.activityLabel ?? snapshot.activeScope
+      : snapshot.statusLabel;
+  return {
+    profile: agent.agent,
+    name: agent.name,
+    kind,
+    activity,
+    elapsed: formatElapsedMMSS(agent.startTime),
+    usage: agent.usage?.usage ?? null,
+  };
 }
 
 function renderSubagentWidgetLines(
   agents: RunningSubagent[],
   width: number,
   mode: "compact" | "minimal" | "full" = statusConfig.mode,
+  theme: WidgetTheme = plainWidgetTheme,
 ): string[] {
-  if (mode === "compact") return renderCompactSubagentWidgetLines(agents, width);
+  if (mode === "compact") {
+    const now = Date.now();
+    return renderCompactWidgetRows(agents.map((agent) => toWidgetRow(agent, now)), width, theme, statusConfig.icons);
+  }
   if (mode === "minimal") return renderMinimalSubagentWidgetLine(agents, width);
   const count = agents.length;
   const title = "Subagents";
   const info = `${count} running`;
-  const lines: string[] = [borderTop(title, info, width)];
+  const lines: string[] = [borderTop(title, info, width, theme)];
 
   for (const agent of agents) {
     const elapsed = formatElapsedMMSS(agent.startTime);
-    const agentTag = agent.agent ? ` (${agent.agent})` : "";
+    const agentTag = agent.agent ? ` (${sanitizeDisplayText(agent.agent)})` : "";
     const snapshot = classifyStatus(agent.statusState, Date.now());
-    const icon = widgetIcon(snapshot.kind);
-    let left = ` ${icon} ${elapsed}  ${agent.name}${agentTag} `;
+    const icon = widgetIcon(snapshot.kind, theme);
+    let left = ` ${icon} ${elapsed}  ${sanitizeDisplayText(agent.name)}${agentTag} `;
     const right = statusConfig.enabled
-      ? formatWidgetRightLabel(snapshot)
+      ? ` ${sanitizeDisplayText(formatWidgetRightLabel(snapshot))} `
       : agent.cli === "claude"
         ? " running… "
         : " starting… ";
@@ -1031,11 +1039,21 @@ function renderSubagentWidgetLines(
       const extra = `${indicator} `;
       if (visibleWidth(left) + visibleWidth(extra) + visibleWidth(right) + 2 <= width) left += extra;
     }
-    lines.push(borderLine(left, right, width));
+    lines.push(borderLine(left, right, width, theme));
   }
 
-  lines.push(borderBottom(width));
+  lines.push(borderBottom(width, theme));
   return lines;
+}
+
+/** Widget factory for setWidget; Pi supplies the current theme on each mount. */
+function subagentWidgetFactory(getAgents: () => RunningSubagent[]) {
+  return (_tui: unknown, theme: WidgetTheme) => ({
+    invalidate() {},
+    render(width: number) {
+      return renderSubagentWidgetLines(getAgents(), width, statusConfig.mode, theme);
+    },
+  });
 }
 
 function updateWidget() {
@@ -1053,14 +1071,7 @@ function updateWidget() {
 
   latestCtx.ui.setWidget(
     "subagent-status",
-    (_tui: any, _theme: any) => {
-      return {
-        invalidate() {},
-        render(width: number) {
-          return renderSubagentWidgetLines(Array.from(runningSubagents.values()), width);
-        },
-      };
-    },
+    subagentWidgetFactory(() => Array.from(runningSubagents.values())),
     { placement: "aboveEditor" },
   );
 }
@@ -1645,6 +1656,8 @@ export const __test__ = {
   renderMinimalSubagentWidgetLine,
   reconcileParentRuns,
   widgetIcon,
+  refreshWidgetUsage,
+  subagentWidgetFactory,
 };
 
 function writeClaudeSystemPromptFile(artifactDir: string, id: string, systemPrompt: string): string {
@@ -1701,6 +1714,10 @@ function startWidgetRefresh() {
     // Counts remain available when lifecycle status notifications are disabled.
     if (!statusConfig.enabled) {
       for (const running of runningSubagents.values()) observeRunningSubagent(running);
+    }
+    // Only compact rows show usage; other modes skip the reads.
+    if (statusConfig.mode === "compact") {
+      for (const running of runningSubagents.values()) refreshWidgetUsage(running);
     }
     updateWidget();
   }, 1000);
