@@ -1,8 +1,9 @@
 import { createHash, randomUUID } from "node:crypto";
-import { closeSync, existsSync, mkdirSync, openSync, readFileSync, readdirSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { processIsAlive } from "./lifecycle.ts";
+import { createExclusiveFile, isAlreadyExists, withExclusiveFile, type ExclusiveFile } from "./lock.ts";
 import { getRunningAgentSurface } from "./herdr.ts";
 import { readNameRegistry } from "./session.ts";
 
@@ -53,16 +54,13 @@ function writeAtomic(path: string, data: unknown): void {
 function withGuard<T>(scope: string, action: () => T): T {
   mkdirSync(scope, { recursive: true });
   const guard = join(scope, "capacity.guard");
-  let fd: number;
-  try { fd = openSync(guard, "wx", 0o600); }
-  catch { throw new Error("Subagent capacity is locked by another process; retry after it finishes or inspect a stale capacity.guard."); }
-  try {
-    writeFileSync(fd, JSON.stringify({ pid: process.pid }));
-    return action();
-  } finally {
-    closeSync(fd);
-    unlinkSync(guard);
+  let file: ExclusiveFile;
+  try { file = createExclusiveFile(guard); }
+  catch (error) {
+    if (isAlreadyExists(error)) throw new Error("Subagent capacity is locked by another process; retry after it finishes or inspect a stale capacity.guard.");
+    throw new Error(`Could not lock subagent capacity (${guard}): ${(error as Error)?.message ?? error}`);
   }
+  return withExclusiveFile(file, action);
 }
 
 function slots(scope: string): Slot[] {

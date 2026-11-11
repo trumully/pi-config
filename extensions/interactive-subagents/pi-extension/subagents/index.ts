@@ -17,7 +17,7 @@ import {
 import { createHash } from "node:crypto";
 import { homedir, tmpdir } from "node:os";
 import {
-  CAPACITY_SCOPE_ENV, attachCapacity, capacityScope, loadCapacityLimit,
+  CAPACITY_SCOPE_ENV, capacityScope, loadCapacityLimit,
   releaseCapacity, releasePriorCapacity, releaseUnsubmittedCapacity, reserveCapacity, restoreCapacity,
   type CapacityTicket,
 } from "./capacity.ts";
@@ -58,7 +58,6 @@ import {
 
 import {
   countSessionEntryLines,
-  claimRegisteredRun,
   updateRegisteredRun,
   findLastAssistantMessage,
   finishRegisteredRun,
@@ -84,6 +83,7 @@ import {
   classifyStatus,
   createStatusState,
   forceStatusAfterInterrupt,
+  forceStatusAfterSteer,
   formatStatusAggregate,
   formatTransitionLine,
   observeStatus,
@@ -96,7 +96,8 @@ import {
   type ActivityReadResult,
   type SubagentActivityState,
 } from "./activity.ts";
-import { acquireTranscriptOwnership, inspectTranscriptOwnership, releaseTranscriptOwnership, updateTranscriptOwnership, type RunMetadata } from "./lifecycle.ts";
+import { inspectTranscriptOwnership, releaseTranscriptOwnership, updateTranscriptOwnership, type RunMetadata } from "./lifecycle.ts";
+import { LaunchAttempt } from "./launch.ts";
 import {
   handoffBlocksResultDelivery,
   handoffSidecarExists,
@@ -291,7 +292,6 @@ function getToolExtensionPath(tool: string): string | undefined {
   );
   const webAccessExtension = packageExtension("pi-web-access/dist/index.js");
   const map: Record<string, string> = {
-    todo: packageExtension("@juicesharp/rpiv-todo/index.ts"),
     ask_user_question: packageExtension("@juicesharp/rpiv-ask-user-question/index.ts"),
     web_search: webAccessExtension,
     source_check: webAccessExtension,
@@ -749,40 +749,6 @@ function completeRun(
   }
 }
 
-/** Roll back only when Herdr has never received a start request. */
-function rollbackUnsubmittedResume(
-  artifactDir: string, name: string, prior: NameRegistryEntry, runId: string,
-  sessionFile: string, ownerToken: string, capacity: CapacityTicket, registryClaimed: boolean,
-): void {
-  // Restore archived signals while the transcript is still exclusively owned.
-  for (const suffix of [".exit", ".ask", ".pending"]) {
-    const path = `${sessionFile}${suffix}`;
-    const archived = `${path}.prior-${runId}`;
-    try {
-      if (existsSync(archived) && !existsSync(path)) renameSync(archived, path);
-    } catch (error: any) {
-      warnOnce(`resume-rollback-signal:${runId}:${suffix}`, `Could not restore ${path}: ${error?.message ?? String(error)}`);
-    }
-  }
-  if (registryClaimed) {
-    try {
-      updateRegisteredRun(artifactDir, name, runId, { ...prior, runMetadata: prior.runMetadata });
-    } catch (error: any) {
-      warnOnce(`resume-rollback-registry:${runId}`, `Could not restore the prior registry run for "${name}": ${error?.message ?? String(error)}`);
-    }
-  }
-  try {
-    releaseTranscriptOwnership(sessionFile, ownerToken);
-  } catch (error: any) {
-    warnOnce(`resume-rollback-owner:${runId}`, `Could not release unsubmitted resume ownership for "${name}": ${error?.message ?? String(error)}`);
-  }
-  try {
-    releaseCapacity(capacity);
-  } catch (error: any) {
-    warnOnce(`resume-rollback-capacity:${runId}`, `Could not release unsubmitted resume capacity for "${name}": ${error?.message ?? String(error)}`);
-  }
-}
-
 function resolveResultPresentation(
   result: Pick<
     SubagentResult,
@@ -1225,11 +1191,13 @@ function applySandboxToParts(
   }
 }
 
-function formatResumeTaskPrompt(path: string): string {
+// Resume prompts are typed into the running pane, where Pi does not expand
+// `@path`, so the follow-up must be sent inline like a fresh spawn's task.
+function formatResumeTaskPrompt(followUp: string): string {
   return (
-    `Read and execute the instructions in the provided task file as your current follow-up assignment. ` +
+    `Execute the follow-up below as your current assignment. ` +
     `Treat prior conversation as background only; do not wait for clarification instead of following that assignment.\n\n` +
-    `@"${path}"`
+    followUp
   );
 }
 
@@ -1421,7 +1389,7 @@ function handleSubagentSteer(
     };
   }
 
-  running.statusState = forceStatusAfterInterrupt(running.statusState, now);
+  running.statusState = forceStatusAfterSteer(running.statusState, now);
   updateWidget();
 
   return {
@@ -1476,7 +1444,7 @@ async function handleSubagentReplace(
     };
   }
 
-  running.statusState = forceStatusAfterInterrupt(running.statusState, now);
+  running.statusState = forceStatusAfterInterrupt(running.statusState, Date.now());
   updateWidget();
   const how = outcome.interrupt
     ? `hc pressed ${outcome.interrupt.key || "the stop key"}, observed the turn stop (status now "${outcome.interrupt.statusAfter}"), then submitted the replacement as a new turn.`
@@ -1664,7 +1632,6 @@ export const __test__ = {
   resolveResultPresentation,
   sendSubagentResult,
   deliverSubagentResult,
-  rollbackUnsubmittedResume,
   resolveResumeLaunchBehavior,
   finishedIntentError,
   formatSubagentMessage,
@@ -1881,27 +1848,26 @@ async function launchReservedSubagent(
       pendingFile: `${sentinelFile}.pending`, sentinelFile, profile: params.agent, task: params.task,
       startTime, cli: "claude", interactive: effectiveInteractive, capacity,
     };
+    const attempt = new LaunchAttempt({
+      parentArtifactDir, name: params.name, runId: id, sessionFile: subagentSessionFile, capacity, prior: null,
+      closePane: () => closeSurfaceAndTab(surface, tabId),
+    });
     try {
-      claimRegisteredRun(parentArtifactDir, params.name, {
+      attempt.claim({
         sessionFile: subagentSessionFile, sessionId: null, usageFile: `${sentinelFile}.usage.json`,
         running: true, runId: id, taskBrief: params.task, runMetadata: claudeMetadata, claude: claudeRecord,
       });
+      await attempt.submit(() => startAgent(herdrAgentName, "claude", surface, args, [params.task]));
     } catch (error) {
-      closeSurfaceAndTab(surface, tabId);
+      if (await attempt.abandon() === "uncertain") handleClaudeLaunchError(error, herdrAgentName, surface, tabId);
       throw error;
     }
-    try {
-      attachCapacity(capacity, parentArtifactDir, params.name, id);
-      await startAgent(herdrAgentName, "claude", surface, args, [params.task]);
-      claudeMetadata.state = "running";
-      claudeMetadata.launchConfirmed = true;
-      updateRegisteredRun(parentArtifactDir, params.name, id, {
-        sessionFile: subagentSessionFile, sessionId: null, usageFile: `${sentinelFile}.usage.json`,
-        running: true, runId: id, taskBrief: params.task, runMetadata: claudeMetadata,
-      });
-    } catch (error) {
-      handleClaudeLaunchError(error, herdrAgentName, surface, tabId);
-    }
+    claudeMetadata.state = "running";
+    claudeMetadata.launchConfirmed = true;
+    await attempt.recordConfirmed({
+      sessionFile: subagentSessionFile, sessionId: null, usageFile: `${sentinelFile}.usage.json`,
+      running: true, runId: id, taskBrief: params.task, runMetadata: claudeMetadata,
+    });
 
     const running: RunningSubagent = {
       id,
@@ -2004,47 +1970,37 @@ async function launchReservedSubagent(
   });
   const { surface, tabId } = allocatedSurface;
   const parentSessionId = ctx.sessionManager.getSessionId();
-  let ownerToken: string;
-  try {
-    ownerToken = acquireTranscriptOwnership({
-      sessionFile: subagentSessionFile, runId: id, herdrAgentName, surface, state: "launching",
-    });
-  } catch (error) {
-    closeSurfaceAndTab(surface, tabId);
-    throw error;
-  }
-  const runMetadata: RunMetadata = {
-    version: 1, state: "launching", parentSessionId, runId: id, herdrAgentName,
-    surface, ...(tabId ? { herdrTabId: tabId } : {}), sessionFile: subagentSessionFile,
-    transcriptOffset: startEntryCount, ownerToken, activityFile,
-    askFile: `${subagentSessionFile}.ask`, pendingFile: `${subagentSessionFile}.pending`, profile: params.agent,
-    task: params.task, startTime, cli: "pi", interactive: effectiveInteractive, capacity,
-  };
   const parentArtifactDir = getArtifactDir(ctx.sessionManager.getSessionDir(), parentSessionId);
+  const attempt = new LaunchAttempt({
+    parentArtifactDir, name: params.name, runId: id, sessionFile: subagentSessionFile, capacity, prior: null,
+    closePane: () => closeSurfaceAndTab(surface, tabId),
+  });
+  let ownerToken: string;
+  let runMetadata: RunMetadata;
   try {
-    claimRegisteredRun(parentArtifactDir, params.name, {
+    ownerToken = attempt.acquireOwner({ herdrAgentName, surface, state: "launching" });
+    runMetadata = {
+      version: 1, state: "launching", parentSessionId, runId: id, herdrAgentName,
+      surface, ...(tabId ? { herdrTabId: tabId } : {}), sessionFile: subagentSessionFile,
+      transcriptOffset: startEntryCount, ownerToken, activityFile,
+      askFile: `${subagentSessionFile}.ask`, pendingFile: `${subagentSessionFile}.pending`, profile: params.agent,
+      task: params.task, startTime, cli: "pi", interactive: effectiveInteractive, capacity,
+    };
+    attempt.claim({
       sessionFile: subagentSessionFile, sessionId: getSessionId(subagentSessionFile),
       activityFile, running: true, runId: id, taskBrief: params.task, runMetadata,
     });
+    await attempt.submit(() => startAgent(herdrAgentName, "pi", surface, parts, promptArgs));
   } catch (error) {
-    releaseTranscriptOwnership(subagentSessionFile, ownerToken);
-    closeSurfaceAndTab(surface, tabId);
+    if (await attempt.abandon() === "uncertain") closeSurfaceAndTab(surface, tabId);
     throw error;
   }
-  try {
-    attachCapacity(capacity, parentArtifactDir, params.name, id);
-    await startAgent(herdrAgentName, "pi", surface, parts, promptArgs);
-    runMetadata.state = "running";
-    runMetadata.launchConfirmed = true;
-    updateTranscriptOwnership(subagentSessionFile, ownerToken, "running");
-    updateRegisteredRun(parentArtifactDir, params.name, id, {
-      sessionFile: subagentSessionFile, sessionId: getSessionId(subagentSessionFile),
-      activityFile, running: true, runId: id, taskBrief: params.task, runMetadata,
-    });
-  } catch (error) {
-    closeSurfaceAndTab(surface, tabId);
-    throw error;
-  }
+  runMetadata.state = "running";
+  runMetadata.launchConfirmed = true;
+  await attempt.recordConfirmed({
+    sessionFile: subagentSessionFile, sessionId: getSessionId(subagentSessionFile),
+    activityFile, running: true, runId: id, taskBrief: params.task, runMetadata,
+  });
 
   const running: RunningSubagent = {
     id,
@@ -2236,31 +2192,20 @@ async function resumeClaudeSubagent(
     ...(prior.profile ? { profile: prior.profile } : {}), task: message, startTime, cli: "claude", interactive, capacity,
   };
   const taskBrief = params.intent === "task" ? message : entry.taskBrief;
-  let registryClaimed = false;
-  let launchSubmitted = false;
+  const attempt = new LaunchAttempt({
+    parentArtifactDir, name, runId: id, sessionFile: entry.sessionFile, capacity, prior: entry,
+    closePane: () => closeSurfaceAndTab(surface, tabId),
+  });
   try {
-    claimRegisteredRun(parentArtifactDir, name, { ...entry, usageFile, running: true, runId: id, runMetadata }, entry);
-    registryClaimed = true;
-    attachCapacity(capacity, parentArtifactDir, name, id);
-    launchSubmitted = true;
-    await startAgent(herdrAgentName, "claude", surface, args, [prompt]);
-    runMetadata.state = "running";
-    runMetadata.launchConfirmed = true;
-    updateRegisteredRun(parentArtifactDir, name, id, { usageFile, running: true, taskBrief, runMetadata });
+    attempt.claim({ ...entry, usageFile, running: true, runId: id, runMetadata });
+    await attempt.submit(() => startAgent(herdrAgentName, "claude", surface, args, [prompt]));
   } catch (error) {
-    if (!launchSubmitted) {
-      if (registryClaimed) {
-        try { updateRegisteredRun(parentArtifactDir, name, id, { ...entry }); } catch (rollback: any) {
-          warnOnce(`claude-resume-rollback:${id}`, `Could not restore the prior registry run for "${name}": ${rollback?.message ?? String(rollback)}`);
-        }
-      }
-      try { releaseCapacity(capacity); } catch {}
-      closeSurfaceAndTab(surface, tabId);
-      throw error;
-    }
-    // Submitted launches stay "launching" so reconciliation treats them as UNKNOWN.
-    handleClaudeLaunchError(error, herdrAgentName, surface, tabId);
+    if (await attempt.abandon() === "uncertain") handleClaudeLaunchError(error, herdrAgentName, surface, tabId);
+    throw error;
   }
+  runMetadata.state = "running";
+  runMetadata.launchConfirmed = true;
+  await attempt.recordConfirmed({ usageFile, running: true, taskBrief, runMetadata });
 
   const running: RunningSubagent = {
     id, name, task: message, agent: prior.profile, surface, herdrTabId: tabId, herdrAgentName, startTime,
@@ -3448,22 +3393,9 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         // Replay the model, identity, and default-deny tool/extension sandbox.
         applySandboxToParts(parts, loadout, { artifactDir, name });
 
-        let resumeMsgFile: string | undefined;
-        if (message) {
-          const msgTimestamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
-          resumeMsgFile = join(
-            artifactDir,
-            "subagent-resume",
-            `${name
-              .toLowerCase()
-              .replace(/[^a-z0-9\s-]/g, "")
-              .replace(/\s+/g, "-")
-              .replace(/-+/g, "-")
-              .replace(/^-|-$/g, "") || "resume"}-${msgTimestamp}.md`,
-          );
-          mkdirSync(dirname(resumeMsgFile), { recursive: true });
-          writeFileSync(resumeMsgFile, formatSubagentMessage(params.intent, name, message, entry.taskBrief), "utf8");
-        }
+        const resumePrompts = message
+          ? [formatResumeTaskPrompt(formatSubagentMessage(params.intent, name, message, entry.taskBrief))]
+          : [];
 
         // Replay the saved sandbox and nested-spawn identity in the new pane.
         const childEnv: Record<string, string> = {};
@@ -3498,53 +3430,36 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         }
         const { surface, tabId } = allocatedSurface;
         const parentSessionId = ctx.sessionManager.getSessionId();
+        const attempt = new LaunchAttempt({
+          parentArtifactDir, name, runId: id, sessionFile: sessionPath, capacity, prior: entry,
+          closePane: () => closeSurfaceAndTab(surface, tabId),
+        });
         let ownerToken: string;
+        let runMetadata: RunMetadata;
         try {
-          ownerToken = acquireTranscriptOwnership({
-            sessionFile: sessionPath, runId: id, herdrAgentName, surface, state: "launching",
+          ownerToken = attempt.acquireOwner({
+            herdrAgentName, surface, state: "launching",
             canRecoverStale: !!priorRun && (entry.running === true || priorRun.state === "finished"),
             expectedPriorRunId: priorRun?.runId,
             herdrConfirmedAbsent,
           });
+          runMetadata = {
+            version: 1, state: "launching", parentSessionId, runId: id, herdrAgentName,
+            surface, ...(tabId ? { herdrTabId: tabId } : {}), sessionFile: sessionPath,
+            transcriptOffset: entryCountBefore, ownerToken, activityFile,
+            askFile: `${sessionPath}.ask`, pendingFile: `${sessionPath}.pending`, profile: loadout.agent ?? undefined,
+            task: message, startTime, cli: "pi", interactive, capacity,
+          };
+          attempt.claim({ ...entry, running: true, runId: id, runMetadata });
+          attempt.archiveSignals();
+          await attempt.submit(() => startAgent(herdrAgentName, "pi", surface, parts, resumePrompts));
         } catch (error) {
-          releaseUnsubmittedCapacity(capacity);
-          closeSurfaceAndTab(surface, tabId);
+          if (await attempt.abandon() === "uncertain") closeSurfaceAndTab(surface, tabId);
           throw error;
         }
-        const runMetadata: RunMetadata = {
-          version: 1, state: "launching", parentSessionId, runId: id, herdrAgentName,
-          surface, ...(tabId ? { herdrTabId: tabId } : {}), sessionFile: sessionPath,
-          transcriptOffset: entryCountBefore, ownerToken, activityFile,
-          askFile: `${sessionPath}.ask`, pendingFile: `${sessionPath}.pending`, profile: loadout.agent ?? undefined,
-          task: message, startTime, cli: "pi", interactive, capacity,
-        };
-        let registryClaimed = false;
-        let launchSubmitted = false;
-        try {
-          claimRegisteredRun(parentArtifactDir, name, { ...entry, running: true, runId: id, runMetadata }, entry);
-          registryClaimed = true;
-          // Old error/question sidecars must not be mistaken for this new run.
-          for (const suffix of [".exit", ".ask", ".pending"]) {
-            const stale = `${sessionPath}${suffix}`;
-            if (existsSync(stale)) renameSync(stale, `${stale}.prior-${id}`);
-          }
-          attachCapacity(capacity, parentArtifactDir, name, id);
-          launchSubmitted = true;
-          await startAgent(herdrAgentName, "pi", surface, parts,
-            resumeMsgFile ? [formatResumeTaskPrompt(resumeMsgFile)] : []);
-          runMetadata.state = "running";
-          runMetadata.launchConfirmed = true;
-          updateTranscriptOwnership(sessionPath, ownerToken, "running");
-          updateRegisteredRun(parentArtifactDir, name, id, { sessionFile: sessionPath, sessionId: resumedSessionId, running: true, taskBrief: params.intent === "task" ? message : entry.taskBrief, runMetadata });
-        } catch (error) {
-          if (!launchSubmitted) {
-            rollbackUnsubmittedResume(parentArtifactDir, name, entry, id, sessionPath, ownerToken, capacity, registryClaimed);
-          } else {
-            releaseUnsubmittedCapacity(capacity);
-          }
-          closeSurfaceAndTab(surface, tabId);
-          throw error;
-        }
+        runMetadata.state = "running";
+        runMetadata.launchConfirmed = true;
+        await attempt.recordConfirmed({ sessionFile: sessionPath, sessionId: resumedSessionId, running: true, taskBrief: params.intent === "task" ? message : entry.taskBrief, runMetadata });
 
         // Register as a running subagent for widget tracking
         const running: RunningSubagent = {

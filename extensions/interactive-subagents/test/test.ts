@@ -1,6 +1,7 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
+import { once } from "node:events";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
@@ -24,7 +25,7 @@ import {
   readSubagentActivityFile,
   type SubagentActivityState,
 } from "../pi-extension/subagents/activity.ts";
-import { registerSubagentProgress, replayTodoProgress, summarizeTodoDetails } from "../pi-extension/subagents/progress.ts";
+import { registerSubagentProgress } from "../pi-extension/subagents/progress.ts";
 
 function createMockExtensionApi() {
   const registeredTools: any[] = [];
@@ -66,7 +67,7 @@ function createTheme() {
 }
 
 describe("compact subagent progress", () => {
-  it("validates optional count summaries and keeps old activity files readable", () => {
+  it("validates child-count progress and keeps old activity files readable", () => {
     const directory = mkdtempSync(join(tmpdir(), "subagent-progress-schema-"));
     const file = join(directory, "activity.json");
     const legacy: SubagentActivityState = {
@@ -77,7 +78,7 @@ describe("compact subagent progress", () => {
     try {
       writeFileSync(file, JSON.stringify(legacy));
       assert.equal(readSubagentActivityFile(file, "run-1").ok, true);
-      writeFileSync(file, JSON.stringify({ ...legacy, progress: { updatedAt: 10, activeChildren: 2, todos: { completed: 1, total: 3 } } }));
+      writeFileSync(file, JSON.stringify({ ...legacy, progress: { updatedAt: 10, activeChildren: 2 } }));
       assert.equal(readSubagentActivityFile(file, "run-1").ok, true);
       writeFileSync(file, JSON.stringify({ ...legacy, progress: { updatedAt: 10, activeChildren: -1 } }));
       const badSummary = readSubagentActivityFile(file, "run-1");
@@ -89,25 +90,6 @@ describe("compact subagent progress", () => {
       writeFileSync(file, JSON.stringify({ ...legacy, progress: { updatedAt: 10, activeChildren: 1 } }));
       assert.equal(readSubagentActivityFile(file, "other-run").reason, "wrong-id");
     } finally { rmSync(directory, { recursive: true, force: true }); }
-  });
-
-  it("summarizes only known, non-deleted todo tasks and clears empty snapshots", () => {
-    assert.deepEqual(summarizeTodoDetails({ tasks: [
-      { status: "completed" }, { status: "pending" }, { status: "in_progress" }, { status: "deleted" },
-    ] }), { completed: 1, total: 3 });
-    assert.deepEqual(summarizeTodoDetails({ tasks: [{ status: "deleted" }] }), { completed: 0, total: 0 });
-    assert.deepEqual(summarizeTodoDetails({ tasks: [] }), { completed: 0, total: 0 });
-    assert.equal(summarizeTodoDetails({ tasks: [{ status: "mystery" }] }), undefined);
-    assert.equal(summarizeTodoDetails({ other: [] }), undefined);
-    assert.equal(summarizeTodoDetails({ tasks: [null] }), undefined);
-    assert.deepEqual(replayTodoProgress([
-      { type: "message", message: { role: "toolResult", toolName: "todo", details: { tasks: [{ status: "completed" }] } } },
-      { type: "message", message: { role: "toolResult", toolName: "todo", details: { tasks: [{ status: "deleted" }] } } },
-    ]), { completed: 0, total: 0 });
-    assert.equal(replayTodoProgress([
-      { type: "message", message: { role: "toolResult", toolName: "todo", details: { tasks: [{ status: "completed" }] } } },
-      { type: "message", message: { role: "toolResult", toolName: "todo", details: {} } },
-    ]), undefined);
   });
 
   it("keeps progress heartbeat separate from lifecycle freshness and hides stale counts", () => {
@@ -122,45 +104,75 @@ describe("compact subagent progress", () => {
       assert.equal(before.ok, true);
       if (!before.ok) return;
       clock = 200;
-      recorder.reportProgress(2, { completed: 1, total: 4 });
+      recorder.reportProgress(2);
       const after = readSubagentActivityFile(file, "run-1");
       assert.equal(after.ok, true);
       if (!after.ok) return;
       assert.equal(after.activity.updatedAt, before.activity.updatedAt);
       assert.equal(after.activity.sequence, before.activity.sequence);
       assert.equal(after.activity.phase, before.activity.phase);
-      assert.deepEqual(progressIndicators(after.activity.progress, 200), ["↳ 2", "● 1/4"]);
+      assert.deepEqual(progressIndicators(after.activity.progress, 200), ["↳ 2"]);
       assert.deepEqual(progressIndicators(after.activity.progress, 10_201), []);
       assert.deepEqual(progressIndicators({ updatedAt: 300, activeChildren: 1 }, 200), []);
     } finally { rmSync(directory, { recursive: true, force: true }); }
   });
 
-  it("replays branches, bridges tool results, and clears the heartbeat interval at shutdown", () => {
+  it("still records done when another process briefly holds the activity file open", async () => {
+    // On Windows, replacing a file that another process has open fails with EPERM.
+    // The parent polls this file every second, so a burst of child events can hit
+    // one read; the recorder must not give up and lose the final "done".
+    const directory = mkdtempSync(join(tmpdir(), "subagent-activity-lock-"));
+    const file = join(directory, "activity.json");
+    const recorder = createSubagentActivityRecorder({ runningChildId: "run-1", activityFile: file });
+    try {
+      recorder.sessionStart();
+      const holder = spawn(process.execPath, ["-e", [
+        `const fs = require("fs");`,
+        `const fd = fs.openSync(process.argv[1], "r");`,
+        `process.stdout.write("held\\n");`,
+        `setTimeout(() => fs.closeSync(fd), 100);`,
+      ].join(" "), file], { stdio: ["ignore", "pipe", "inherit"] });
+      const exited = once(holder, "exit");
+      await new Promise<void>((resolveHeld, rejectHeld) => {
+        holder.stdout!.once("data", () => resolveHeld());
+        holder.once("error", rejectHeld);
+      });
+      recorder.agentStart();
+      recorder.toolExecutionStart("call-1", "read");
+      recorder.toolExecutionEnd("call-1", "read");
+      recorder.agentEndDone();
+      await exited;
+      const read = readSubagentActivityFile(file, "run-1");
+      assert.equal(read.ok, true);
+      if (read.ok) assert.equal(read.activity.phase, "done");
+    } finally { rmSync(directory, { recursive: true, force: true }); }
+  });
+
+  it("publishes direct-child counts and clears the heartbeat interval at shutdown", () => {
     const handlers = new Map<string, Function[]>();
     const api = { on(event: string, handler: Function) { handlers.set(event, [...(handlers.get(event) ?? []), handler]); } } as any;
-    const reports: Array<{ children: number; todos?: unknown }> = [];
-    const recorder = { reportProgress(children: number, todos?: unknown) { reports.push({ children, todos }); } } as any;
+    const reports: number[] = [];
+    const recorder = { reportProgress(children: number) { reports.push(children); } } as any;
     const originalSetInterval = globalThis.setInterval;
     const originalClearInterval = globalThis.clearInterval;
     let timerCallback: (() => void) | undefined;
     let cleared = 0;
+    let children = 2;
     (globalThis as any).setInterval = (callback: () => void) => { timerCallback = callback; return 123; };
     (globalThis as any).clearInterval = (timer: unknown) => { if (timer === 123) cleared++; };
     try {
-      registerSubagentProgress(api, recorder, () => 2);
-      const ctx = { sessionManager: { getBranch: () => [
-        { type: "message", message: { role: "toolResult", toolName: "todo", details: { tasks: [{ status: "completed" }, { status: "pending" }] } } },
-      ] } };
-      handlers.get("session_start")![0]({}, ctx);
-      assert.deepEqual(reports.at(-1), { children: 2, todos: { completed: 1, total: 2 } });
-      handlers.get("session_tree")![0]({}, { sessionManager: { getBranch: () => [] } });
-      assert.deepEqual(reports.at(-1), { children: 2, todos: undefined });
-      handlers.get("tool_execution_end")![0]({ toolName: "todo", result: { details: { tasks: [{ status: "completed" }] } } });
-      assert.deepEqual(reports.at(-1), { children: 2, todos: { completed: 1, total: 1 } });
+      registerSubagentProgress(api, recorder, () => children);
+      handlers.get("session_start")![0]();
+      assert.equal(reports.at(-1), 2);
+      children = 1;
+      handlers.get("session_tree")![0]();
+      assert.equal(reports.at(-1), 1);
+      handlers.get("tool_execution_end")![0]();
+      assert.equal(reports.at(-1), 1);
       timerCallback!();
       assert.equal(reports.length, 4);
       // A repeated session_start replaces, rather than leaks, the old interval.
-      handlers.get("session_start")![0]({}, ctx);
+      handlers.get("session_start")![0]();
       assert.equal(cleared, 1);
       handlers.get("session_shutdown")![0]();
       assert.equal(cleared, 2);
@@ -185,20 +197,18 @@ describe("compact subagent progress", () => {
         activityLabel: null, snapshotState: "present", snapshotProblemSinceMs: null,
         snapshotError: null, currentKind: "active",
       },
-      activityRead: { ok: true }, activity: { phase: "active", progress: { updatedAt: now, activeChildren: 2, todos: { completed: 1, total: 3 } } },
+      activityRead: { ok: true }, activity: { phase: "active", progress: { updatedAt: now, activeChildren: 2 } },
     };
     const wide = testApi.renderSubagentWidgetLines([base], 100, "full").join("\n");
     assert.match(wide, /WorkerName/);
     assert.match(wide, /↳ 2/);
-    assert.match(wide, /● 1\/3/);
     assert.match(wide, /active/);
     const narrow = testApi.renderSubagentWidgetLines([base], 60, "full").join("\n");
     assert.match(narrow, /WorkerName/);
     assert.match(narrow, /↳ 2/);
-    assert.doesNotMatch(narrow, /●/);
     assert.match(narrow, /active/);
-    const stale = { ...base, activity: { phase: "active", progress: { updatedAt: now - 20_000, activeChildren: 2, todos: { completed: 1, total: 3 } } } };
-    assert.doesNotMatch(testApi.renderSubagentWidgetLines([stale], 100, "full").join("\n"), /↳|●/);
+    const stale = { ...base, activity: { phase: "active", progress: { updatedAt: now - 20_000, activeChildren: 2 } } };
+    assert.doesNotMatch(testApi.renderSubagentWidgetLines([stale], 100, "full").join("\n"), /↳/);
   });
 });
 
@@ -222,7 +232,7 @@ describe("interactive subagents smoke tests", () => {
     }
   });
 
-  it("loads bundled community extensions and grants workers the todo tool", () => {
+  it("loads bundled community extensions", () => {
     const testApi = (subagentsModule as any).__test__;
     const root = resolve(dirname(fileURLToPath(import.meta.url)), "../../..");
     const manifest = JSON.parse(readFileSync(join(root, "package.json"), "utf8"));
@@ -230,7 +240,6 @@ describe("interactive subagents smoke tests", () => {
       assert.ok(existsSync(resolve(root, entry)), `Missing extension: ${entry}`);
     }
     for (const [tool, entry] of Object.entries({
-      todo: "@juicesharp/rpiv-todo/index.ts",
       ask_user_question: "@juicesharp/rpiv-ask-user-question/index.ts",
       web_search: "pi-web-access/dist/index.js",
       source_check: "pi-web-access/dist/index.js",
@@ -239,8 +248,6 @@ describe("interactive subagents smoke tests", () => {
     })) {
       assert.equal(testApi.getToolExtensionPath(tool), join(root, "node_modules", entry));
     }
-    const worker = readFileSync(join(root, "extensions/interactive-subagents/agents/worker.md"), "utf8");
-    assert.match(worker, /^tools:.*\btodo\b/m);
   });
 
   it("grants the bundled researcher codemode without shell, files, or spawning tools", () => {
@@ -1034,10 +1041,14 @@ describe("interactive subagents smoke tests", () => {
     assert.equal(testApi.finishedIntentError("task"), null);
     assert.match(testApi.formatSubagentMessage("task", "Worker", "new assignment"), /Complete replacement assignment.*full current task/);
     assert.match(testApi.formatSubagentMessage(undefined, "Worker", "follow up", "old task"), /background context only, not an instruction to repeat it/);
-    const resumePrompt = testApi.formatResumeTaskPrompt("C:\\tasks\\latest review.md");
-    assert.match(resumePrompt, /Read and execute the instructions.*current follow-up assignment/);
+    // Resume prompts are typed into a running pane, where `@path` is not expanded,
+    // so a child without `read` (gh-scout, researcher) must still get the text.
+    const followUp = testApi.formatSubagentMessage(undefined, "gh-scout", "check PR 12 reviews", "old task");
+    const resumePrompt = testApi.formatResumeTaskPrompt(followUp);
+    assert.match(resumePrompt, /Execute the follow-up below as your current assignment/);
     assert.match(resumePrompt, /Treat prior conversation as background only/);
-    assert.match(resumePrompt, /@"C:\\tasks\\latest review\.md"/);
+    assert.ok(resumePrompt.endsWith(followUp), "follow-up text is inlined verbatim");
+    assert.doesNotMatch(resumePrompt, /@"/, "no file reference the child may be unable to read");
   });
 
   it("rejects a spawn without an agent or a nonblank task", async () => {

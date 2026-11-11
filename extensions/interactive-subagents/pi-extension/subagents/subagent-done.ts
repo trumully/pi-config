@@ -4,37 +4,28 @@
  * - Provides an `ask_question` tool for asking the parent orchestrator a question
  *
  * Subagents do NOT self-terminate via a tool. Auto-exit agents shut down
- * automatically when their agent loop ends (see the `agent_end` handler);
+ * automatically once the agent has settled (see the `agent_settled` handler;
+ * `agent_end` is not final because Pi may still retry or run queued work);
  * interactive agents end when the human exits the pane.
  *
  * `ask_question` keeps the session OPEN: it writes a `${sessionFile}.ask`
  * signal the parent's watcher picks up, parks the session in a "waiting" state
- * (auto-exit is suppressed for that turn via `awaitingAnswer`), and the parent
- * replies with subagent_message - which lands as the subagent's next turn.
+ * (the handoff controller blocks auto-exit until a reply arrives), and the parent
+ * replies with subagent_message - which lands as the subagent's next input.
  */
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Box, Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { renameSync, writeFileSync } from "node:fs";
 import { randomUUID } from "node:crypto";
 import { createSubagentActivityRecorder } from "./activity.ts";
 import { registerSubagentProgress } from "./progress.ts";
+import { createHandoffController } from "./handoff-controller.ts";
 import {
-  advanceThresholdLatch,
-  branchHasAssistantAfterResumeToken,
-  branchHasCompactionAfter,
-  branchHasResumeToken,
-  formatCheckpoint,
-  handoffBlocksResultDelivery,
-  handoffNeedsToStayOpen,
-  handoffSidecarExists,
   loadProactiveCompactionConfig,
   parseProactiveCompactionConfig,
-  readHandoffState,
   validateProactiveCheckpoint,
-  writeHandoffState,
   type ProactiveCompactionConfig,
-  type ProactiveHandoffState,
 } from "./proactive-compaction.ts";
 
 /**
@@ -148,148 +139,17 @@ export default function (pi: ExtensionAPI) {
     proactiveConfigError = error instanceof Error ? error.message : String(error);
   }
 
-  let handoffState: ProactiveHandoffState | null = null;
-  let handoffPending = false;
-  let handoffRecoveryBlocked = false;
-  let thresholdRequested = false;
-  let thresholdPromptPending = false;
-  let thresholdRequestAccepted = false;
-  let resumeInputAccepted = false;
-  let resumeDispatching = false;
-  let extensionActive = true;
-  let latestCtx: ExtensionContext | undefined;
+  const handoff = createHandoffController({
+    sessionFile,
+    config: proactiveConfig,
+    autoExit,
+    sendUserMessage: (text, options) => pi.sendUserMessage(text, options),
+    runningChildrenCount,
+    lastRunAllowsExit: (messages) => shouldAutoExitOnAgentEnd(messages),
+  });
 
   function notify(ctx: ExtensionContext | undefined, message: string, level: "info" | "warning" | "error" = "info") {
     if (ctx?.hasUI) ctx.ui.notify(message, level);
-  }
-
-  function saveHandoff(next: ProactiveHandoffState, ctx?: ExtensionContext): boolean {
-    handoffState = next;
-    handoffPending = handoffNeedsToStayOpen(next) || handoffRecoveryBlocked;
-    try {
-      writeHandoffState(sessionFile, next);
-      return true;
-    } catch (error) {
-      notify(ctx ?? latestCtx, `Could not persist self_compact handoff state: ${error instanceof Error ? error.message : String(error)}`, "error");
-      return false;
-    }
-  }
-
-  function failHandoff(error: string, aborted: boolean, ctx?: ExtensionContext): void {
-    if (!handoffState || handoffState.phase !== "compacting") return;
-    saveHandoff({
-      ...handoffState,
-      phase: resumeInputAccepted ? "resume-pending" : "failed",
-      error,
-      aborted,
-    }, ctx);
-    notify(
-      ctx ?? latestCtx,
-      aborted
-        ? "Proactive child compaction was aborted. The checkpoint is saved; the child is waiting for input."
-        : `Proactive child compaction failed. The checkpoint is saved; the child is waiting for input. ${error}`,
-      aborted ? "warning" : "error",
-    );
-  }
-
-  function resumeToken(state: ProactiveHandoffState): string {
-    return state.resumeToken ?? `[pi-subagent-self-compact:${state.id}]`;
-  }
-
-  function resumePrompt(state: ProactiveHandoffState, token: string): string {
-    return [
-      `Continue the original child task from this saved checkpoint. Do not report completion until the task is actually finished. ${token}`,
-      formatCheckpoint(state.checkpoint),
-    ].join("\n\n");
-  }
-
-  function dispatchResume(ctx: ExtensionContext, state: ProactiveHandoffState): void {
-    if (!extensionActive || resumeDispatching) return;
-    const token = resumeToken(state);
-    if (branchHasResumeToken(ctx.sessionManager.getBranch(), token)) {
-      saveHandoff({ ...state, phase: "resumed", resumeToken: token }, ctx);
-      handoffPending = false;
-      resumeInputAccepted = false;
-      return;
-    }
-
-    const pending = { ...state, phase: "resume-pending" as const, resumeToken: token };
-    if (!saveHandoff(pending, ctx)) {
-      handoffPending = true;
-      return;
-    }
-    // A user/parent message queued while compaction ran is itself the
-    // continuation. The input hook below adds the checkpoint to that message.
-    if (resumeInputAccepted || !ctx.isIdle() || ctx.hasPendingMessages()) return;
-
-    resumeDispatching = true;
-    pi.sendUserMessage(resumePrompt(pending, token), { deliverAs: "steer" });
-  }
-
-  function recoverHandoff(ctx: ExtensionContext): void {
-    const sidecarExists = handoffSidecarExists(sessionFile);
-    handoffState = readHandoffState(sessionFile);
-    handoffRecoveryBlocked = sidecarExists && !handoffState;
-    if (handoffRecoveryBlocked) {
-      handoffPending = true;
-      thresholdRequested = true;
-      notify(ctx, "The child self_compact checkpoint is unreadable. The child will stay open rather than report an incomplete task.", "error");
-      return;
-    }
-    if (!handoffState) {
-      handoffPending = false;
-      return;
-    }
-
-    const branch = ctx.sessionManager.getBranch();
-    if (
-      handoffState.phase === "compacting" &&
-      handoffState.compactionBaselineEntryCount !== undefined
-    ) {
-      handoffState = branchHasCompactionAfter(branch, handoffState.compactionBaselineEntryCount)
-        ? { ...handoffState, phase: "compacted" }
-        : { ...handoffState, phase: "failed", error: "Interrupted before a successful compaction was recorded." };
-      saveHandoff(handoffState, ctx);
-    } else if (
-      handoffState.phase === "requested" &&
-      branchHasCompactionAfter(branch, handoffState.requestEntryCount)
-    ) {
-      handoffState = { ...handoffState, phase: "compacted" };
-      saveHandoff(handoffState, ctx);
-    }
-
-    if (
-      (handoffState.phase === "resume-pending" || handoffState.phase === "resumed") &&
-      branchHasResumeToken(branch, handoffState.resumeToken)
-    ) {
-      handoffState = { ...handoffState, phase: "resumed" };
-      saveHandoff(handoffState, ctx);
-    } else if (handoffState.phase === "resumed") {
-      // A crash after the phase write but before the resume prompt reached the
-      // transcript is safe to recover from the next explicit input.
-      handoffState = { ...handoffState, phase: "resume-pending" };
-      saveHandoff(handoffState, ctx);
-    }
-
-    handoffPending = handoffNeedsToStayOpen(handoffState);
-    thresholdRequested = true;
-  }
-
-  function finishAcceptedResume(ctx?: ExtensionContext): void {
-    if (!resumeInputAccepted || !handoffState || handoffState.phase !== "resume-pending") return;
-    saveHandoff({ ...handoffState, phase: "resumed" }, ctx);
-    handoffPending = false;
-    resumeInputAccepted = false;
-  }
-
-  function markHandoffCompleted(ctx: ExtensionContext): void {
-    if (
-      handoffState?.phase === "resumed" &&
-      branchHasAssistantAfterResumeToken(ctx.sessionManager.getBranch(), handoffState.resumeToken)
-    ) {
-      saveHandoff({ ...handoffState, phase: "completed" }, ctx);
-      handoffPending = false;
-    }
   }
 
   function renderWidget(ctx: { ui: { setWidget: Function } }, _theme: any) {
@@ -316,68 +176,20 @@ export default function (pi: ExtensionAPI) {
     );
   }
 
-  // Set when ask_question is called; suppresses auto-exit so the session stays
-  // open while it waits for the orchestrator's reply. Cleared when the reply
-  // lands - on `input` (covers a reply steered into the current run) and on
-  // `agent_start` (covers a reply that starts a fresh turn after parking).
-  let awaitingAnswer = false;
-
   // Keep the child tools panel hidden until explicitly requested.
   pi.on("session_start", (_event, ctx) => {
-    latestCtx = ctx;
     recorder.sessionStart();
     const tools = pi.getAllTools();
     toolNames = tools.map((t) => t.name).sort();
     renderWidget(ctx, null);
     if (proactiveConfigError) notify(ctx, `${proactiveConfigError} Using the default 70% checkpoint threshold.`, "warning");
-    recoverHandoff(ctx);
+    handoff.sessionStart(ctx);
   });
 
   pi.on("input", (event, ctx) => {
     recorder.input();
-    // A submitted message is the orchestrator's (or a human's) reply - the
-    // pending ask_question has been answered, however it was delivered. Clear
-    // here, not only on agent_start, because a reply steered in *mid-run* is
-    // absorbed into the current run (pi's `steer` behavior injects it before
-    // the next LLM call): no new agent_start fires, so without this the flag
-    // would stay set and agent_end would park the session as `waiting` even
-    // though the answer already arrived and was consumed.
-    awaitingAnswer = false;
     const text = typeof (event as any)?.text === "string" ? (event as any).text as string : "";
-    if (text.includes("[pi-subagent-checkpoint-request]") || thresholdPromptPending) {
-      thresholdRequestAccepted = true;
-    }
-
-    if (handoffRecoveryBlocked) {
-      // The sidecar cannot be trusted, so never silently exit with a potentially
-      // incomplete task. A new explicit instruction is the recovery boundary.
-      handoffRecoveryBlocked = false;
-      handoffPending = false;
-      thresholdRequested = true;
-      notify(ctx, "Continuing without the unreadable checkpoint; native automatic compaction remains enabled.", "warning");
-      return;
-    }
-
-    const state = handoffState;
-    if (!state || (!handoffNeedsToStayOpen(state) && state.phase !== "failed")) return;
-
-    const token = resumeToken(state);
-    resumeInputAccepted = true;
-    const next = state.phase === "compacting"
-      ? { ...state, resumeToken: token }
-      : { ...state, phase: "resume-pending" as const, resumeToken: token };
-    if (!saveHandoff(next, ctx)) handoffPending = true;
-    if (text.includes(token)) return;
-
-    return {
-      action: "transform" as const,
-      text: [
-        "Continue the child task from this checkpoint. Do not treat the handoff as task completion.",
-        formatCheckpoint(state.checkpoint),
-        `Additional instruction: ${text}`,
-        token,
-      ].join("\n\n"),
-    };
+    return handoff.input(text, (event as any)?.source, ctx);
   });
 
   pi.on("before_agent_start", () => {
@@ -385,163 +197,67 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("agent_start", (_event, ctx) => {
-    // A new turn is starting - any pending ask_question has now been answered
-    // (or superseded), so let auto-exit resume normally when this turn ends.
-    awaitingAnswer = false;
-    finishAcceptedResume(ctx);
+    handoff.agentStart(ctx);
     recorder.agentStart();
   });
 
   pi.on("turn_end", (_event, ctx) => {
-    if (!proactiveConfig.enabled || handoffPending || handoffRecoveryBlocked) return;
-    const usage = ctx.getContextUsage();
-    const next = advanceThresholdLatch(
-      thresholdRequested,
-      usage?.percent,
-      proactiveConfig.thresholdPercent,
-    );
-    thresholdRequested = next.latched;
-    if (!next.request) return;
-
-    // turn_end fires after the assistant's complete tool batch. Steering here
-    // asks for a checkpoint before the next model request without interrupting
-    // an in-flight tool or changing Pi's native automatic compaction path.
-    thresholdPromptPending = true;
-    pi.sendUserMessage(
-      `[pi-subagent-checkpoint-request] Context usage reached ${proactiveConfig.thresholdPercent}%. ` +
-        "Finish the current atomic step, then call self_compact exactly once with a checkpoint containing: goal, task, completed work, in-progress state, decisions, verified tests, and one precise next action. " +
-        "Do not report task completion. The child will continue the task after compaction.",
-      { deliverAs: "steer" },
-    );
+    handoff.turnEnd(ctx);
   });
 
-  pi.on("agent_end", (event, ctx) => {
-    const messages = (event as any).messages as any[] | undefined;
-    // Never shut down while work is in flight: a pending question, a proactive
-    // checkpoint handoff, a queued threshold request, or children whose results
-    // are still outstanding all keep this same process alive. The parent watcher
-    // reports completion only when the Pi process actually exits.
-    const hasPendingChildren = runningChildrenCount() > 0;
-    const keepOpen = handoffPending || handoffRecoveryBlocked || thresholdPromptPending;
-    const shouldExit =
-      !awaitingAnswer &&
-      !keepOpen &&
-      !hasPendingChildren &&
-      autoExit &&
-      shouldAutoExitOnAgentEnd(messages);
+  pi.on("agent_end", (event) => {
+    handoff.agentEnd((event as any).messages as any[] | undefined);
+  });
 
-    if (shouldExit) {
-      markHandoffCompleted(ctx);
-      // Surface stopReason: "error" turns (auto-retry exhausted, provider
-      // overload, etc.) to the parent via the .exit sidecar so the watcher
-      // can report a clear failure with the underlying error message.
-      // Without this the parent would only see exit code 0 and a stale
-      // assistant message, mistaking the crash for a successful completion.
-      const errorInfo = findLatestAssistantError(messages);
-      const sessionFile = process.env.PI_SUBAGENT_SESSION;
-      if (errorInfo && sessionFile) {
-        try {
-          writeFileSync(
-            `${sessionFile}.exit`,
-            JSON.stringify({
-              type: "error",
-              errorMessage: errorInfo.errorMessage,
-              stopReason: errorInfo.stopReason,
-            }),
-          );
-        } catch {
-          // Best effort - even without the sidecar, watcher's session-file
-          // fallback can still recover the errorMessage.
-        }
+  pi.on("agent_settled", (event, ctx) => {
+    const decision = handoff.agentSettled((event as any).aborted === true, ctx);
+    if (decision.kind !== "exit") {
+      recorder.agentEndWaiting();
+      return;
+    }
+
+    // Surface stopReason: "error" turns (auto-retry exhausted, provider
+    // overload, etc.) to the parent via the .exit sidecar so the watcher
+    // can report a clear failure with the underlying error message.
+    // Without this the parent would only see exit code 0 and a stale
+    // assistant message, mistaking the crash for a successful completion.
+    const errorInfo = findLatestAssistantError(handoff.lastRunMessages());
+    if (errorInfo) {
+      try {
+        writeFileSync(
+          `${sessionFile}.exit`,
+          JSON.stringify({
+            type: "error",
+            errorMessage: errorInfo.errorMessage,
+            stopReason: errorInfo.stopReason,
+          }),
+        );
+      } catch {
+        // Best effort - even without the sidecar, watcher's session-file
+        // fallback can still recover the errorMessage.
       }
-
-      recorder.agentEndDone();
-      ctx.shutdown();
-      return;
     }
 
-    recorder.agentEndWaiting();
-  });
-
-  pi.on("agent_settled", (_event, ctx) => {
-    const state = handoffState;
-    if (!extensionActive || !state || state.phase !== "requested") return;
-    // The installed Pi runtime emits agent_settled only after native retry,
-    // compaction, and queued continuation have completed. Its context is idle;
-    // still verify that before invoking the manual compact API (which aborts
-    // active work if called at the wrong time).
-    if (!ctx.isIdle() || ctx.hasPendingMessages()) return;
-
-    const branch = ctx.sessionManager.getBranch();
-    if (branchHasCompactionAfter(branch, state.requestEntryCount)) {
-      const compacted = { ...state, phase: "compacted" as const };
-      if (saveHandoff(compacted, ctx)) dispatchResume(ctx, compacted);
-      return;
-    }
-
-    const baseline = branch.length;
-    const compacting = {
-      ...state,
-      phase: "compacting" as const,
-      compactionBaselineEntryCount: baseline,
-    };
-    if (!saveHandoff(compacting, ctx)) {
-      failHandoff("Could not persist the compaction phase; no compaction was started.", false, ctx);
-      return;
-    }
-
-    ctx.compact({
-      customInstructions:
-        "This is a proactive continuation handoff, not task completion. Preserve the checkpoint and its precise next action in the summary:\n\n" +
-        formatCheckpoint(state.checkpoint),
-      onComplete: () => {
-        if (
-          !extensionActive ||
-          !handoffState ||
-          handoffState.id !== state.id ||
-          (handoffState.phase !== "compacting" && handoffState.phase !== "compacted")
-        ) return;
-        const currentBranch = ctx.sessionManager.getBranch();
-        if (!branchHasCompactionAfter(currentBranch, baseline)) {
-          failHandoff("Pi reported compaction success but no compaction entry was recorded.", false, ctx);
-          return;
-        }
-        const compacted = { ...handoffState, phase: "compacted" as const };
-        if (saveHandoff(compacted, ctx)) dispatchResume(ctx, compacted);
-      },
-      onError: (error) => {
-        if (!extensionActive) return;
-        failHandoff(error.message, /abort|cancel/i.test(error.message), ctx);
-      },
-    });
+    recorder.agentEndDone();
+    ctx.shutdown();
   });
 
   pi.on("session_compact", (event, ctx) => {
-    if (
-      handoffState?.phase === "compacting" &&
-      (event as any).reason === "manual"
-    ) {
-      saveHandoff({ ...handoffState, phase: "compacted" }, ctx);
-    }
+    if ((event as any).reason === "manual") handoff.manualCompactSucceeded(ctx);
   });
 
   pi.on("session_compact_failed", (event, ctx) => {
     const failure = event as any;
-    if (handoffState?.phase === "compacting" && failure.reason === "manual") {
-      failHandoff(
-        failure.errorMessage ?? (failure.aborted ? "Compaction was aborted." : "Compaction failed."),
-        failure.aborted === true,
-        ctx,
-      );
-    }
+    if (failure.reason !== "manual") return;
+    handoff.manualCompactFailed(
+      failure.errorMessage ?? (failure.aborted ? "Compaction was aborted." : "Compaction failed."),
+      failure.aborted === true,
+      ctx,
+    );
   });
 
   pi.on("turn_start", (event, ctx) => {
-    if (thresholdRequestAccepted) {
-      thresholdPromptPending = false;
-      thresholdRequestAccepted = false;
-    }
-    finishAcceptedResume(ctx);
+    handoff.turnStart(ctx);
     recorder.turnStart((event as any).turnIndex);
   });
 
@@ -582,8 +298,7 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("session_shutdown", (event, ctx) => {
-    if ((event as any).reason === "quit") markHandoffCompleted(ctx);
-    extensionActive = false;
+    handoff.sessionShutdown((event as any).reason, ctx);
     recorder.sessionShutdown((event as any).reason);
   });
 
@@ -637,7 +352,7 @@ export default function (pi: ExtensionAPI) {
       // Keep the session open: suppress auto-exit for this turn and park in the
       // "waiting" phase. The parent's watcher picks up the `.ask` signal and
       // notifies the orchestrator, who replies via subagent_message.
-      awaitingAnswer = true;
+      handoff.askQuestion();
       recorder.askQuestion();
       const askData = {
         id: randomUUID(),
@@ -704,34 +419,19 @@ export default function (pi: ExtensionAPI) {
       async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
         const checkpoint = validateProactiveCheckpoint(params);
         if (!checkpoint) throw new Error("self_compact requires a complete, bounded continuation checkpoint.");
-        if (handoffPending) {
+        const handoffId = randomUUID();
+        const rejection = handoff.selfCompact(checkpoint, handoffId, ctx);
+        if (rejection) {
           return {
-            content: [{ type: "text", text: "A checkpoint handoff is already pending; do not request another one." }],
+            content: [{ type: "text", text: rejection }],
             details: { error: "handoff already pending" },
             isError: true,
           };
         }
 
-        const state: ProactiveHandoffState = {
-          version: 1,
-          id: randomUUID(),
-          phase: "requested",
-          createdAt: Date.now(),
-          requestEntryCount: ctx.sessionManager.getBranch().length,
-          checkpoint,
-        };
-        // Save synchronously before asking Pi to end the run. If persistence
-        // fails, fail this tool call instead of risking an untracked handoff.
-        writeHandoffState(sessionFile, state);
-        handoffState = state;
-        handoffPending = true;
-        thresholdRequested = true;
-        thresholdPromptPending = false;
-        resumeDispatching = false;
-
         return Object.assign({
           content: [{ type: "text", text: "Checkpoint saved. The child will compact at the idle boundary and resume the task; do not report completion yet." }],
-          details: { handoffId: state.id },
+          details: { handoffId },
         }, { terminate: true as const });
       },
       renderCall(_args, theme) {

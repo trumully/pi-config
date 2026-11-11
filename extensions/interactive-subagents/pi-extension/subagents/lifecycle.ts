@@ -2,6 +2,7 @@ import { closeSync, existsSync, mkdirSync, openSync, readFileSync, realpathSync,
 import { randomUUID } from "node:crypto";
 import type { CapacityTicket } from "./capacity.ts";
 import { basename, dirname, join, resolve } from "node:path";
+import { createExclusiveFile, isAlreadyExists, withExclusiveFile, type ExclusiveFile } from "./lock.ts";
 
 export interface RunMetadata {
   version: 1;
@@ -102,14 +103,14 @@ export function acquireTranscriptOwnership(params: {
   const path = ownerPath(params.sessionFile);
   const guard = `${path}.guard`;
   mkdirSync(dirname(path), { recursive: true });
-  let guardFd: number;
+  let guardFile: ExclusiveFile;
   try {
-    guardFd = openSync(guard, "wx", 0o600);
-    writeFileSync(guardFd, JSON.stringify({ pid: process.pid }));
-  } catch {
-    throw new Error(`Transcript ownership is being checked by another process (${path}).`);
+    guardFile = createExclusiveFile(guard);
+  } catch (error) {
+    if (isAlreadyExists(error)) throw new Error(`Transcript ownership is being checked by another process (${path}).`);
+    throw new Error(`Could not guard transcript ownership (${path}): ${(error as Error)?.message ?? error}`);
   }
-  try {
+  return withExclusiveFile(guardFile, () => {
     const current = readOwner(path);
     if (current) {
       if (current.state === "launching" || current.runId !== params.expectedPriorRunId ||
@@ -129,24 +130,20 @@ export function acquireTranscriptOwnership(params: {
       herdrAgentName: params.herdrAgentName, surface: params.surface, state: params.state,
     };
     const fd = openSync(path, "wx", 0o600);
-    try { writeFileSync(fd, `${JSON.stringify(owner)}\n`); } finally { closeSync(fd); }
+    try {
+      writeFileSync(fd, `${JSON.stringify(owner)}\n`);
+    } catch (error) {
+      try { closeSync(fd); } catch {}
+      try { unlinkSync(path); } catch {}
+      throw error;
+    }
+    try { closeSync(fd); } catch {}
     return token;
-  } finally {
-    try { closeSync(guardFd); } catch {}
-    try { unlinkSync(guard); } catch {}
-  }
+  });
 }
 
 function withOwnerGuard<T>(path: string, action: () => T): T {
-  const guard = `${path}.guard`;
-  const fd = openSync(guard, "wx", 0o600);
-  try {
-    writeFileSync(fd, JSON.stringify({ pid: process.pid }));
-    return action();
-  } finally {
-    closeSync(fd);
-    unlinkSync(guard);
-  }
+  return withExclusiveFile(createExclusiveFile(`${path}.guard`), action);
 }
 
 export function updateTranscriptOwnership(sessionFile: string, token: string, state: "launching" | "running"): void {
