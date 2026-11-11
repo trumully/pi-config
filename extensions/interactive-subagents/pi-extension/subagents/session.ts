@@ -504,7 +504,16 @@ export interface SessionStats {
  */
 export function summarizeSessionStats(
   sessionFile: string,
-  options: { excludeEntryIds?: ReadonlySet<string>; afterEntryCount?: number } = {},
+  options: {
+    excludeEntryIds?: ReadonlySet<string>;
+    afterEntryCount?: number;
+    /**
+     * Count tool results, compactions and branch summaries that record no
+     * usage as free instead of incomplete. Pi records usage on these only when
+     * they cost something. Assistant turns without usage stay incomplete.
+     */
+    optionalUsageMissingIsFree?: boolean;
+  } = {},
 ): SessionStats | null {
   let entries: SessionEntry[];
   try {
@@ -530,6 +539,10 @@ export function summarizeSessionStats(
     compactionCount: 0,
   };
 
+  const addOptionalUsage = (value: unknown): void => {
+    if (value === undefined && options.optionalUsageMissingIsFree) return;
+    addUsage(value);
+  };
   const addUsage = (value: unknown): void => {
     if (!value || typeof value !== "object") {
       stats.costComplete = false;
@@ -563,8 +576,12 @@ export function summarizeSessionStats(
       if (typeof modelId === "string" && modelId) stats.model = modelId;
       continue;
     }
-    if (entry.type === "usage" || entry.type === "branch_summary" || entry.type === "compaction") {
+    if (entry.type === "usage") {
       addUsage(entry.usage);
+      continue;
+    }
+    if (entry.type === "branch_summary" || entry.type === "compaction") {
+      addOptionalUsage(entry.usage);
       continue;
     }
     if (entry.type !== "message") continue;
@@ -584,7 +601,7 @@ export function summarizeSessionStats(
         stats.contextTokens = total;
       }
     } else if (msg.role === "toolResult") {
-      addUsage(msg.usage);
+      addOptionalUsage(msg.usage);
     }
   }
 

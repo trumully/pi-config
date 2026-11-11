@@ -10,8 +10,8 @@ import { convertToLlm } from "@earendil-works/pi-coding-agent";
 import * as subagentsModule from "../pi-extension/subagents/index.ts";
 import { buildPromptAgentArgs } from "../pi-extension/subagents/herdr.ts";
 import { bindMailbox, createFileDeliveryStore, unbindMailbox } from "../pi-extension/subagents/delivery.ts";
-import { finishRegisteredRun, readNameRegistry, readSubagentLoadout, registerName, writeSubagentLoadout, type SubagentLoadout } from "../pi-extension/subagents/session.ts";
-import { collectSubagentUsage } from "../pi-extension/subagents/usage.ts";
+import { finishRegisteredRun, readNameRegistry, readSubagentLoadout, registerName, summarizeSessionStats, writeSubagentLoadout, type SubagentLoadout } from "../pi-extension/subagents/session.ts";
+import { collectSubagentUsage, readRunUsage } from "../pi-extension/subagents/usage.ts";
 import {
   readClaudeCostEstimate,
   readClaudeUsageSidecar,
@@ -1203,5 +1203,140 @@ describe("interactive subagents smoke tests", () => {
     }, "Worker");
     assert.match(presentation, /NOT complete/);
     assert.doesNotMatch(presentation, /intermediate checkpoint text/);
+  });
+});
+
+describe("per-run widget usage", () => {
+  const usageLine = (id: string, input: number, output: number, cost?: number) => JSON.stringify({
+    type: "usage", id, usage: { input, output, ...(cost === undefined ? {} : { cost: { total: cost } }) },
+  });
+
+  it("counts only this run's Pi usage, excluding pre-run and inherited entries", () => {
+    const directory = mkdtempSync(join(tmpdir(), "run-usage-"));
+    const sessionFile = join(directory, "session.jsonl");
+    writeFileSync(sessionFile, [
+      JSON.stringify({ type: "session", id: "header", inheritedEntryIds: ["inherited-1"] }),
+      usageLine("before-run", 9000, 9000, 9),
+      usageLine("inherited-1", 7000, 7000, 7),
+      usageLine("run-1", 1200, 300, 0.5),
+      usageLine("run-2", 34, 0, 0.25),
+    ].join("\n"));
+    try {
+      assert.deepEqual(readRunUsage({ sessionFile, startEntryCount: 2 }).usage, {
+        inputTokens: 1234, outputTokens: 300, cost: 0.75, costEstimated: false, costComplete: true,
+      });
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("reports no Pi usage before the run records any, and a known zero as zero", () => {
+    const directory = mkdtempSync(join(tmpdir(), "run-usage-"));
+    const sessionFile = join(directory, "session.jsonl");
+    writeFileSync(sessionFile, [JSON.stringify({ type: "session", id: "header" }), usageLine("old", 5, 5, 1)].join("\n"));
+    try {
+      assert.equal(readRunUsage({ sessionFile, startEntryCount: 2 }).usage, null);
+      writeFileSync(sessionFile, [JSON.stringify({ type: "session", id: "header" }), usageLine("zero", 0, 0, 0)].join("\n"));
+      assert.deepEqual(readRunUsage({ sessionFile, startEntryCount: 1 }).usage, {
+        inputTokens: 0, outputTokens: 0, cost: 0, costEstimated: false, costComplete: true,
+      });
+      assert.equal(readRunUsage({ sessionFile: join(directory, "missing.jsonl"), startEntryCount: 0 }).usage, null);
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("keeps missing Pi cost unknown and marks partly costed runs incomplete", () => {
+    const directory = mkdtempSync(join(tmpdir(), "run-usage-"));
+    const sessionFile = join(directory, "session.jsonl");
+    writeFileSync(sessionFile, usageLine("no-cost", 10, 2));
+    try {
+      assert.deepEqual(readRunUsage({ sessionFile, startEntryCount: 0 }).usage, {
+        inputTokens: 10, outputTokens: 2, cost: null, costEstimated: false, costComplete: false,
+      });
+      writeFileSync(sessionFile, [usageLine("no-cost", 10, 2), usageLine("costed", 1, 1, 0.5)].join("\n"));
+      assert.deepEqual(readRunUsage({ sessionFile, startEntryCount: 0 }).usage, {
+        inputTokens: 11, outputTokens: 3, cost: 0.5, costEstimated: false, costComplete: false,
+      });
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("treats tool results and summaries without usage as no spend, but not assistant turns", () => {
+    const directory = mkdtempSync(join(tmpdir(), "run-usage-"));
+    const sessionFile = join(directory, "session.jsonl");
+    const assistant = (id: string, usage?: Record<string, unknown>) => JSON.stringify({
+      type: "message", id, message: {
+        role: "assistant", model: "m",
+        content: [{ type: "toolCall", id: `${id}-call`, name: "read", arguments: { path: "a.ts" } }],
+        ...(usage ? { usage } : {}),
+      },
+    });
+    const costed = (input: number, cost: number) => ({ input, output: 10, cacheRead: 0, cacheWrite: 0, totalTokens: input + 10, cost: { total: cost } });
+    const realistic = [
+      JSON.stringify({ type: "session", id: "header" }),
+      assistant("a1", costed(100, 0.25)),
+      JSON.stringify({ type: "message", id: "r1", message: { role: "toolResult", toolCallId: "a1-call", toolName: "read", content: [{ type: "text", text: "ok" }] } }),
+      JSON.stringify({ type: "compaction", id: "c1", summary: "earlier work", firstKeptEntryId: "a1", tokensBefore: 5000 }),
+      JSON.stringify({ type: "branch_summary", id: "b1", summary: "abandoned branch", fromId: "a1" }),
+      assistant("a2", costed(200, 0.5)),
+    ];
+    writeFileSync(sessionFile, realistic.join("\n"));
+    try {
+      assert.deepEqual(readRunUsage({ sessionFile, startEntryCount: 1 }).usage, {
+        inputTokens: 300, outputTokens: 20, cost: 0.75, costEstimated: false, costComplete: true,
+      });
+      // Footer and result accounting keep their stricter default.
+      assert.equal(summarizeSessionStats(sessionFile)?.costComplete, false);
+      writeFileSync(sessionFile, [...realistic, assistant("a3")].join("\n"));
+      assert.equal(readRunUsage({ sessionFile, startEntryCount: 1 }).usage?.costComplete, false, "assistant turn without usage");
+      writeFileSync(sessionFile, [...realistic, assistant("a4", { input: 5, output: 5 })].join("\n"));
+      assert.equal(readRunUsage({ sessionFile, startEntryCount: 1 }).usage?.costComplete, false, "usage without cost.total");
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("reuses the cached read until the transcript changes and keeps the last value through a partial write", () => {
+    const directory = mkdtempSync(join(tmpdir(), "run-usage-"));
+    const sessionFile = join(directory, "session.jsonl");
+    writeFileSync(sessionFile, usageLine("a", 100, 10, 0.5));
+    try {
+      const first = readRunUsage({ sessionFile, startEntryCount: 0 });
+      assert.equal(readRunUsage({ sessionFile, startEntryCount: 0 }, first), first);
+      writeFileSync(sessionFile, [usageLine("a", 100, 10, 0.5), "{\"type\":\"usa"].join("\n"));
+      const partial = readRunUsage({ sessionFile, startEntryCount: 0 }, first);
+      assert.deepEqual(partial.usage, first.usage);
+      writeFileSync(sessionFile, [usageLine("a", 100, 10, 0.5), usageLine("b", 50, 5, 0.25)].join("\n"));
+      assert.equal(readRunUsage({ sessionFile, startEntryCount: 0 }, partial).usage?.inputTokens, 150);
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("reads Claude live estimates without inventing token counts", () => {
+    const directory = mkdtempSync(join(tmpdir(), "run-usage-"));
+    const usageFile = join(directory, "child.usage.json");
+    const sessionFile = join(directory, "not-pi.jsonl");
+    try {
+      assert.equal(readRunUsage({ sessionFile, startEntryCount: 0, usageFile }).usage, null);
+      writeClaudeUsageSidecar(usageFile, {
+        estimated: true, cost: 0.42, costAvailable: true, inputTokens: null, outputTokens: null,
+        cacheReadTokens: null, cacheWriteTokens: null, sessionId: null,
+      }, "statusline");
+      assert.deepEqual(readRunUsage({ sessionFile, startEntryCount: 0, usageFile }).usage, {
+        inputTokens: null, outputTokens: null, cost: 0.42, costEstimated: true, costComplete: true,
+      });
+      writeClaudeUsageSidecar(usageFile, {
+        estimated: true, cost: null, costAvailable: false, inputTokens: 16, outputTokens: 9,
+        cacheReadTokens: null, cacheWriteTokens: null, sessionId: null,
+      });
+      assert.deepEqual(readRunUsage({ sessionFile, startEntryCount: 0, usageFile }).usage, {
+        inputTokens: 16, outputTokens: 9, cost: null, costEstimated: true, costComplete: false,
+      });
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
   });
 });

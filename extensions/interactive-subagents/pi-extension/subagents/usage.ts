@@ -65,6 +65,105 @@ function readCachedStats(sessionFile: string): SessionStats | null {
   }
 }
 
+/**
+ * Usage shown on one subagent's widget row, excluding its descendants.
+ * Pi usage covers only the current launch or resume. Claude usage is what the
+ * per-launch sidecar reports; after a resume its cost may include earlier
+ * spend in the same Claude session.
+ */
+export interface RunUsage {
+  /** Null when the source reports no cumulative count, as with live Claude snapshots. */
+  inputTokens: number | null;
+  outputTokens: number | null;
+  /** Null when no cost is known. Never treat as zero. */
+  cost: number | null;
+  /** True for Claude Code list-price estimates. */
+  costEstimated: boolean;
+  /** False when some usage in this run has no known cost. */
+  costComplete: boolean;
+}
+
+export interface RunUsageSource {
+  sessionFile: string;
+  /** Transcript entries that existed before this run started. */
+  startEntryCount: number;
+  /** Claude usage sidecar. When set, the Pi transcript is not read. */
+  usageFile?: string;
+}
+
+export interface RunUsageSnapshot {
+  file: string;
+  startEntryCount: number;
+  size: number;
+  mtimeMs: number;
+  usage: RunUsage | null;
+}
+
+function piRunUsage(sessionFile: string, startEntryCount: number): RunUsage | null | undefined {
+  const stats = summarizeSessionStats(sessionFile, {
+    afterEntryCount: startEntryCount,
+    excludeEntryIds: getInheritedSessionEntryIds(sessionFile),
+    optionalUsageMissingIsFree: true,
+  });
+  // Undefined: unreadable now, usually a partly written trailing line.
+  if (!stats) return undefined;
+  if (!stats.usageAvailable && !stats.costAvailable) return null;
+  return {
+    inputTokens: stats.inputAvailable ? stats.inputTokens : null,
+    outputTokens: stats.outputAvailable ? stats.outputTokens : null,
+    cost: stats.costAvailable ? stats.cost : null,
+    costEstimated: false,
+    costComplete: stats.costComplete !== false,
+  };
+}
+
+/**
+ * The sidecar as reported, without attempting run-local attribution. Live
+ * snapshots normally carry a cost estimate but no token totals; final totals
+ * arrive at completion, when the widget row usually goes away.
+ */
+function claudeRunUsage(usageFile: string): RunUsage | null {
+  const sidecar = readClaudeUsageSidecar(usageFile);
+  if (!sidecar) return null;
+  const cost = sidecar.costAvailable ? sidecar.cost : null;
+  return {
+    inputTokens: sidecar.inputTokens,
+    outputTokens: sidecar.outputTokens,
+    cost,
+    costEstimated: sidecar.estimated,
+    costComplete: cost !== null,
+  };
+}
+
+/**
+ * Read one run's own usage for the status widget. Pass the previous snapshot
+ * to skip parsing when the source file has not changed.
+ */
+export function readRunUsage(source: RunUsageSource, previous?: RunUsageSnapshot): RunUsageSnapshot {
+  const file = source.usageFile ?? source.sessionFile;
+  const sameRun = previous?.file === file && previous.startEntryCount === source.startEntryCount;
+  const carried = sameRun ? previous.usage : null;
+  let size: number;
+  let mtimeMs: number;
+  try {
+    ({ size, mtimeMs } = statSync(file));
+  } catch {
+    return { file, startEntryCount: source.startEntryCount, size: -1, mtimeMs: -1, usage: carried };
+  }
+  if (sameRun && previous.size === size && previous.mtimeMs === mtimeMs) return previous;
+
+  const usage = source.usageFile
+    ? claudeRunUsage(source.usageFile)
+    : piRunUsage(source.sessionFile, source.startEntryCount);
+  return {
+    file,
+    startEntryCount: source.startEntryCount,
+    size,
+    mtimeMs,
+    usage: usage === undefined ? carried : usage,
+  };
+}
+
 /** Capture full-session usage at completion, independently of footer polling. */
 export function captureSubagentUsage(sessionFile: string): void {
   readCachedStats(sessionFile);
