@@ -46,7 +46,6 @@ Restart Pi after updating. `settings.example.json` is a reference, not a setting
 | [`rpiv-ask-user-question`](https://www.npmjs.com/package/@juicesharp/rpiv-ask-user-question) | Structured question tool. |
 | [`pi-web-access`](https://www.npmjs.com/package/pi-web-access) | Web access for researcher profiles. |
 | [`pi-codemode-compact`](https://www.npmjs.com/package/pi-codemode-compact) | Compact display of codemode calls and results (not context compaction). |
-| [`rpiv-todo`](https://www.npmjs.com/package/@juicesharp/rpiv-todo) | Session-local task list for multistep work. |
 
 ## Workflow
 
