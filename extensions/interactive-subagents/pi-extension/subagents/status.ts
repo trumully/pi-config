@@ -231,39 +231,65 @@ export function createStatusState(params: {
   };
 }
 
+type PresentObservation = Extract<StatusObservation, { snapshot: "present" }>;
+type ProblemObservation = Exclude<StatusObservation, { snapshot: "present" }>;
+
+export type StatusOrderingVerdict = "accept" | "stale" | "overridden";
+
+export function statusOrderingVerdict(
+  state: SubagentStatusState,
+  updatedAt: number,
+  sequence: number,
+): StatusOrderingVerdict {
+  const lastAt = state.lastActivityAtMs;
+  const lastSequence = state.lastActivitySequence;
+  if (lastAt != null && (
+    updatedAt < lastAt ||
+    (updatedAt === lastAt && lastSequence != null && sequence < lastSequence)
+  )) return "stale";
+
+  const overrideAt = state.localOverrideAtMs;
+  const overrideSequence = state.localOverrideSequence;
+  if (overrideAt != null && (
+    updatedAt < overrideAt ||
+    (updatedAt === overrideAt && overrideSequence != null && sequence <= overrideSequence)
+  )) return "overridden";
+
+  return "accept";
+}
+
+function recordSnapshotProblem(
+  state: SubagentStatusState,
+  observation: ProblemObservation,
+  now: number,
+): SubagentStatusState {
+  return {
+    ...state,
+    firstObservationAtMs: state.firstObservationAtMs ?? now,
+    snapshotState: observation.snapshot,
+    snapshotProblemSinceMs: state.snapshotProblemSinceMs ?? now,
+    snapshotError: observation.snapshotError ?? null,
+  };
+}
+
 export function observeStatus(
   state: SubagentStatusState,
   observation: StatusObservation,
   now: number,
 ): SubagentStatusState {
   if (state.source === "claude") return state;
+  if (observation.snapshot !== "present") return recordSnapshotProblem(state, observation, now);
+  if (statusOrderingVerdict(state, observation.updatedAt, observation.sequence) !== "accept") return state;
+  return acceptActivity(state, observation, now);
+}
 
-  if (observation.snapshot !== "present") {
-    return {
-      ...state,
-      firstObservationAtMs: state.firstObservationAtMs ?? now,
-      snapshotState: observation.snapshot,
-      snapshotProblemSinceMs: state.snapshotProblemSinceMs ?? now,
-      snapshotError: observation.snapshotError ?? null,
-    };
-  }
-
+function acceptActivity(
+  state: SubagentStatusState,
+  observation: PresentObservation,
+  now: number,
+): SubagentStatusState {
   const updatedAt = observation.updatedAt;
   const sequence = observation.sequence;
-  const lastActivityAtMs = state.lastActivityAtMs;
-  const lastActivitySequence = state.lastActivitySequence;
-  const olderThanLastActivity = lastActivityAtMs != null && (
-    updatedAt < lastActivityAtMs ||
-    (updatedAt === lastActivityAtMs && lastActivitySequence != null && sequence < lastActivitySequence)
-  );
-  if (olderThanLastActivity) return state;
-
-  const blockedByLocalOverride = state.localOverrideAtMs != null && (
-    updatedAt < state.localOverrideAtMs ||
-    (updatedAt === state.localOverrideAtMs && state.localOverrideSequence != null && sequence <= state.localOverrideSequence)
-  );
-  if (blockedByLocalOverride) return state;
-
   const phase = observation.phase;
   const activeNow = phase === "active" || observation.active === true;
   const activeSinceMs = activeNow
@@ -293,22 +319,35 @@ export function observeStatus(
   };
 }
 
-export function forceStatusAfterInterrupt(state: SubagentStatusState, now: number): SubagentStatusState {
+export type LocalStatusAction = "interrupt" | "steer";
+
+const LOCAL_ACTION_LABELS: Record<LocalStatusAction, { latestEvent: string; activityLabel: string }> = {
+  interrupt: { latestEvent: "interrupt_requested", activityLabel: "interrupted" },
+  steer: { latestEvent: "steer_requested", activityLabel: "steered" },
+};
+
+function applyLocalOverride(
+  state: SubagentStatusState,
+  now: number,
+  action: LocalStatusAction,
+): SubagentStatusState {
   if (state.source === "claude") return state;
 
+  const at = Math.max(now, state.lastActivityAtMs ?? now);
+  const { latestEvent, activityLabel } = LOCAL_ACTION_LABELS[action];
   return {
     ...state,
     firstObservationAtMs: state.firstObservationAtMs ?? now,
-    lastActivityAtMs: now,
-    localOverrideAtMs: now,
+    lastActivityAtMs: at,
+    localOverrideAtMs: at,
     localOverrideSequence: state.lastActivitySequence,
     activeNow: false,
     activeSinceMs: null,
     activeScope: null,
-    waitingSinceMs: now,
+    waitingSinceMs: at,
     phase: "waiting",
-    latestEvent: "interrupt_requested",
-    activityLabel: "interrupted",
+    latestEvent,
+    activityLabel,
     snapshotState: "present",
     snapshotProblemSinceMs: null,
     snapshotError: null,
@@ -316,14 +355,34 @@ export function forceStatusAfterInterrupt(state: SubagentStatusState, now: numbe
   };
 }
 
-function classifyProblemState(state: SubagentStatusState, now: number): Pick<StatusSnapshot, "kind" | "statusLabel"> {
+export function forceStatusAfterInterrupt(state: SubagentStatusState, now: number): SubagentStatusState {
+  return applyLocalOverride(state, now, "interrupt");
+}
+
+export function forceStatusAfterSteer(state: SubagentStatusState, now: number): SubagentStatusState {
+  return applyLocalOverride(state, now, "steer");
+}
+
+type ClassifiedStatus = Pick<StatusSnapshot, "kind" | "statusLabel">;
+
+function startupWindowExpired(state: SubagentStatusState, now: number): boolean {
+  const referenceMs = state.firstObservationAtMs ?? state.startTimeMs;
+  return Math.max(0, now - referenceMs) >= SNAPSHOT_STALLED_AFTER_MS;
+}
+
+function classifyPresentState(state: SubagentStatusState, now: number): ClassifiedStatus {
+  if (state.activeNow || state.phase === "active") return { kind: "active", statusLabel: null };
+  if (state.phase === "waiting") return { kind: "waiting", statusLabel: null };
+  if (state.phase === "done") return { kind: "waiting", statusLabel: "done" };
+  return { kind: startupWindowExpired(state, now) ? "stalled" : "starting", statusLabel: null };
+}
+
+function classifyProblemState(state: SubagentStatusState, now: number): ClassifiedStatus {
   const problemLabel = snapshotProblemLabel(state.snapshotState);
   const hasValidSnapshot = state.lastActivityAtMs != null;
 
   if (!hasValidSnapshot) {
-    const referenceMs = state.firstObservationAtMs ?? state.startTimeMs;
-    const elapsedMs = Math.max(0, now - referenceMs);
-    return elapsedMs >= SNAPSHOT_STALLED_AFTER_MS
+    return startupWindowExpired(state, now)
       ? { kind: "stalled", statusLabel: problemLabel }
       : { kind: "starting", statusLabel: null };
   }
@@ -365,28 +424,9 @@ export function classifyStatus(state: SubagentStatusState, now: number): StatusS
     };
   }
 
-  let kind: SubagentStatusKind;
-  let statusLabel: string | null = null;
-
-  if (state.snapshotState === "present") {
-    if (state.phase === "active" || state.activeNow) {
-      kind = "active";
-    } else if (state.phase === "waiting") {
-      kind = "waiting";
-    } else if (state.phase === "done") {
-      kind = "waiting";
-      statusLabel = "done";
-    } else {
-      const referenceMs = state.firstObservationAtMs ?? state.startTimeMs;
-      const elapsedSinceObservationMs = Math.max(0, now - referenceMs);
-      kind = elapsedSinceObservationMs >= SNAPSHOT_STALLED_AFTER_MS ? "stalled" : "starting";
-      statusLabel = null;
-    }
-  } else {
-    const classified = classifyProblemState(state, now);
-    kind = classified.kind;
-    statusLabel = classified.statusLabel;
-  }
+  const { kind, statusLabel } = state.snapshotState === "present"
+    ? classifyPresentState(state, now)
+    : classifyProblemState(state, now);
 
   const activeDurationText = state.activeSinceMs == null
     ? null
@@ -416,6 +456,14 @@ export function classifyStatus(state: SubagentStatusState, now: number): StatusS
   };
 }
 
+export function statusNotification(
+  latched: SubagentStatusKind,
+  computed: SubagentStatusKind,
+): SubagentStatusTransition {
+  if (latched !== "stalled") return computed === "stalled" ? "stalled" : null;
+  return computed === "active" || computed === "waiting" ? "recovered" : null;
+}
+
 export function advanceStatusState(
   state: SubagentStatusState,
   now: number,
@@ -425,12 +473,7 @@ export function advanceStatusState(
   transition: SubagentStatusTransition;
 } {
   const snapshot = classifyStatus(state, now);
-  const transition =
-    state.currentKind !== "stalled" && snapshot.kind === "stalled"
-      ? "stalled"
-      : state.currentKind === "stalled" && (snapshot.kind === "active" || snapshot.kind === "waiting")
-        ? "recovered"
-        : null;
+  const transition = statusNotification(state.currentKind, snapshot.kind);
 
   return {
     snapshot,

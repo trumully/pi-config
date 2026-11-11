@@ -27,15 +27,9 @@ export type SubagentActivityPhase = (typeof ACTIVITY_PHASES)[number];
 export type SubagentActivityScope = (typeof ACTIVITY_SCOPES)[number];
 export type SubagentActivityEvent = (typeof ACTIVITY_EVENTS)[number];
 
-export interface TodoProgress {
-  completed: number;
-  total: number;
-}
-
 export interface SubagentProgress {
   updatedAt: number;
   activeChildren: number;
-  todos?: TodoProgress;
 }
 
 // A separate heartbeat keeps passive counts fresh without resetting stall detection.
@@ -72,7 +66,7 @@ export type ActivityReadResult =
 export type SubagentShutdownReason = "quit" | "reload" | "new" | "resume" | "fork";
 
 export interface SubagentActivityRecorder {
-  reportProgress(activeChildren: number, todos?: TodoProgress): void;
+  reportProgress(activeChildren: number): void;
   sessionStart(): void;
   input(): void;
   beforeAgentStart(): void;
@@ -195,15 +189,9 @@ function isCount(value: unknown): value is number {
   return Number.isSafeInteger(value) && (value as number) >= 0;
 }
 
-export function isTodoProgress(value: unknown): value is TodoProgress {
-  const todos = requireObject(value);
-  return !!todos && isCount(todos.completed) && isCount(todos.total) && todos.completed <= todos.total;
-}
-
 export function isSubagentProgress(value: unknown): value is SubagentProgress {
   const progress = requireObject(value);
-  return !!progress && Number.isFinite(progress.updatedAt) && isCount(progress.activeChildren)
-    && (progress.todos === undefined || isTodoProgress(progress.todos));
+  return !!progress && Number.isFinite(progress.updatedAt) && isCount(progress.activeChildren);
 }
 
 export function progressIndicators(progress: SubagentProgress | undefined, now: number): string[] {
@@ -211,7 +199,6 @@ export function progressIndicators(progress: SubagentProgress | undefined, now: 
     || now - progress.updatedAt > SUBAGENT_PROGRESS_STALE_MS) return [];
   const indicators: string[] = [];
   if (progress.activeChildren > 0) indicators.push(`↳ ${progress.activeChildren}`);
-  if (progress.todos && progress.todos.total > 0) indicators.push(`● ${progress.todos.completed}/${progress.todos.total}`);
   return indicators;
 }
 
@@ -232,6 +219,30 @@ export function readSubagentActivityFile(
   return validateActivity(parsed, expectedRunningChildId);
 }
 
+// Windows will not replace a file that another process has open (EPERM/EACCES/EBUSY).
+// The parent polls the activity file every second, and scanners open new files too.
+// Bursts of child events can land inside one such window and would otherwise exhaust
+// MAX_WRITE_FAILURES at once, disabling the recorder before it writes "done".
+const LOCKED_FILE_CODES = new Set(["EPERM", "EACCES", "EBUSY"]);
+const RENAME_RETRY_DELAYS_MS = [1, 2, 4, 8, 16, 32, 64, 128];
+
+function sleepSync(ms: number): void {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+}
+
+function renameReplacingLockedFile(from: string, to: string): void {
+  for (let attempt = 0; ; attempt++) {
+    try {
+      renameSync(from, to);
+      return;
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code;
+      if (attempt >= RENAME_RETRY_DELAYS_MS.length || !code || !LOCKED_FILE_CODES.has(code)) throw error;
+      sleepSync(RENAME_RETRY_DELAYS_MS[attempt]);
+    }
+  }
+}
+
 export function writeSubagentActivityFile(activityFile: string, activity: SubagentActivityState): void {
   const dir = dirname(activityFile);
   mkdirSync(dir, { recursive: true });
@@ -239,7 +250,7 @@ export function writeSubagentActivityFile(activityFile: string, activity: Subage
 
   try {
     writeFileSync(tempFile, `${JSON.stringify(activity)}\n`, "utf8");
-    renameSync(tempFile, activityFile);
+    renameReplacingLockedFile(tempFile, activityFile);
   } catch (error) {
     try {
       unlinkSync(tempFile);
@@ -275,7 +286,66 @@ function createNoopRecorder(): SubagentActivityRecorder {
   };
 }
 
-function clearActiveState(activity: SubagentActivityState): void {
+type ToolActivityEvent =
+  | "tool_execution_start"
+  | "tool_call"
+  | "tool_execution_update"
+  | "tool_result"
+  | "tool_execution_end";
+
+export type ActivityInput =
+  | { event: "session_start" }
+  | { event: "input" }
+  | { event: "before_agent_start" }
+  | { event: "agent_start" }
+  | { event: "agent_end"; outcome: "waiting" | "done" }
+  | { event: "turn_start" | "turn_end"; turnIndex?: number }
+  | { event: "before_provider_request" }
+  | { event: "after_provider_response" }
+  | { event: "message_update"; messageEventType?: string }
+  | { event: ToolActivityEvent; toolCallId?: string; toolName?: string }
+  | { event: "ask_question" }
+  | { event: "session_shutdown"; reason: SubagentShutdownReason };
+
+export type ActivityRest = { phase: "starting" } | { phase: "waiting"; since: number };
+
+export interface ActivityMachineState {
+  snapshot: SubagentActivityState;
+  rest: ActivityRest;
+}
+
+export type ActivityEffect =
+  | { kind: "write"; flush: "immediate" | "throttled"; final: boolean }
+  | { kind: "stop" };
+
+export function initialActivityMachine(runningChildId: string, createdAt: number): ActivityMachineState {
+  return {
+    snapshot: {
+      version: 1,
+      runningChildId,
+      createdAt,
+      updatedAt: createdAt,
+      sequence: 0,
+      latestEvent: "session_start",
+      phase: "starting",
+      agentActive: false,
+      turnActive: false,
+      providerActive: false,
+      toolActive: false,
+    },
+    rest: { phase: "starting" },
+  };
+}
+
+function derivedScope(activity: SubagentActivityState): SubagentActivityScope | undefined {
+  if (activity.toolActive) return "tool";
+  if (activity.providerActive) return "provider";
+  if (activity.turnActive) return "turn";
+  if (activity.agentActive) return "agent";
+  return undefined;
+}
+
+function clearExecution(activity: SubagentActivityState): void {
   activity.agentActive = false;
   activity.turnActive = false;
   activity.providerActive = false;
@@ -284,28 +354,7 @@ function clearActiveState(activity: SubagentActivityState): void {
   delete activity.activeSince;
 }
 
-function refreshActiveScope(activity: SubagentActivityState): void {
-  const activeScope: SubagentActivityScope | undefined = activity.toolActive
-    ? "tool"
-    : activity.providerActive
-      ? "provider"
-      : activity.turnActive
-        ? "turn"
-        : activity.agentActive
-          ? "agent"
-          : undefined;
-
-  if (activeScope) {
-    activity.phase = "active";
-    activity.activeScope = activeScope;
-    return;
-  }
-
-  delete activity.activeScope;
-  delete activity.activeSince;
-}
-
-function markActive(
+function activate(
   activity: SubagentActivityState,
   scope: SubagentActivityScope,
   now: number,
@@ -317,6 +366,152 @@ function markActive(
   delete activity.waitingSince;
 }
 
+function enterRest(activity: SubagentActivityState, rest: ActivityRest): void {
+  clearExecution(activity);
+  activity.phase = rest.phase;
+  if (rest.phase === "waiting") activity.waitingSince = rest.since;
+  else delete activity.waitingSince;
+}
+
+function settle(activity: SubagentActivityState, rest: ActivityRest): void {
+  const scope = derivedScope(activity);
+  if (!scope) {
+    enterRest(activity, rest);
+    return;
+  }
+  activity.phase = "active";
+  activity.activeScope = scope;
+}
+
+function finish(activity: SubagentActivityState): void {
+  clearExecution(activity);
+  activity.phase = "done";
+  delete activity.waitingSince;
+}
+
+export function transitionActivity(
+  machine: ActivityMachineState,
+  input: ActivityInput,
+  now: number,
+): { machine: ActivityMachineState; effect: ActivityEffect } {
+  if (input.event === "session_shutdown" && input.reason !== "quit") {
+    return { machine, effect: { kind: "stop" } };
+  }
+
+  const next: SubagentActivityState = {
+    ...machine.snapshot,
+    latestEvent: input.event,
+    updatedAt: now,
+    sequence: machine.snapshot.sequence + 1,
+  };
+  let rest = machine.rest;
+  let flush: "immediate" | "throttled" = "immediate";
+  let final = false;
+
+  switch (input.event) {
+    case "session_start":
+      rest = { phase: "starting" };
+      enterRest(next, rest);
+      break;
+    case "input":
+      break;
+    case "before_agent_start":
+    case "agent_start":
+      next.agentActive = true;
+      activate(next, "agent", now);
+      break;
+    case "agent_end":
+      if (input.outcome === "done") {
+        finish(next);
+        final = true;
+      } else {
+        rest = { phase: "waiting", since: now };
+        enterRest(next, rest);
+      }
+      break;
+    case "ask_question":
+      // The subagent paused to ask the orchestrator a question. Park it in the
+      // "waiting" phase (do NOT disable the recorder) so the status widget shows
+      // it as waiting and recording resumes when the answer arrives.
+      rest = { phase: "waiting", since: now };
+      enterRest(next, rest);
+      break;
+    case "turn_start":
+      next.agentActive = true;
+      next.turnActive = true;
+      if (input.turnIndex != null) next.turnIndex = input.turnIndex;
+      activate(next, next.toolActive || next.providerActive ? next.activeScope ?? "turn" : "turn", now);
+      break;
+    case "turn_end":
+      next.turnActive = false;
+      next.providerActive = false;
+      next.toolActive = false;
+      if (input.turnIndex != null) next.turnIndex = input.turnIndex;
+      settle(next, rest);
+      break;
+    case "before_provider_request":
+      next.providerActive = true;
+      activate(next, "provider", now, true);
+      break;
+    case "after_provider_response":
+      next.providerActive = false;
+      settle(next, rest);
+      break;
+    case "message_update":
+      flush = "throttled";
+      next.agentActive = true;
+      next.turnActive = true;
+      next.messageEventType = input.messageEventType;
+      if (!next.toolActive) activate(next, "streaming", now);
+      break;
+    case "tool_execution_start":
+      next.toolActive = true;
+      next.toolCallId = input.toolCallId;
+      next.toolName = input.toolName;
+      next.toolStartedAt = now;
+      activate(next, "tool", now, true);
+      break;
+    case "tool_call":
+    case "tool_execution_update":
+      if (input.event === "tool_execution_update") flush = "throttled";
+      next.toolActive = true;
+      next.toolCallId = input.toolCallId ?? next.toolCallId;
+      next.toolName = input.toolName ?? next.toolName;
+      activate(next, "tool", now);
+      break;
+    case "tool_result":
+      next.toolCallId = input.toolCallId ?? next.toolCallId;
+      next.toolName = input.toolName ?? next.toolName;
+      settle(next, rest);
+      break;
+    case "tool_execution_end":
+      next.toolActive = false;
+      next.toolCallId = input.toolCallId ?? next.toolCallId;
+      next.toolName = input.toolName ?? next.toolName;
+      next.toolEndedAt = now;
+      settle(next, rest);
+      break;
+    case "session_shutdown":
+      finish(next);
+      final = true;
+      break;
+  }
+
+  return { machine: { snapshot: next, rest }, effect: { kind: "write", flush, final } };
+}
+
+type FlushState =
+  | { kind: "idle" }
+  | { kind: "scheduled"; timer: ReturnType<typeof setTimeout> };
+
+type DisableReason = "final" | "replaced" | "write-failed";
+
+type RecorderMode =
+  | { kind: "recording"; flush: FlushState; failures: number; lastFlushAt: number }
+  | { kind: "disabled"; reason: DisableReason };
+
+type RecordingMode = Extract<RecorderMode, { kind: "recording" }>;
+
 export function createSubagentActivityRecorder(params: {
   runningChildId?: string;
   activityFile?: string;
@@ -327,224 +522,100 @@ export function createSubagentActivityRecorder(params: {
   if (!runningChildId || !activityFile) return createNoopRecorder();
 
   const now = params.now ?? (() => Date.now());
-  const createdAt = now();
-  const activity: SubagentActivityState = {
-    version: 1,
-    runningChildId,
-    createdAt,
-    updatedAt: createdAt,
-    sequence: 0,
-    latestEvent: "session_start",
-    phase: "starting",
-    agentActive: false,
-    turnActive: false,
-    providerActive: false,
-    toolActive: false,
-  };
+  let machine = initialActivityMachine(runningChildId, now());
+  let mode: RecorderMode = { kind: "recording", flush: { kind: "idle" }, failures: 0, lastFlushAt: 0 };
 
-  let disabled = false;
-  let failureCount = 0;
-  let lastFlushAt = 0;
-  let pendingFlush: ReturnType<typeof setTimeout> | null = null;
-
-  function clearPendingFlush(): void {
-    if (!pendingFlush) return;
-    clearTimeout(pendingFlush);
-    pendingFlush = null;
+  function recording(): RecordingMode | null {
+    return mode.kind === "recording" ? mode : null;
   }
 
-  function disable(): void {
-    disabled = true;
-    clearPendingFlush();
+  function disable(reason: DisableReason): void {
+    const current = recording();
+    if (!current) return;
+    if (current.flush.kind === "scheduled") clearTimeout(current.flush.timer);
+    mode = { kind: "disabled", reason };
   }
 
-  function flushNow(): void {
-    if (disabled) return;
+  function write(): void {
+    const current = recording();
+    if (!current) return;
     try {
-      writeSubagentActivityFile(activityFile, activity);
-      lastFlushAt = now();
-      failureCount = 0;
+      writeSubagentActivityFile(activityFile, machine.snapshot);
+      current.lastFlushAt = now();
+      current.failures = 0;
     } catch {
-      failureCount += 1;
-      if (failureCount >= MAX_WRITE_FAILURES) disable();
+      current.failures += 1;
+      if (current.failures >= MAX_WRITE_FAILURES) disable("write-failed");
     }
   }
 
-  function scheduleFlush(): void {
-    if (disabled || pendingFlush) return;
+  function flushImmediately(): void {
+    const current = recording();
+    if (!current) return;
+    if (current.flush.kind === "scheduled") {
+      clearTimeout(current.flush.timer);
+      current.flush = { kind: "idle" };
+    }
+    write();
+  }
 
-    const remainingMs = Math.max(0, ACTIVITY_UPDATE_THROTTLE_MS - (now() - lastFlushAt));
+  function flushThrottled(): void {
+    const current = recording();
+    if (!current || current.flush.kind === "scheduled") return;
+    const remainingMs = Math.max(0, ACTIVITY_UPDATE_THROTTLE_MS - (now() - current.lastFlushAt));
     if (remainingMs === 0) {
-      flushNow();
+      write();
       return;
     }
-
-    pendingFlush = setTimeout(() => {
-      pendingFlush = null;
-      flushNow();
-    }, remainingMs);
+    current.flush = {
+      kind: "scheduled",
+      timer: setTimeout(() => {
+        current.flush = { kind: "idle" };
+        write();
+      }, remainingMs),
+    };
   }
 
-  function record(
-    latestEvent: SubagentActivityEvent,
-    update: (current: SubagentActivityState, now: number) => void,
-    flush: "immediate" | "throttled",
-  ): void {
-    if (disabled) return;
-    if (flush === "immediate") clearPendingFlush();
-
-    const observedAt = now();
-    activity.latestEvent = latestEvent;
-    activity.updatedAt = observedAt;
-    activity.sequence += 1;
-    update(activity, observedAt);
-
-    if (flush === "immediate") flushNow();
-    else scheduleFlush();
-  }
-
-  function markDone(latestEvent: SubagentActivityEvent): void {
-    record(latestEvent, (current) => {
-      current.phase = "done";
-      clearActiveState(current);
-      delete current.waitingSince;
-    }, "immediate");
-    disable();
+  function dispatch(input: ActivityInput): void {
+    if (!recording()) return;
+    const step = transitionActivity(machine, input, now());
+    machine = step.machine;
+    if (step.effect.kind === "stop") {
+      disable("replaced");
+      return;
+    }
+    if (step.effect.flush === "immediate") flushImmediately();
+    else flushThrottled();
+    if (step.effect.final) disable("final");
   }
 
   return {
-    reportProgress(activeChildren, todos) {
-      if (disabled) return;
-      const progress = { updatedAt: now(), activeChildren, ...(todos ? { todos: { ...todos } } : {}) };
+    reportProgress(activeChildren) {
+      if (!recording()) return;
+      const progress = { updatedAt: now(), activeChildren };
       if (!isSubagentProgress(progress)) return;
-      activity.progress = progress;
+      machine = { ...machine, snapshot: { ...machine.snapshot, progress } };
       // Do not advance activity.updatedAt, sequence, latestEvent, or phase:
       // a healthy reporter does not mean the agent itself is making progress.
-      flushNow();
+      write();
     },
-    sessionStart() {
-      record("session_start", (current) => {
-        current.phase = "starting";
-        clearActiveState(current);
-        delete current.waitingSince;
-      }, "immediate");
-    },
-    input() {
-      record("input", () => {}, "immediate");
-    },
-    beforeAgentStart() {
-      record("before_agent_start", (current, observedAt) => {
-        current.agentActive = true;
-        markActive(current, "agent", observedAt);
-      }, "immediate");
-    },
-    agentStart() {
-      record("agent_start", (current, observedAt) => {
-        current.agentActive = true;
-        markActive(current, "agent", observedAt);
-      }, "immediate");
-    },
-    agentEndWaiting() {
-      record("agent_end", (current, observedAt) => {
-        clearActiveState(current);
-        current.phase = "waiting";
-        current.waitingSince = observedAt;
-      }, "immediate");
-    },
-    agentEndDone() {
-      markDone("agent_end");
-    },
-    turnStart(turnIndex) {
-      record("turn_start", (current, observedAt) => {
-        current.agentActive = true;
-        current.turnActive = true;
-        if (turnIndex != null) current.turnIndex = turnIndex;
-        markActive(current, current.toolActive || current.providerActive ? current.activeScope ?? "turn" : "turn", observedAt);
-      }, "immediate");
-    },
-    turnEnd(turnIndex) {
-      record("turn_end", (current) => {
-        current.turnActive = false;
-        current.providerActive = false;
-        current.toolActive = false;
-        if (turnIndex != null) current.turnIndex = turnIndex;
-        refreshActiveScope(current);
-      }, "immediate");
-    },
-    beforeProviderRequest() {
-      record("before_provider_request", (current, observedAt) => {
-        current.providerActive = true;
-        markActive(current, "provider", observedAt, true);
-      }, "immediate");
-    },
-    afterProviderResponse() {
-      record("after_provider_response", (current) => {
-        current.providerActive = false;
-        refreshActiveScope(current);
-      }, "immediate");
-    },
-    messageUpdate(messageEventType) {
-      record("message_update", (current, observedAt) => {
-        current.agentActive = true;
-        current.turnActive = true;
-        current.messageEventType = messageEventType;
-        if (!current.toolActive) markActive(current, "streaming", observedAt);
-      }, "throttled");
-    },
-    toolExecutionStart(toolCallId, toolName) {
-      record("tool_execution_start", (current, observedAt) => {
-        current.toolActive = true;
-        current.toolCallId = toolCallId;
-        current.toolName = toolName;
-        current.toolStartedAt = observedAt;
-        markActive(current, "tool", observedAt, true);
-      }, "immediate");
-    },
-    toolCall(toolCallId, toolName) {
-      record("tool_call", (current, observedAt) => {
-        current.toolActive = true;
-        current.toolCallId = toolCallId ?? current.toolCallId;
-        current.toolName = toolName ?? current.toolName;
-        markActive(current, "tool", observedAt);
-      }, "immediate");
-    },
-    toolExecutionUpdate(toolCallId, toolName) {
-      record("tool_execution_update", (current, observedAt) => {
-        current.toolActive = true;
-        current.toolCallId = toolCallId ?? current.toolCallId;
-        current.toolName = toolName ?? current.toolName;
-        markActive(current, "tool", observedAt);
-      }, "throttled");
-    },
-    toolResult(toolCallId, toolName) {
-      record("tool_result", (current) => {
-        current.toolCallId = toolCallId ?? current.toolCallId;
-        current.toolName = toolName ?? current.toolName;
-        refreshActiveScope(current);
-      }, "immediate");
-    },
-    toolExecutionEnd(toolCallId, toolName) {
-      record("tool_execution_end", (current, observedAt) => {
-        current.toolActive = false;
-        current.toolCallId = toolCallId ?? current.toolCallId;
-        current.toolName = toolName ?? current.toolName;
-        current.toolEndedAt = observedAt;
-        refreshActiveScope(current);
-      }, "immediate");
-    },
-    askQuestion() {
-      // The subagent paused to ask the orchestrator a question. Park it in the
-      // "waiting" phase (do NOT disable the recorder) so the status widget shows
-      // it as waiting and recording resumes when the answer arrives.
-      record("ask_question", (current, observedAt) => {
-        clearActiveState(current);
-        current.phase = "waiting";
-        current.waitingSince = observedAt;
-      }, "immediate");
-    },
-    sessionShutdown(reason) {
-      if (reason === "quit") markDone("session_shutdown");
-      else disable();
-    },
+    sessionStart: () => dispatch({ event: "session_start" }),
+    input: () => dispatch({ event: "input" }),
+    beforeAgentStart: () => dispatch({ event: "before_agent_start" }),
+    agentStart: () => dispatch({ event: "agent_start" }),
+    agentEndWaiting: () => dispatch({ event: "agent_end", outcome: "waiting" }),
+    agentEndDone: () => dispatch({ event: "agent_end", outcome: "done" }),
+    turnStart: (turnIndex) => dispatch({ event: "turn_start", turnIndex }),
+    turnEnd: (turnIndex) => dispatch({ event: "turn_end", turnIndex }),
+    beforeProviderRequest: () => dispatch({ event: "before_provider_request" }),
+    afterProviderResponse: () => dispatch({ event: "after_provider_response" }),
+    messageUpdate: (messageEventType) => dispatch({ event: "message_update", messageEventType }),
+    toolExecutionStart: (toolCallId, toolName) => dispatch({ event: "tool_execution_start", toolCallId, toolName }),
+    toolCall: (toolCallId, toolName) => dispatch({ event: "tool_call", toolCallId, toolName }),
+    toolExecutionUpdate: (toolCallId, toolName) => dispatch({ event: "tool_execution_update", toolCallId, toolName }),
+    toolResult: (toolCallId, toolName) => dispatch({ event: "tool_result", toolCallId, toolName }),
+    toolExecutionEnd: (toolCallId, toolName) => dispatch({ event: "tool_execution_end", toolCallId, toolName }),
+    askQuestion: () => dispatch({ event: "ask_question" }),
+    sessionShutdown: (reason) => dispatch({ event: "session_shutdown", reason }),
   };
 }

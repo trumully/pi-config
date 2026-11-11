@@ -104,11 +104,31 @@ export interface MailboxBinding {
 /** In a single runtime, re-send an unacknowledged item only after this long idle. */
 const RETRY_AFTER_MS = 30_000;
 
+/**
+ * What this runtime remembers about one item. No entry means PENDING: the item
+ * may have a mailbox file but has not been handed to Pi in this runtime.
+ * IN_FLIGHT means handed to Pi and not yet seen in the transcript. ACKNOWLEDGED
+ * means a persisted entry was seen, so the item is never sent again here, even
+ * if removing its file failed.
+ */
+type ItemState = { phase: "in-flight"; sentAt: number } | { phase: "acknowledged" };
+
 let binding: MailboxBinding | null = null;
-/** Items handed to Pi in this runtime and not yet observed as persisted. */
-const inFlight = new Map<string, number>();
-const acknowledged = new Set<string>();
+const itemStates = new Map<string, ItemState>();
 const warned = new Set<string>();
+
+function markInFlight(id: string, now: number): void {
+  itemStates.set(id, { phase: "in-flight", sentAt: now });
+}
+
+function markAcknowledged(id: string): void {
+  itemStates.set(id, { phase: "acknowledged" });
+}
+
+/** IN_FLIGHT -> PENDING. Never reopens an acknowledged item. */
+function returnToPending(id: string): void {
+  if (itemStates.get(id)?.phase === "in-flight") itemStates.delete(id);
+}
 let retryTimer: ReturnType<typeof setTimeout> | undefined;
 
 function cancelRetry(): void {
@@ -135,18 +155,14 @@ export function warnOnce(key: string, message: string): void {
 
 export function bindMailbox(next: MailboxBinding): void {
   cancelRetry();
-  if (binding?.parentSessionId !== next.parentSessionId) {
-    inFlight.clear();
-    acknowledged.clear();
-  }
+  if (binding?.parentSessionId !== next.parentSessionId) itemStates.clear();
   binding = next;
 }
 
 export function unbindMailbox(): void {
   cancelRetry();
   binding = null;
-  inFlight.clear();
-  acknowledged.clear();
+  itemStates.clear();
 }
 
 export function currentParentSessionId(): string | null {
@@ -170,21 +186,21 @@ function acknowledge(target: MailboxBinding, id: string): void {
     // Still suppressed: the persisted entry is checked before any resend.
     warnOnce(`remove:${id}`, `Could not remove acknowledged mailbox item ${id}: ${error?.message ?? String(error)}`);
   }
-  acknowledged.add(id);
-  inFlight.delete(id);
+  markAcknowledged(id);
 }
 
+/** Send only PENDING items; IN_FLIGHT and ACKNOWLEDGED items are left alone. */
 function dispatch(target: MailboxBinding, item: DeliveryItem, persisted: Set<string>): void {
   if (persisted.has(item.id)) {
     acknowledge(target, item.id);
     return;
   }
-  if (acknowledged.has(item.id) || inFlight.has(item.id)) return;
-  inFlight.set(item.id, Date.now());
+  if (itemStates.has(item.id)) return;
+  markInFlight(item.id, Date.now());
   try {
     target.send(item);
   } catch (error: any) {
-    inFlight.delete(item.id);
+    returnToPending(item.id);
     warnOnce(`send:${item.id}`, `Could not hand mailbox item ${item.id} to Pi; it stays pending: ${error?.message ?? String(error)}`);
   }
   scheduleRetry();
@@ -199,10 +215,10 @@ export type EnqueueResult = "queued" | "duplicate" | "unbound";
 export function enqueueDelivery(item: Omit<DeliveryItem, "createdAt">): EnqueueResult {
   const target = binding;
   if (!target) return "unbound";
-  if (acknowledged.has(item.id)) return "duplicate";
+  if (itemStates.get(item.id)?.phase === "acknowledged") return "duplicate";
   const full: DeliveryItem = { ...item, details: { ...item.details, deliveryId: item.id }, createdAt: Date.now() };
   const created = target.store.put(full);
-  if (!created && inFlight.has(item.id)) return "duplicate";
+  if (!created && itemStates.get(item.id)?.phase === "in-flight") return "duplicate";
   const persisted = persistedDeliveryIds(target);
   if (persisted.has(item.id)) {
     acknowledge(target, item.id);
@@ -255,10 +271,10 @@ export function replayPending(now = Date.now()): void {
   scheduleRetry();
   const persisted = persistedDeliveryIds(target);
   for (const item of items) {
-    const sentAt = inFlight.get(item.id);
-    if (sentAt !== undefined && !persisted.has(item.id)) {
-      if (now - sentAt < RETRY_AFTER_MS) continue;
-      inFlight.delete(item.id);
+    const state = itemStates.get(item.id);
+    if (state?.phase === "in-flight" && !persisted.has(item.id)) {
+      if (now - state.sentAt < RETRY_AFTER_MS) continue;
+      returnToPending(item.id);
     }
     dispatch(target, item, persisted);
   }

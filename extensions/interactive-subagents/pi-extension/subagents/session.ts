@@ -13,6 +13,7 @@ import { randomUUID } from "node:crypto";
 import { dirname, join } from "node:path";
 import type { RunMetadata } from "./lifecycle.ts";
 import { processIsAlive } from "./lifecycle.ts";
+import { createExclusiveFile, isAlreadyExists, withExclusiveFile, type ExclusiveFile } from "./lock.ts";
 
 export interface SessionEntry {
   type: string;
@@ -221,25 +222,25 @@ export function readNameRegistry(artifactDir: string): NameRegistry {
  * Writes atomically (temp file + rename) so a concurrent reader never sees a
  * partial registry.
  */
+const REMOVE_ENTRY = Symbol("remove registry entry");
+
 function mutateRegisteredName(
   artifactDir: string,
   name: string,
-  mutate: (entry: NameRegistryEntry | null) => NameRegistryEntry | null,
-): NameRegistryEntry | null {
+  mutate: (entry: NameRegistryEntry | null) => NameRegistryEntry | null | typeof REMOVE_ENTRY,
+): NameRegistryEntry | typeof REMOVE_ENTRY | null {
   mkdirSync(artifactDir, { recursive: true });
   const p = nameRegistryPath(artifactDir);
   const lock = `${p}.lock`;
   const guard = `${lock}.guard`;
-  let guardFd: number;
+  let guardFile: ExclusiveFile;
   try {
-    guardFd = openSync(guard, "wx", 0o600);
-    writeFileSync(guardFd, `${JSON.stringify({ pid: process.pid })}\n`);
-  } catch {
-    throw new Error(`Subagent registry is locked by another writer (${lock}).`);
+    guardFile = createExclusiveFile(guard);
+  } catch (error) {
+    if (isAlreadyExists(error)) throw new Error(`Subagent registry is locked by another writer (${lock}).`);
+    throw new Error(`Could not lock subagent registry (${lock}): ${(error as Error)?.message ?? error}`);
   }
-  let lockFd: number | undefined;
-  let ownsLock = false;
-  try {
+  return withExclusiveFile(guardFile, () => {
     if (existsSync(lock)) {
       let ownerPid: number | undefined;
       try { ownerPid = JSON.parse(readFileSync(lock, "utf8")).pid; } catch {}
@@ -247,23 +248,18 @@ function mutateRegisteredName(
       if (processIsAlive(ownerPid!)) throw new Error(`Subagent registry is locked by process ${ownerPid}.`);
       unlinkSync(lock);
     }
-    lockFd = openSync(lock, "wx", 0o600);
-    ownsLock = true;
-    writeFileSync(lockFd, `${JSON.stringify({ pid: process.pid })}\n`);
-    const registry = readNameRegistry(artifactDir);
-    const entry = mutate(registry[name] ?? null);
-    if (!entry) return null;
-    registry[name] = entry;
-    const tmp = `${p}.tmp-${process.pid}-${Math.random().toString(16).slice(2, 8)}`;
-    writeFileSync(tmp, JSON.stringify(registry, null, 2), "utf8");
-    renameSync(tmp, p);
-    return entry;
-  } finally {
-    if (lockFd !== undefined) closeSync(lockFd);
-    if (ownsLock) try { unlinkSync(lock); } catch {}
-    try { closeSync(guardFd); } catch {}
-    try { unlinkSync(guard); } catch {}
-  }
+    return withExclusiveFile(createExclusiveFile(lock), () => {
+      const registry = readNameRegistry(artifactDir);
+      const entry = mutate(registry[name] ?? null);
+      if (!entry) return null;
+      if (entry === REMOVE_ENTRY) delete registry[name];
+      else registry[name] = entry;
+      const tmp = `${p}.tmp-${process.pid}-${Math.random().toString(16).slice(2, 8)}`;
+      writeFileSync(tmp, JSON.stringify(registry, null, 2), "utf8");
+      renameSync(tmp, p);
+      return entry;
+    });
+  });
 }
 
 export function registerName(artifactDir: string, name: string, entry: NameRegistryEntry): void {
@@ -287,6 +283,14 @@ export function updateRegisteredRun(
 ): boolean {
   return !!mutateRegisteredName(artifactDir, name, (current) =>
     current?.runId === runId ? { ...current, ...updates } : null,
+  );
+}
+
+export function restoreRegisteredRun(
+  artifactDir: string, name: string, runId: string, prior: NameRegistryEntry | null,
+): boolean {
+  return !!mutateRegisteredName(artifactDir, name, (current) =>
+    current?.runId === runId ? (prior ?? REMOVE_ENTRY) : null,
   );
 }
 
