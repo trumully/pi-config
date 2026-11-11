@@ -7,11 +7,12 @@ import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { convertToLlm } from "@earendil-works/pi-coding-agent";
+import { stripTerminalSequences, visibleWidth } from "@earendil-works/pi-tui";
 import * as subagentsModule from "../pi-extension/subagents/index.ts";
 import { buildPromptAgentArgs } from "../pi-extension/subagents/herdr.ts";
 import { bindMailbox, createFileDeliveryStore, unbindMailbox } from "../pi-extension/subagents/delivery.ts";
-import { finishRegisteredRun, readNameRegistry, readSubagentLoadout, registerName, writeSubagentLoadout, type SubagentLoadout } from "../pi-extension/subagents/session.ts";
-import { collectSubagentUsage } from "../pi-extension/subagents/usage.ts";
+import { finishRegisteredRun, readNameRegistry, readSubagentLoadout, registerName, summarizeSessionStats, writeSubagentLoadout, type SubagentLoadout } from "../pi-extension/subagents/session.ts";
+import { collectSubagentUsage, readRunUsage } from "../pi-extension/subagents/usage.ts";
 import {
   readClaudeCostEstimate,
   readClaudeUsageSidecar,
@@ -26,6 +27,8 @@ import {
   type SubagentActivityState,
 } from "../pi-extension/subagents/activity.ts";
 import { registerSubagentProgress } from "../pi-extension/subagents/progress.ts";
+import { parseStatusConfig } from "../pi-extension/subagents/status.ts";
+import { renderCompactWidgetRows } from "../pi-extension/subagents/widget.ts";
 
 function createMockExtensionApi() {
   const registeredTools: any[] = [];
@@ -56,6 +59,36 @@ function registerSubagents() {
   const harness = createMockExtensionApi();
   (subagentsModule as any).default(harness.api);
   return harness;
+}
+
+/** Emits real SGR sequences so width checks see styled text; records calls. */
+function ansiTheme() {
+  const calls: Array<{ method: string; color?: unknown; text: string }> = [];
+  const colors = new Proxy({}, { get: (_target, token) => ({ kind: "rgb", r: 250, g: 250, b: 250, token }) });
+  return {
+    calls,
+    colors,
+    fg(color: string, text: string) { calls.push({ method: "fg", color, text }); return `\x1b[38;5;1m${text}\x1b[39m`; },
+    bg(color: string, text: string) { calls.push({ method: "bg", color, text }); return `\x1b[48;5;1m${text}\x1b[49m`; },
+    bold(text: string) { calls.push({ method: "bold", text }); return `\x1b[1m${text}\x1b[22m`; },
+    style(text: string, options: any) { calls.push({ method: "style", color: options, text }); return `\x1b[1;48;5;2m${text}\x1b[0m`; },
+  };
+}
+
+function widgetAgent(overrides: Record<string, unknown> = {}, state: Record<string, unknown> = {}) {
+  const now = Date.now();
+  return {
+    id: "widget-test", name: "WorkerName", agent: "worker", startTime: now - 96_000,
+    startEntryCount: 0, sessionFile: "", ...overrides,
+    statusState: {
+      source: "pi", startTimeMs: now - 96_000, firstObservationAtMs: now - 20_000,
+      lastActivityAtMs: now - 8_000, lastActivitySequence: 1, localOverrideAtMs: null,
+      localOverrideSequence: null, activeNow: false, activeSinceMs: null, activeScope: null,
+      waitingSinceMs: now - 8_000, phase: "waiting", latestEvent: null, activityLabel: null,
+      snapshotState: "present", snapshotProblemSinceMs: null, snapshotError: null,
+      currentKind: "waiting", ...state,
+    },
+  };
 }
 
 function createTheme() {
@@ -1063,50 +1096,22 @@ describe("interactive subagents smoke tests", () => {
     assert.match(blankTask.content[0].text, /task is required and must not be blank/);
   });
 
-  it("keeps usage metrics out of the compact widget while preserving status and profile", () => {
+  it("shows this run's tokens and cost in the compact widget after status and profile", () => {
     const testApi = (subagentsModule as any).__test__;
     const directory = mkdtempSync(join(tmpdir(), "subagent-widget-"));
     const sessionFile = join(directory, "session.jsonl");
     writeFileSync(sessionFile, [
       JSON.stringify({ type: "usage", id: "usage-1", usage: { input: 12345, output: 6789, cost: { total: 0.123 } } }),
-      JSON.stringify({ type: "compaction", id: "compaction-1" }),
     ].join("\n"));
 
     try {
-      const now = Date.now();
-      const rendered = testApi.renderSubagentWidgetLines([{
-        id: "widget-test",
-        name: "extension-readmes",
-        agent: "worker",
-        startTime: now - 96_000,
-        startEntryCount: 0,
-        sessionFile,
-        statusState: {
-          source: "pi",
-          startTimeMs: now - 96_000,
-          firstObservationAtMs: now - 20_000,
-          lastActivityAtMs: now - 8_000,
-          lastActivitySequence: 1,
-          localOverrideAtMs: null,
-          localOverrideSequence: null,
-          activeNow: false,
-          activeSinceMs: null,
-          activeScope: null,
-          waitingSinceMs: now - 8_000,
-          phase: "waiting",
-          latestEvent: null,
-          activityLabel: null,
-          snapshotState: "present",
-          snapshotProblemSinceMs: null,
-          snapshotError: null,
-          currentKind: "waiting",
-        },
-      }], 120, "full").join("\n");
-
-      assert.match(rendered, /extension-readmes \(worker\)/);
-      assert.match(rendered, /\d\d:\d\d/);
-      assert.match(rendered, /waiting 8s/);
-      assert.doesNotMatch(rendered, /tokens|cost|compaction|12\.3k|6\.8k|0\.123/i);
+      const agent = widgetAgent({ name: "extension-readmes", sessionFile });
+      testApi.refreshWidgetUsage(agent);
+      const lines = testApi.renderSubagentWidgetLines([agent], 120, "compact", ansiTheme());
+      assert.equal(lines.length, 1);
+      assert.ok(visibleWidth(lines[0]) <= 120);
+      const plain = stripTerminalSequences(lines[0]);
+      assert.match(plain, /^ worker  \S extension-readmes waiting +01:36  ↑12k ↓6\.8k  \$0\.1230$/);
     } finally {
       rmSync(directory, { recursive: true, force: true });
     }
@@ -1203,5 +1208,305 @@ describe("interactive subagents smoke tests", () => {
     }, "Worker");
     assert.match(presentation, /NOT complete/);
     assert.doesNotMatch(presentation, /intermediate checkpoint text/);
+  });
+});
+
+describe("subagent-status widget", () => {
+  it("defaults status icons to portable Unicode and accepts only unicode, nerd, or ascii", () => {
+    assert.equal(parseStatusConfig({ status: { enabled: true } }).icons, "unicode");
+    assert.equal(parseStatusConfig({ status: { enabled: true, icons: "nerd" } }).icons, "nerd");
+    assert.equal(parseStatusConfig({ status: { enabled: true, icons: "ascii" } }).icons, "ascii");
+    assert.throws(
+      () => parseStatusConfig({ status: { enabled: true, icons: "emoji" } }, "cfg.json"),
+      /Invalid subagent status config in cfg\.json: status\.icons must be "unicode", "nerd", or "ascii"/,
+    );
+    assert.throws(
+      () => parseStatusConfig({ status: { enabled: true, glyphs: "nerd" } }, "cfg.json"),
+      /unsupported key\(s\): glyphs/,
+    );
+  });
+});
+
+describe("per-run widget usage", () => {
+  const usageLine = (id: string, input: number, output: number, cost?: number) => JSON.stringify({
+    type: "usage", id, usage: { input, output, ...(cost === undefined ? {} : { cost: { total: cost } }) },
+  });
+
+  it("counts only this run's Pi usage, excluding pre-run and inherited entries", () => {
+    const directory = mkdtempSync(join(tmpdir(), "run-usage-"));
+    const sessionFile = join(directory, "session.jsonl");
+    writeFileSync(sessionFile, [
+      JSON.stringify({ type: "session", id: "header", inheritedEntryIds: ["inherited-1"] }),
+      usageLine("before-run", 9000, 9000, 9),
+      usageLine("inherited-1", 7000, 7000, 7),
+      usageLine("run-1", 1200, 300, 0.5),
+      usageLine("run-2", 34, 0, 0.25),
+    ].join("\n"));
+    try {
+      assert.deepEqual(readRunUsage({ sessionFile, startEntryCount: 2 }).usage, {
+        inputTokens: 1234, outputTokens: 300, cost: 0.75, costEstimated: false, costComplete: true,
+      });
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("reports no Pi usage before the run records any, and a known zero as zero", () => {
+    const directory = mkdtempSync(join(tmpdir(), "run-usage-"));
+    const sessionFile = join(directory, "session.jsonl");
+    writeFileSync(sessionFile, [JSON.stringify({ type: "session", id: "header" }), usageLine("old", 5, 5, 1)].join("\n"));
+    try {
+      assert.equal(readRunUsage({ sessionFile, startEntryCount: 2 }).usage, null);
+      writeFileSync(sessionFile, [JSON.stringify({ type: "session", id: "header" }), usageLine("zero", 0, 0, 0)].join("\n"));
+      assert.deepEqual(readRunUsage({ sessionFile, startEntryCount: 1 }).usage, {
+        inputTokens: 0, outputTokens: 0, cost: 0, costEstimated: false, costComplete: true,
+      });
+      assert.equal(readRunUsage({ sessionFile: join(directory, "missing.jsonl"), startEntryCount: 0 }).usage, null);
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("keeps missing Pi cost unknown and marks partly costed runs incomplete", () => {
+    const directory = mkdtempSync(join(tmpdir(), "run-usage-"));
+    const sessionFile = join(directory, "session.jsonl");
+    writeFileSync(sessionFile, usageLine("no-cost", 10, 2));
+    try {
+      assert.deepEqual(readRunUsage({ sessionFile, startEntryCount: 0 }).usage, {
+        inputTokens: 10, outputTokens: 2, cost: null, costEstimated: false, costComplete: false,
+      });
+      writeFileSync(sessionFile, [usageLine("no-cost", 10, 2), usageLine("costed", 1, 1, 0.5)].join("\n"));
+      assert.deepEqual(readRunUsage({ sessionFile, startEntryCount: 0 }).usage, {
+        inputTokens: 11, outputTokens: 3, cost: 0.5, costEstimated: false, costComplete: false,
+      });
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("treats tool results and summaries without usage as no spend, but not assistant turns", () => {
+    const directory = mkdtempSync(join(tmpdir(), "run-usage-"));
+    const sessionFile = join(directory, "session.jsonl");
+    const assistant = (id: string, usage?: Record<string, unknown>) => JSON.stringify({
+      type: "message", id, message: {
+        role: "assistant", model: "m",
+        content: [{ type: "toolCall", id: `${id}-call`, name: "read", arguments: { path: "a.ts" } }],
+        ...(usage ? { usage } : {}),
+      },
+    });
+    const costed = (input: number, cost: number) => ({ input, output: 10, cacheRead: 0, cacheWrite: 0, totalTokens: input + 10, cost: { total: cost } });
+    const realistic = [
+      JSON.stringify({ type: "session", id: "header" }),
+      assistant("a1", costed(100, 0.25)),
+      JSON.stringify({ type: "message", id: "r1", message: { role: "toolResult", toolCallId: "a1-call", toolName: "read", content: [{ type: "text", text: "ok" }] } }),
+      JSON.stringify({ type: "compaction", id: "c1", summary: "earlier work", firstKeptEntryId: "a1", tokensBefore: 5000 }),
+      JSON.stringify({ type: "branch_summary", id: "b1", summary: "abandoned branch", fromId: "a1" }),
+      assistant("a2", costed(200, 0.5)),
+    ];
+    writeFileSync(sessionFile, realistic.join("\n"));
+    try {
+      assert.deepEqual(readRunUsage({ sessionFile, startEntryCount: 1 }).usage, {
+        inputTokens: 300, outputTokens: 20, cost: 0.75, costEstimated: false, costComplete: true,
+      });
+      // Footer and result accounting keep their stricter default.
+      assert.equal(summarizeSessionStats(sessionFile)?.costComplete, false);
+      writeFileSync(sessionFile, [...realistic, assistant("a3")].join("\n"));
+      assert.equal(readRunUsage({ sessionFile, startEntryCount: 1 }).usage?.costComplete, false, "assistant turn without usage");
+      writeFileSync(sessionFile, [...realistic, assistant("a4", { input: 5, output: 5 })].join("\n"));
+      assert.equal(readRunUsage({ sessionFile, startEntryCount: 1 }).usage?.costComplete, false, "usage without cost.total");
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("reuses the cached read until the transcript changes and keeps the last value through a partial write", () => {
+    const directory = mkdtempSync(join(tmpdir(), "run-usage-"));
+    const sessionFile = join(directory, "session.jsonl");
+    writeFileSync(sessionFile, usageLine("a", 100, 10, 0.5));
+    try {
+      const first = readRunUsage({ sessionFile, startEntryCount: 0 });
+      assert.equal(readRunUsage({ sessionFile, startEntryCount: 0 }, first), first);
+      writeFileSync(sessionFile, [usageLine("a", 100, 10, 0.5), "{\"type\":\"usa"].join("\n"));
+      const partial = readRunUsage({ sessionFile, startEntryCount: 0 }, first);
+      assert.deepEqual(partial.usage, first.usage);
+      writeFileSync(sessionFile, [usageLine("a", 100, 10, 0.5), usageLine("b", 50, 5, 0.25)].join("\n"));
+      assert.equal(readRunUsage({ sessionFile, startEntryCount: 0 }, partial).usage?.inputTokens, 150);
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("reads Claude live estimates without inventing token counts", () => {
+    const directory = mkdtempSync(join(tmpdir(), "run-usage-"));
+    const usageFile = join(directory, "child.usage.json");
+    const sessionFile = join(directory, "not-pi.jsonl");
+    try {
+      assert.equal(readRunUsage({ sessionFile, startEntryCount: 0, usageFile }).usage, null);
+      writeClaudeUsageSidecar(usageFile, {
+        estimated: true, cost: 0.42, costAvailable: true, inputTokens: null, outputTokens: null,
+        cacheReadTokens: null, cacheWriteTokens: null, sessionId: null,
+      }, "statusline");
+      assert.deepEqual(readRunUsage({ sessionFile, startEntryCount: 0, usageFile }).usage, {
+        inputTokens: null, outputTokens: null, cost: 0.42, costEstimated: true, costComplete: true,
+      });
+      writeClaudeUsageSidecar(usageFile, {
+        estimated: true, cost: null, costAvailable: false, inputTokens: 16, outputTokens: 9,
+        cacheReadTokens: null, cacheWriteTokens: null, sessionId: null,
+      });
+      assert.deepEqual(readRunUsage({ sessionFile, startEntryCount: 0, usageFile }).usage, {
+        inputTokens: 16, outputTokens: 9, cost: null, costEstimated: true, costComplete: false,
+      });
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("compact widget layout", () => {
+  const knownUsage = { inputTokens: 12345, outputTokens: 6789, cost: 0.123, costEstimated: false, costComplete: true };
+  const row = (overrides: Record<string, unknown> = {}) => ({
+    profile: "worker", name: "WorkerName", kind: "active", activity: "reading files", elapsed: "01:36",
+    usage: knownUsage, ...overrides,
+  });
+  const plainRows = (rows: any[], width: number, icons = "unicode") => {
+    const lines = renderCompactWidgetRows(rows, width, ansiTheme(), icons);
+    for (const line of lines) assert.ok(visibleWidth(line) <= width, `${visibleWidth(line)} > ${width}: ${JSON.stringify(line)}`);
+    return lines.map((line: string) => stripTerminalSequences(line));
+  };
+
+  it("drops activity and metrics before profile, name, or status on narrow terminals", () => {
+    assert.match(plainRows([row()], 120)[0], /^ worker  ⟳ WorkerName active · reading files +01:36  ↑12k ↓6\.8k  \$0\.1230$/);
+    assert.match(plainRows([row()], 40)[0], /^ worker  ⟳ WorkerName active +01:36$/);
+    const tiny = plainRows([row()], 24)[0];
+    assert.match(tiny, /^ worker  ⟳ Work\S*… active$/);
+    assert.doesNotMatch(tiny, /01:36|↑|\$/);
+  });
+
+  it("keeps the full state and a useful name ahead of a long profile badge", () => {
+    const researcher = (overrides: Record<string, unknown> = {}) => row({ profile: "researcher", ...overrides });
+    // Room to spare: full badge, glyph, name and state.
+    assert.match(plainRows([researcher()], 34)[0], /^ researcher  ⟳ WorkerName active/);
+    for (const kind of ["active", "starting", "stalled", "waiting"]) {
+      for (const width of [18, 20, 22, 24, 26]) {
+        const line = plainRows([researcher({ kind })], width)[0];
+        assert.ok(line.endsWith(` ${kind}`), `width ${width} ${kind}: ${JSON.stringify(line)}`);
+        const name = line.match(/(\S+) \S+$/)![1];
+        assert.ok(visibleWidth(name) >= 6, `width ${width} ${kind}: name ${JSON.stringify(name)}`);
+      }
+    }
+    assert.match(plainRows([researcher()], 18)[0], /^⟳ WorkerNa… active$/);
+    assert.match(plainRows([researcher()], 20)[0], /^⟳ WorkerName active/);
+    assert.match(plainRows([researcher({ kind: "starting" })], 18)[0], /^○ Worker… starting$/);
+    // Without room for the full badge, the name comes first and the badge is shortened.
+    assert.match(plainRows([researcher()], 25)[0], /^ re…  ⟳ WorkerName active$/);
+    // Wide names keep a useful prefix.
+    assert.match(plainRows([researcher({ name: "日本語の名前です" })], 18)[0], /^⟳ 日本語の… active$/);
+    // Impossible widths degrade deterministically, state first.
+    assert.equal(plainRows([researcher({ kind: "starting" })], 12)[0], "Wo… starting");
+    assert.equal(plainRows([researcher({ kind: "starting" })], 8)[0], "starting");
+    assert.equal(plainRows([researcher({ kind: "starting" })], 5)[0], "star…");
+  });
+
+  it("strips terminal controls from agent text and keeps wide text within the width", () => {
+    const hostile = row({ profile: "日本語", name: "\x1b[31mEvil\x1b[0m\nName", activity: "\x1b]0;pwned\x07tool\tcall" });
+    for (const width of [60, 20, 12, 5]) {
+      const raw = renderCompactWidgetRows([hostile], width, ansiTheme(), "unicode")[0];
+      assert.ok(visibleWidth(raw) <= width, `width ${width}: ${JSON.stringify(raw)}`);
+      assert.doesNotMatch(raw, /\x1b\]|\x1b\[31m|\x07|[\n\t]/);
+    }
+    assert.match(stripTerminalSequences(renderCompactWidgetRows([hostile], 80, ansiTheme(), "unicode")[0]), /^ 日本語  ⟳ Evil Name active · tool call +01:36/);
+  });
+
+  it("draws status glyphs from the configured icon set", () => {
+    const kinds = ["active", "running", "waiting", "starting", "stalled"].map((kind) => row({ kind, activity: "tool call" }));
+    const privateUse = /[\u{F0000}-\u{FFFFD}\u{E000}-\u{F8FF}]/u;
+
+    const unicode = plainRows(kinds, 120, "unicode");
+    assert.deepEqual(unicode.map((line) => line.split(" ")[3]), ["⟳", "⟳", "○", "○", "⟳"]);
+    for (const line of unicode) assert.doesNotMatch(line, privateUse);
+
+    const ascii = plainRows(kinds, 120, "ascii");
+    assert.deepEqual(ascii.map((line) => line.split(" ")[3]), ["*", "*", "o", ".", "!"]);
+    assert.match(ascii[0], /active - tool call +01:36  in 12k out 6\.8k  \$0\.1230$/);
+    for (const line of [...ascii, ...plainRows(kinds, 24, "ascii")]) assert.match(line, /^[\x20-\x7e]*$/);
+
+    const nerd = plainRows(kinds, 120, "nerd").map((line) => line.split(" ")[3].codePointAt(0)!);
+    for (const active of nerd.slice(0, 2)) assert.ok(active >= 0xF0A9E && active <= 0xF0AA5, active.toString(16));
+    assert.deepEqual(nerd.slice(2), [0xF03E5, 0xF0A9E, 0xF0159]);
+  });
+
+  it("styles the widget through the theme Pi passes to the widget factory", () => {
+    const testApi = (subagentsModule as any).__test__;
+    const agent = widgetAgent();
+    const forwarded = ansiTheme();
+    const component = testApi.subagentWidgetFactory(() => [agent])(undefined, forwarded);
+    assert.ok(component.render(100).length > 0);
+    assert.ok(forwarded.calls.length > 0, "the factory theme was not used");
+
+    for (const mode of ["compact", "minimal", "full"]) {
+      const theme = ansiTheme();
+      const output = testApi.renderSubagentWidgetLines([agent], 100, mode, theme).join("\n");
+      assert.doesNotMatch(output, /\x1b\[38;2;/, `${mode} uses hard-coded colors`);
+      if (mode !== "minimal") assert.ok(theme.calls.length > 0, `${mode} ignored the theme`);
+    }
+
+    const theme = ansiTheme();
+    renderCompactWidgetRows([row({ kind: "stalled" })], 100, theme, "unicode");
+    const badge: any = theme.calls.find((call) => call.method === "style");
+    assert.equal(badge.text, " worker ");
+    assert.equal(typeof badge.color.bg.token, "string", "badge background comes from theme.colors");
+    assert.deepEqual(badge.color.fg, { kind: "rgb", r: 0, g: 0, b: 0 }, "dark text on a light badge");
+    assert.equal(badge.color.bold, true);
+    assert.ok(theme.calls.some((call) => call.method === "fg" && call.color === "error" && call.text === "stalled"));
+  });
+
+  it("re-reads a running agent's usage at most every five seconds", () => {
+    const testApi = (subagentsModule as any).__test__;
+    const directory = mkdtempSync(join(tmpdir(), "subagent-widget-"));
+    const sessionFile = join(directory, "session.jsonl");
+    const line = (id: string, input: number) => JSON.stringify({ type: "usage", id, usage: { input, output: 1, cost: { total: 0.5 } } });
+    writeFileSync(sessionFile, line("a", 100));
+    try {
+      const agent: any = widgetAgent({ sessionFile });
+      testApi.refreshWidgetUsage(agent, 10_000);
+      assert.equal(agent.usage.usage.inputTokens, 100);
+      writeFileSync(sessionFile, [line("a", 100), line("b", 50)].join("\n"));
+      testApi.refreshWidgetUsage(agent, 14_999);
+      assert.equal(agent.usage.usage.inputTokens, 100);
+      testApi.refreshWidgetUsage(agent, 15_000);
+      assert.equal(agent.usage.usage.inputTokens, 150);
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("registers subagent display only under the existing subagent-status widget", () => {
+    const sourceDir = join(dirname(fileURLToPath(import.meta.url)), "../pi-extension/subagents");
+    const keys = ["index.ts", "widget.ts"].flatMap((file) =>
+      [...readFileSync(join(sourceDir, file), "utf8").matchAll(/setWidget\(\s*("[^"]*"|'[^']*'|[^,)]+)/g)].map((match) => match[1]));
+    assert.ok(keys.length > 0);
+    assert.deepEqual([...new Set(keys)], ['"subagent-status"']);
+  });
+
+  it("shows zero usage as zero, marks estimates and gaps, and never shows unknown cost as $0", () => {
+    const usage = (overrides: Record<string, unknown>) => ({ ...knownUsage, ...overrides });
+    const tail = (u: any) => plainRows([row({ usage: u, activity: null })], 100)[0].replace(/^.*01:36/, "01:36");
+    assert.equal(tail(usage({ inputTokens: 0, outputTokens: 0, cost: 0 })), "01:36  ↑0 ↓0  $0.0000");
+    assert.equal(tail(usage({ inputTokens: null, outputTokens: null, cost: 0.42, costEstimated: true })), "01:36  ~$0.4200");
+    assert.equal(tail(usage({ cost: null, costComplete: false })), "01:36  ↑12k ↓6.8k");
+    assert.equal(tail(usage({ cost: 0.5, costComplete: false })), "01:36  ↑12k ↓6.8k  $0.5000+?");
+    assert.equal(tail(null), "01:36");
+  });
+
+  it("truncates names and activity without inserting style resets", () => {
+    for (const icons of ["unicode", "ascii"]) {
+      const theme = ansiTheme();
+      const long = row({ name: "a-very-long-agent-name", activity: "editing a long file name", usage: null });
+      renderCompactWidgetRows([long], 30, theme, icons); // name truncated
+      renderCompactWidgetRows([long], 70, theme, icons); // activity truncated
+      const truncated = theme.calls.filter((call) => call.method === "fg" && /…|\.\.\./.test(call.text));
+      assert.equal(truncated.length, 2, icons);
+      for (const call of truncated) assert.doesNotMatch(call.text, /\x1b/, `${icons}: ${JSON.stringify(call.text)}`);
+    }
   });
 });

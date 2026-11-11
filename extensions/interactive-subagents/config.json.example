@@ -1,7 +1,8 @@
 {
   "status": {
     "enabled": true,
-    "mode": "compact"
+    "mode": "compact",
+    "icons": "unicode"
   },
   "limits": { "maxConcurrent": 4 },
   "proactiveCompaction": {

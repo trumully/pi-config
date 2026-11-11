@@ -1,6 +1,8 @@
-# Agent prompt attribution
+# pi-subagent-manager attribution
 
 The tasker, architect and writer roles, plus targeted lookup and review guidance, are adapted from [pi-subagent-manager](https://github.com/championswimmer/pi-subagent-manager). Tool names, permissions and delivery behavior follow this repository's Herdr setup.
+
+The compact status widget's row style (profile badge, state, activity, right-aligned duration, tokens and cost) and its Nerd Font glyph choices (circle slices U+F0A9E–U+F0AA5 at 180 ms per frame, U+F03E5 and U+F0159) follow the same project. The layout code is this repository's own; it keeps identity and status ahead of metrics on narrow terminals.
 
 MIT License
 
