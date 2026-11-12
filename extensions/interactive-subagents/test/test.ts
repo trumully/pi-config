@@ -441,7 +441,7 @@ describe("interactive subagents smoke tests", () => {
       const [running] = hc.started();
       assert.deepEqual({ agent: running.agent, icon: running.icon }, { agent: "writer", icon: "✎" });
       assert.equal(readNameRegistry(ctx.artifactDir).draft.runMetadata?.icon, "✎");
-      assert.match(renderRunningRow(running), /^ ⟳ ✎ writer  draft running/);
+      assert.match(renderRunningRow(running), /^ [⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏] ✎ writer  draft running/);
     } finally {
       hc.restore();
       rmSync(directory, { recursive: true, force: true });
@@ -466,7 +466,7 @@ describe("interactive subagents smoke tests", () => {
         const running = hc.started().find((r: any) => r.name === name);
         assert.deepEqual({ agent: running.agent, icon: running.icon }, { agent, icon });
         assert.equal(readNameRegistry(ctx.artifactDir)[name].runMetadata?.icon, icon);
-        assert.match(renderRunningRow(running), new RegExp(`^ ⟳ ${icon} ${agent}  ${name} running`));
+        assert.match(renderRunningRow(running), new RegExp(`^ [⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏] ${icon} ${agent}  ${name} running`));
       }
       assert.equal(hc.runs.length, 2);
     } finally {
@@ -503,7 +503,7 @@ describe("interactive subagents smoke tests", () => {
       const [running] = hc.started();
       assert.deepEqual({ agent: running.agent, icon: running.icon, cli: running.cli }, { agent: "cc-reviewer", icon: "◆", cli: "claude" });
       assert.equal(readNameRegistry(ctx.artifactDir).review.runMetadata?.icon, "◆");
-      assert.match(renderRunningRow(running), /^ ⟳ ◆ cc-reviewer  review running/);
+      assert.match(renderRunningRow(running), /^ [⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏] ◆ cc-reviewer  review running/);
     } finally {
       for (const running of hc.started()) if (running.sentinelFile) rmSync(running.sentinelFile, { force: true });
       hc.restore();
@@ -534,7 +534,7 @@ describe("interactive subagents smoke tests", () => {
       await testApi.reconcileParentRuns(api, ctx, "parent-session", ctx.artifactDir, () => true);
       const [running] = hc.started();
       assert.deepEqual({ id: running?.id, agent: running?.agent, icon: running?.icon }, { id: "r-live", agent: "writer", icon: "✎" });
-      assert.match(renderRunningRow(running), /^ ⟳ ✎ writer  draft running/);
+      assert.match(renderRunningRow(running), /^ [⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏] ✎ writer  draft running/);
     } finally {
       hc.restore();
       rmSync(directory, { recursive: true, force: true });
@@ -1599,23 +1599,23 @@ describe("compact widget layout", () => {
     usage: knownUsage, ...overrides,
   });
   const plainRows = (rows: any[], width: number, icons = "unicode") => {
-    const lines = renderCompactWidgetRows(rows, width, ansiTheme(), icons);
+    const lines = renderCompactWidgetRows(rows, width, ansiTheme(), icons, 0);
     for (const line of lines) assert.ok(visibleWidth(line) <= width, `${visibleWidth(line)} > ${width}: ${JSON.stringify(line)}`);
     return lines.map((line: string) => stripTerminalSequences(line));
   };
 
   it("drops activity and metrics before profile, name, or status on narrow terminals", () => {
-    assert.match(plainRows([row()], 120)[0], /^ ⟳ worker  WorkerName active · reading files +01:36  ↑12k ↓6\.8k  \$0\.1230$/);
-    assert.match(plainRows([row()], 40)[0], /^ ⟳ worker  WorkerName active +01:36$/);
+    assert.match(plainRows([row()], 120)[0], /^ ⠋ worker  WorkerName active · reading files +01:36  ↑12k ↓6\.8k  \$0\.1230$/);
+    assert.match(plainRows([row()], 40)[0], /^ ⠋ worker  WorkerName active +01:36$/);
     const tiny = plainRows([row()], 24)[0];
-    assert.match(tiny, /^ ⟳ worker  Work\S*… active$/);
+    assert.match(tiny, /^ ⠋ worker  Work\S*… active$/);
     assert.doesNotMatch(tiny, /01:36|↑|\$/);
   });
 
   it("keeps the full state and a useful name ahead of a long profile badge", () => {
     const researcher = (overrides: Record<string, unknown> = {}) => row({ profile: "researcher", ...overrides });
     // Room to spare: full badge, glyph, name and state.
-    assert.match(plainRows([researcher()], 34)[0], /^ ⟳ researcher  WorkerName active/);
+    assert.match(plainRows([researcher()], 34)[0], /^ ⠋ researcher  WorkerName active/);
     for (const kind of ["active", "starting", "stalled", "waiting"]) {
       for (const width of [18, 20, 22, 24, 26]) {
         const line = plainRows([researcher({ kind })], width)[0];
@@ -1624,13 +1624,13 @@ describe("compact widget layout", () => {
         assert.ok(visibleWidth(name) >= 6, `width ${width} ${kind}: name ${JSON.stringify(name)}`);
       }
     }
-    assert.match(plainRows([researcher()], 18)[0], /^⟳ WorkerNa… active$/);
-    assert.match(plainRows([researcher()], 20)[0], /^⟳ WorkerName active/);
-    assert.match(plainRows([researcher({ kind: "starting" })], 18)[0], /^○ Worker… starting$/);
+    assert.match(plainRows([researcher()], 18)[0], /^⠋ WorkerNa… active$/);
+    assert.match(plainRows([researcher()], 20)[0], /^⠋ WorkerName active/);
+    assert.match(plainRows([researcher({ kind: "starting" })], 18)[0], /^⠋ Worker… starting$/);
     // Without room for the full badge, the name comes first and the badge is shortened.
-    assert.match(plainRows([researcher()], 25)[0], /^ ⟳ re…  WorkerName active$/);
+    assert.match(plainRows([researcher()], 25)[0], /^ ⠋ re…  WorkerName active$/);
     // Wide names keep a useful prefix.
-    assert.match(plainRows([researcher({ name: "日本語の名前です" })], 18)[0], /^⟳ 日本語の… active$/);
+    assert.match(plainRows([researcher({ name: "日本語の名前です" })], 18)[0], /^⠋ 日本語の… active$/);
     // Impossible widths degrade deterministically, state first.
     assert.equal(plainRows([researcher({ kind: "starting" })], 12)[0], "Wo… starting");
     assert.equal(plainRows([researcher({ kind: "starting" })], 8)[0], "starting");
@@ -1640,11 +1640,11 @@ describe("compact widget layout", () => {
   it("strips terminal controls from agent text and keeps wide text within the width", () => {
     const hostile = row({ profile: "日本語", name: "\x1b[31mEvil\x1b[0m\nName", activity: "\x1b]0;pwned\x07tool\tcall" });
     for (const width of [60, 20, 12, 5]) {
-      const raw = renderCompactWidgetRows([hostile], width, ansiTheme(), "unicode")[0];
+      const raw = renderCompactWidgetRows([hostile], width, ansiTheme(), "unicode", 0)[0];
       assert.ok(visibleWidth(raw) <= width, `width ${width}: ${JSON.stringify(raw)}`);
       assert.doesNotMatch(raw, /\x1b\]|\x1b\[31m|\x07|[\n\t]/);
     }
-    assert.match(stripTerminalSequences(renderCompactWidgetRows([hostile], 80, ansiTheme(), "unicode")[0]), /^ ⟳ 日本語  Evil Name active · tool call +01:36/);
+    assert.match(stripTerminalSequences(renderCompactWidgetRows([hostile], 80, ansiTheme(), "unicode", 0)[0]), /^ ⠋ 日本語  Evil Name active · tool call +01:36/);
   });
 
   it("draws status glyphs from the configured icon set", () => {
@@ -1652,11 +1652,11 @@ describe("compact widget layout", () => {
     const privateUse = /[\u{F0000}-\u{FFFFD}\u{E000}-\u{F8FF}]/u;
 
     const unicode = plainRows(kinds, 120, "unicode");
-    assert.deepEqual(unicode.map((line) => line.split(" ")[1]), ["⟳", "⟳", "○", "○", "⟳"]);
+    assert.deepEqual(unicode.map((line) => line.split(" ")[1]), ["⠋", "⠋", "○", "⠋", "⟳"]);
     for (const line of unicode) assert.doesNotMatch(line, privateUse);
 
     const ascii = plainRows(kinds, 120, "ascii");
-    assert.deepEqual(ascii.map((line) => line.split(" ")[1]), ["*", "*", "o", ".", "!"]);
+    assert.deepEqual(ascii.map((line) => line.split(" ")[1]), ["|", "|", "o", "|", "!"]);
     assert.match(ascii[0], /active - tool call +01:36  in 12k out 6\.8k  \$0\.1230$/);
     for (const line of [...ascii, ...plainRows(kinds, 24, "ascii")]) assert.match(line, /^[\x20-\x7e]*$/);
 
@@ -1686,6 +1686,73 @@ describe("compact widget layout", () => {
     assert.deepEqual(badge.color.fg, { kind: "rgb", r: 0, g: 0, b: 0 }, "dark text on a light badge");
     assert.equal(badge.color.bold, true);
     assert.ok(theme.calls.some((call) => call.method === "fg" && call.color === "error" && call.text === "stalled"));
+  });
+
+  describe("spinner animation in the mounted widget", () => {
+    /** Mount the widget the way Pi does, with a TUI that renders it on request. */
+    function mount(getAgents: () => any[]) {
+      const testApi = (subagentsModule as any).__test__;
+      const glyphs: string[] = [];
+      let component: any;
+      const tui = {
+        requestRender() {
+          const lines = component.render(100).map((line: string) => stripTerminalSequences(line));
+          glyphs.push(lines[0]?.split(" ")[1] ?? "");
+        },
+      };
+      component = testApi.subagentWidgetFactory(getAgents)(tui, ansiTheme());
+      component.render(100);
+      return { component, glyphs };
+    }
+    /** Advance the fake clock in small steps so timers set by earlier timers also fire. */
+    const advance = (t: any, ms: number) => { for (let i = 0; i < ms; i += 10) t.mock.timers.tick(10); };
+    // Claude runs always render as "running", whatever the local status config says.
+    const runningAgent = () => widgetAgent({}, { source: "claude" });
+
+    it("redraws a running agent several times a second with changing frames, without reading usage", (t) => {
+      t.mock.timers.enable({ apis: ["setTimeout", "setInterval", "Date"], now: 1_000_000 });
+      const agent: any = runningAgent();
+      const { component, glyphs } = mount(() => [agent]);
+      advance(t, 1000);
+      assert.ok(glyphs.length >= 5, `only ${glyphs.length} redraws in one second`);
+      assert.ok(new Set(glyphs).size >= 3, `frames did not change: ${JSON.stringify(glyphs)}`);
+      assert.equal(agent.usageCheckedAt, undefined, "animation must not re-read usage");
+      component.dispose();
+    });
+
+    it("stops redrawing once disposed", (t) => {
+      t.mock.timers.enable({ apis: ["setTimeout", "setInterval", "Date"], now: 1_000_000 });
+      const { component, glyphs } = mount(() => [runningAgent()]);
+      advance(t, 500);
+      assert.ok(glyphs.length > 0);
+      component.dispose();
+      component.dispose();
+      const before = glyphs.length;
+      advance(t, 5000);
+      assert.equal(glyphs.length, before);
+    });
+
+    it("stops redrawing when no agent is left to animate", (t) => {
+      t.mock.timers.enable({ apis: ["setTimeout", "setInterval", "Date"], now: 1_000_000 });
+      let agents: any[] = [runningAgent()];
+      const { component, glyphs } = mount(() => agents);
+      advance(t, 500);
+      agents = [];
+      advance(t, 500);
+      const before = glyphs.length;
+      advance(t, 5000);
+      assert.equal(glyphs.length, before);
+      component.dispose();
+    });
+
+    it("renders without a TUI and never schedules a redraw", (t) => {
+      t.mock.timers.enable({ apis: ["setTimeout", "setInterval", "Date"], now: 1_000_000 });
+      const testApi = (subagentsModule as any).__test__;
+      const component = testApi.subagentWidgetFactory(() => [runningAgent()])(undefined, ansiTheme());
+      assert.ok(component.render(100).length > 0);
+      advance(t, 5000);
+      component.dispose();
+    });
   });
 
   it("re-reads a running agent's usage at most every five seconds", () => {

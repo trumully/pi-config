@@ -40,8 +40,10 @@ import {
 } from "./claude-usage.ts";
 import { captureSubagentUsage, readRunUsage, type RunUsageSnapshot } from "./usage.ts";
 import {
+  isAnimatedWidgetKind,
   plainWidgetTheme,
   renderCompactWidgetRows,
+  widgetSpinnerFrameMs,
   type WidgetRow,
   type WidgetTheme,
 } from "./widget.ts";
@@ -923,26 +925,63 @@ function toWidgetRow(agent: RunningSubagent, now: number, options = treeRowOptio
   };
 }
 
-/** One row per direct agent, each followed by its live named descendants. */
+/** One row per direct agent, each followed by its live named descendants. Reads only cached data. */
+function subagentWidgetRows(agents: RunningSubagent[], now: number): WidgetRow[] {
+  const options = treeRowOptions();
+  return agents.flatMap((agent) => [toWidgetRow(agent, now, options), ...subagentTree.rowsFor(agent.id, now, options)]);
+}
+
 function renderSubagentWidgetLines(
   agents: RunningSubagent[],
   width: number,
   theme: WidgetTheme = plainWidgetTheme,
   now = Date.now(),
 ): string[] {
-  const options = treeRowOptions();
-  const rows = agents.flatMap((agent) => [toWidgetRow(agent, now, options), ...subagentTree.rowsFor(agent.id, now, options)]);
-  return renderCompactWidgetRows(rows, width, theme, statusConfig.icons, now);
+  return renderCompactWidgetRows(subagentWidgetRows(agents, now), width, theme, statusConfig.icons, now);
 }
 
-/** Widget factory for setWidget; Pi supplies the current theme on each mount. */
+/** The part of Pi's TUI the widget uses. Absent when a caller mounts the widget without one. */
+interface WidgetTui {
+  requestRender(): void;
+}
+
+/**
+ * Widget factory for setWidget; Pi supplies the current theme on each mount.
+ *
+ * While any row shows a spinner, the component asks the TUI to redraw at the
+ * next spinner frame. That timer only requests a render; render reads cached
+ * rows, never files or usage, which the one-second widget timer refreshes.
+ * Pi disposes the component when the widget is replaced or cleared and on
+ * reload or session switch, which stops the timer.
+ */
 function subagentWidgetFactory(getAgents: () => RunningSubagent[]) {
-  return (_tui: unknown, theme: WidgetTheme) => ({
-    invalidate() {},
-    render(width: number) {
-      return renderSubagentWidgetLines(getAgents(), width, theme);
-    },
-  });
+  return (tui: WidgetTui | undefined, theme: WidgetTheme) => {
+    let frameTimer: ReturnType<typeof setTimeout> | null = null;
+    let disposed = false;
+    const scheduleFrame = (now: number) => {
+      if (disposed || frameTimer || typeof tui?.requestRender !== "function") return;
+      const frameMs = widgetSpinnerFrameMs(statusConfig.icons);
+      frameTimer = setTimeout(() => {
+        frameTimer = null;
+        if (!disposed) tui.requestRender();
+      }, frameMs - (now % frameMs));
+      frameTimer.unref?.();
+    };
+    return {
+      invalidate() {},
+      render(width: number) {
+        const now = Date.now();
+        const rows = subagentWidgetRows(getAgents(), now);
+        if (rows.some((row) => isAnimatedWidgetKind(row.kind))) scheduleFrame(now);
+        return renderCompactWidgetRows(rows, width, theme, statusConfig.icons, now);
+      },
+      dispose() {
+        disposed = true;
+        if (frameTimer) clearTimeout(frameTimer);
+        frameTimer = null;
+      },
+    };
+  };
 }
 
 function updateWidget() {
