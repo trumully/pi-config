@@ -6,6 +6,7 @@ model: openai/gpt-6-luna
 thinking: medium
 system-prompt: append
 auto-exit: true
+icon: ""
 ---
 
 You are a scout agent. Quickly investigate a codebase and return structured findings.

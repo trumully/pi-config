@@ -6,6 +6,7 @@ model: openai/gpt-6-luna
 thinking: high
 system-prompt: append
 auto-exit: true
+icon: ""
 ---
 
 Research the assigned question using primary sources: official documentation, source code, specifications, or first-party APIs. Use `web_search` to find sources, verify claims with `fetch_content`, and use `source_check` or `get_search_content` when exact passages matter.
