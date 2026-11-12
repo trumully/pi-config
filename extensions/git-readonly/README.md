@@ -21,6 +21,10 @@ Diff without refs compares index to working tree. `staged: true` compares HEAD t
 
 Show inspects one commit, defaulting to HEAD. Log defaults to HEAD and 20 entries; `limit` accepts 1-100 and `offset` accepts 0-10000. Refs resolve to commit IDs before inspection, recorded in result details. Working-tree state is not a locked snapshot.
 
+## Display
+
+Each call shows as one row by default, such as `git_readonly ✓ diff main..HEAD stat -- src/a.ts +2 more · 3 lines · 0.8s`. Failures show ✗ and the first error line; cancellations show ⊘; clipped output shows `truncated`. Press Ctrl+O to expand it to every argument and the full output the model received. The display only changes how the terminal shows that result. It does not change what the model receives, run Git again, or change any limit below. Escape sequences and control characters are removed from the display only. The renderer lives in [`../readonly-tool-ui`](../readonly-tool-ui/render.ts), so keep that directory next to this one.
+
 ## Limits and permissions
 
 - No write commands, clone/fetch, arbitrary flags, configuration changes, general shell, or output files.
