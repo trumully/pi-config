@@ -24,14 +24,47 @@ export const plainWidgetTheme: WidgetTheme = {
   bold: (text) => text,
 };
 
-/** One running agent, already reduced to display data. */
+/**
+ * A row's state. "finished" is display-only: a finished ancestor shown
+ * because a descendant still runs.
+ */
+export type WidgetStatusKind = SubagentStatusKind | "finished";
+
+/** One agent in the widget, already reduced to display data. */
 export interface WidgetRow {
   profile: string | undefined;
   name: string;
-  kind: SubagentStatusKind;
+  kind: WidgetStatusKind;
   activity: string | null;
+  /** Empty when unknown; the row then shows no elapsed time. */
   elapsed: string;
   usage: RunUsage | null;
+  /** Decorative profile glyph, already chosen for the icon set. Unsafe or undrawable icons are omitted. */
+  profileIcon?: string;
+  /** Tree connector drawn before the badge for nested agents, such as "│  └─ ". Empty for roots. */
+  treePrefix?: string;
+}
+
+const PRIVATE_USE = /[\u{E000}-\u{F8FF}\u{F0000}-\u{FFFFD}\u{100000}-\u{10FFFD}]/u;
+// Controls, unassigned and surrogate code points, separators and whitespace.
+// Format characters (such as bidi overrides) are allowed only as the joiner
+// inside an emoji sequence.
+const UNSAFE_ICON = /[\p{Cc}\p{Cs}\p{Cn}\p{Z}\s]|(?!\u200D)\p{Cf}/u;
+const graphemes = new Intl.Segmenter(undefined, { granularity: "grapheme" });
+
+/**
+ * Return the icon if it is one safe glyph, at most two columns wide, that
+ * the icon set can draw: Nerd Font private-use glyphs need "nerd", and
+ * "ascii" draws only printable ASCII. Otherwise return undefined.
+ */
+export function displayableProfileIcon(icon: string | undefined, icons: StatusIconSet): string | undefined {
+  if (!icon || UNSAFE_ICON.test(icon) || stripTerminalSequences(icon) !== icon) return undefined;
+  if ([...graphemes.segment(icon)].length !== 1) return undefined;
+  const width = visibleWidth(icon);
+  if (width < 1 || width > 2) return undefined;
+  if (icons === "ascii" && !/^[\x21-\x7e]$/.test(icon)) return undefined;
+  if (icons !== "nerd" && PRIVATE_USE.test(icon)) return undefined;
+  return icon;
 }
 
 export function formatWidgetTokens(n: number): string {
@@ -42,7 +75,7 @@ export function formatWidgetTokens(n: number): string {
 }
 
 interface GlyphSet {
-  status(kind: SubagentStatusKind, now: number): string;
+  status(kind: WidgetStatusKind, now: number): string;
   input: string;
   output: string;
   separator: string;
@@ -57,10 +90,15 @@ const NERD_LOADER_FRAMES = 8;
 const NERD_FRAME_MS = 180;
 const NERD_WAITING = "\u{F03E5}";
 const NERD_STALLED = "\u{F0159}";
+// Material Design check-circle-outline.
+const NERD_FINISHED = "\u{F05E0}";
 
 const GLYPHS: Record<StatusIconSet, GlyphSet> = {
   unicode: {
-    status: (kind) => (kind === "waiting" || kind === "starting" ? "○" : "⟳"),
+    status(kind) {
+      if (kind === "finished") return "✓";
+      return kind === "waiting" || kind === "starting" ? "○" : "⟳";
+    },
     input: "↑",
     output: "↓",
     separator: " · ",
@@ -70,6 +108,7 @@ const GLYPHS: Record<StatusIconSet, GlyphSet> = {
     status(kind, now) {
       if (kind === "waiting") return NERD_WAITING;
       if (kind === "stalled") return NERD_STALLED;
+      if (kind === "finished") return NERD_FINISHED;
       if (kind === "starting") return String.fromCodePoint(NERD_LOADER_START);
       return String.fromCodePoint(NERD_LOADER_START + (Math.floor(now / NERD_FRAME_MS) % NERD_LOADER_FRAMES));
     },
@@ -79,7 +118,7 @@ const GLYPHS: Record<StatusIconSet, GlyphSet> = {
     ellipsis: "…",
   },
   ascii: {
-    status: (kind) => ({ active: "*", running: "*", waiting: "o", starting: ".", stalled: "!" })[kind],
+    status: (kind) => ({ active: "*", running: "*", waiting: "o", starting: ".", stalled: "!", finished: "-" })[kind],
     input: "in ",
     output: "out ",
     separator: " - ",
@@ -101,9 +140,9 @@ function usageParts(usage: RunUsage | null, glyphs: GlyphSet): string[] {
   return parts;
 }
 
-function kindColor(kind: SubagentStatusKind): string {
+function kindColor(kind: WidgetStatusKind): string {
   if (kind === "stalled") return "error";
-  if (kind === "waiting" || kind === "starting") return "muted";
+  if (kind === "waiting" || kind === "starting" || kind === "finished") return "muted";
   return "accent";
 }
 
@@ -137,12 +176,23 @@ export function renderCompactWidgetRows(
   now = Date.now(),
 ): string[] {
   if (width <= 0) return [];
-  return rows.map((row) => renderCompactRow(row, width, theme, GLYPHS[icons], now));
+  return rows.map((row) => renderCompactRow(row, width, theme, icons, now));
 }
 
 /** Make agent-supplied text safe to style: no escape sequences, controls, or line breaks. */
 export function sanitizeDisplayText(text: string): string {
   return replaceControlCharacters(stripTerminalSequences(text)).replace(/\s+/g, " ").trim();
+}
+
+/**
+ * Make a tree prefix safe to draw. Unlike display text, leading spaces are
+ * indentation and stay; trailing space goes because the row adds its own gap.
+ */
+export function sanitizeTreePrefix(prefix: string): string {
+  return replaceControlCharacters(stripTerminalSequences(prefix))
+    .replace(/\p{Cf}/gu, "")
+    .replace(/\s/g, " ")
+    .trimEnd();
 }
 
 /**
@@ -165,6 +215,7 @@ const MIN_NAME_WIDTH = 6;
 const MIN_BADGE_LABEL_WIDTH = 3;
 
 interface Identity {
+  tree: string;
   badgeText: string;
   glyph: string;
   name: string;
@@ -172,15 +223,18 @@ interface Identity {
 }
 
 /**
- * Fit the left side: [badge] [glyph] name state. The full lifecycle state
- * and a short name come first, then the glyph, then the full badge. Without
- * room for the full badge, the name grows to full length and the badge gets
- * what is left, shortened or dropped. When even state and a short name do
- * not fit, the name shrinks, then goes, then the state is truncated.
+ * Fit the left side: [tree] [badge: glyph icon profile] name state. The full
+ * lifecycle state and a short name come first, then the tree connector, the
+ * glyph, the tree indentation, and the full badge. Without room for the full
+ * badge, the name grows to full length and the badge gets what is left: a
+ * shortened profile, the glyph alone, or nothing, leaving the glyph outside.
+ * The profile icon shows only beside the full name. When even state and a
+ * short name do not fit, the name shrinks, then goes, then the state is
+ * truncated.
  */
 function fitIdentity(
-  row: { profile: string; name: string; kind: SubagentStatusKind },
-  width: number,
+  row: { profile: string; profileIcon: string; treePrefix: string; name: string; kind: WidgetStatusKind },
+  fullWidth: number,
   glyphs: GlyphSet,
   now: number,
 ): Identity {
@@ -192,73 +246,109 @@ function fitIdentity(
   const shortName = (room: number) =>
     room >= fullNameWidth ? row.name : truncatePlain(row.name, room, glyphs.ellipsis);
 
-  if (nameAndState(minName) > width) {
-    const room = width - stateWidth - 1;
+  if (nameAndState(minName) > fullWidth) {
+    const room = fullWidth - stateWidth - 1;
     // A name narrower than one character plus the ellipsis says nothing.
     if (row.name && room >= 1 + visibleWidth(glyphs.ellipsis)) {
-      return { badgeText: "", glyph: "", name: shortName(room), state };
+      return { tree: "", badgeText: "", glyph: "", name: shortName(room), state };
     }
-    return { badgeText: "", glyph: "", name: "", state: truncatePlain(state, width, glyphs.ellipsis) };
+    return { tree: "", badgeText: "", glyph: "", name: "", state: truncatePlain(state, fullWidth, glyphs.ellipsis) };
   }
 
   const statusGlyph = glyphs.status(row.kind, now);
+  // The glyph alone, outside any badge, plus the gap after it.
   const glyphWidth = visibleWidth(statusGlyph) + 1;
-  const glyph = nameAndState(minName) + glyphWidth <= width ? statusGlyph : "";
-  const prefix = glyph ? glyphWidth : 0;
 
+  // The tree connector comes next, then the glyph, then the indentation
+  // before the connector. Widths include the gap after the prefix.
+  const treeWidth = (text: string) => (text ? visibleWidth(text) + 1 : 0);
+  const connector = row.treePrefix.split(" ").at(-1) ?? "";
+  const base = nameAndState(minName);
+  let tree = base + treeWidth(connector) <= fullWidth ? connector : "";
+  const glyphRoom = base + treeWidth(tree) + glyphWidth <= fullWidth ? glyphWidth : 0;
+  if (tree && base + treeWidth(row.treePrefix) + glyphRoom <= fullWidth) tree = row.treePrefix;
+  const width = fullWidth - treeWidth(tree);
+
+  let glyph = nameAndState(minName) + glyphWidth <= width ? statusGlyph : "";
+
+  // The badge holds the glyph first, then the profile. Its width counts the
+  // gap after it.
   let badgeText = "";
-  if (row.profile) {
-    const fullBadge = ` ${row.profile} `;
-    const fullBadgeWidth = visibleWidth(fullBadge) + 1;
-    if (prefix + fullBadgeWidth + nameAndState(minName) <= width) {
+  if (glyph) {
+    const badgeFor = (label: string) => ` ${[statusGlyph, label].filter(Boolean).join(" ")} `;
+    const fits = (text: string, nameWidth: number) => visibleWidth(text) + 1 + nameAndState(nameWidth) <= width;
+    const iconBadge = badgeFor([row.profileIcon, row.profile].filter(Boolean).join(" "));
+    const fullBadge = badgeFor(row.profile);
+    // The decorative icon never costs the name any columns.
+    if (row.profileIcon && fits(iconBadge, fullNameWidth)) {
+      badgeText = iconBadge;
+    } else if (row.profile && fits(fullBadge, minName)) {
       badgeText = fullBadge;
-    } else {
-      // Badge padding (2) plus the gap after it (1).
-      const labelRoom = width - prefix - nameAndState(fullNameWidth) - 3;
+    } else if (row.profile) {
+      // Glyph badge without a label, plus one space before the label.
+      const labelRoom = width - visibleWidth(badgeFor("")) - 2 - nameAndState(fullNameWidth);
       const minLabel = Math.min(visibleWidth(row.profile), MIN_BADGE_LABEL_WIDTH);
-      if (labelRoom >= minLabel) badgeText = ` ${truncatePlain(row.profile, labelRoom, glyphs.ellipsis)} `;
+      if (labelRoom >= minLabel) badgeText = badgeFor(truncatePlain(row.profile, labelRoom, glyphs.ellipsis));
     }
+    if (!badgeText && fits(badgeFor(""), fullNameWidth)) badgeText = badgeFor("");
+    if (badgeText) glyph = "";
   }
 
-  const badgeWidth = badgeText ? visibleWidth(badgeText) + 1 : 0;
-  const nameRoom = width - prefix - badgeWidth - stateWidth - (row.name ? 1 : 0);
-  return { badgeText, glyph, name: row.name ? shortName(nameRoom) : "", state };
+  const used = badgeText ? visibleWidth(badgeText) + 1 : glyph ? glyphWidth : 0;
+  const nameRoom = width - used - stateWidth - (row.name ? 1 : 0);
+  return { tree, badgeText, glyph, name: row.name ? shortName(nameRoom) : "", state };
 }
 
 /**
  * Lay out one row. The identity comes first (see fitIdentity). Elapsed
  * time, tokens and cost are added right-aligned, in that order, while they
- * fit beside it. Activity fills what remains, so it drops first.
+ * fit beside it, ahead of the decorative profile icon. Activity fills what
+ * remains, so it drops first.
  */
 function renderCompactRow(
   untrusted: WidgetRow,
   width: number,
   theme: WidgetTheme,
-  glyphs: GlyphSet,
+  icons: StatusIconSet,
   now: number,
 ): string {
+  const glyphs = GLYPHS[icons];
   const row = {
     ...untrusted,
     profile: untrusted.profile ? sanitizeDisplayText(untrusted.profile) : "",
+    profileIcon: displayableProfileIcon(untrusted.profileIcon, icons) ?? "",
+    treePrefix: untrusted.treePrefix ? sanitizeTreePrefix(untrusted.treePrefix) : "",
     name: sanitizeDisplayText(untrusted.name),
     activity: untrusted.activity ? sanitizeDisplayText(untrusted.activity) : "",
   };
   const color = row.profile ? profileColor(row.profile) : "accent";
   const stateColor = kindColor(row.kind);
-  const { badgeText, glyph, name, state } = fitIdentity(row, width, glyphs, now);
-  const leftWidth =
-    (badgeText ? visibleWidth(badgeText) + 1 : 0) +
-    (glyph ? visibleWidth(glyph) + 1 : 0) +
-    visibleWidth(name) +
-    (name && state ? 1 : 0) +
-    visibleWidth(state);
-
-  let right = "";
-  for (const part of [row.elapsed, ...usageParts(row.usage, glyphs)]) {
-    const candidate = right ? `${right}${GAP}${part}` : part;
-    if (leftWidth + GAP.length + visibleWidth(candidate) > width) break;
-    right = candidate;
+  const metrics = [row.elapsed, ...usageParts(row.usage, glyphs)].filter(Boolean);
+  const layout = (identity: Identity) => {
+    const leftWidth =
+      (identity.tree ? visibleWidth(identity.tree) + 1 : 0) +
+      (identity.badgeText ? visibleWidth(identity.badgeText) + 1 : 0) +
+      (identity.glyph ? visibleWidth(identity.glyph) + 1 : 0) +
+      visibleWidth(identity.name) +
+      (identity.name && identity.state ? 1 : 0) +
+      visibleWidth(identity.state);
+    let right = "";
+    let shown = 0;
+    for (const part of metrics) {
+      const candidate = right ? `${right}${GAP}${part}` : part;
+      if (leftWidth + GAP.length + visibleWidth(candidate) > width) break;
+      right = candidate;
+      shown++;
+    }
+    return { identity, leftWidth, right, shown };
+  };
+  let fitted = layout(fitIdentity(row, width, glyphs, now));
+  if (row.profileIcon) {
+    // The decorative icon never costs the row a metric.
+    const withoutIcon = layout(fitIdentity({ ...row, profileIcon: "" }, width, glyphs, now));
+    if (withoutIcon.shown > fitted.shown) fitted = withoutIcon;
   }
+  const { identity: { tree, badgeText, glyph, name, state }, leftWidth, right } = fitted;
   const rightWidth = right ? GAP.length + visibleWidth(right) : 0;
 
   let activity = "";
@@ -271,6 +361,7 @@ function renderCompactRow(
 
   const pad = right ? width - leftWidth - activityWidth - visibleWidth(right) : 0;
   const line = [
+    tree ? `${theme.fg("muted", tree)} ` : "",
     badgeText ? `${badge(theme, badgeText, color)} ` : "",
     glyph ? `${theme.fg(stateColor, glyph)} ` : "",
     name ? theme.fg(color, name) : "",
@@ -286,7 +377,7 @@ function renderCompactRow(
 
 /** A themed status glyph for the full widget mode. */
 export function widgetStatusIcon(
-  kind: SubagentStatusKind,
+  kind: WidgetStatusKind,
   theme: WidgetTheme,
   icons: StatusIconSet,
   now: number,

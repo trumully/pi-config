@@ -24,6 +24,8 @@ export interface RunMetadata {
   pendingFile?: string;
   sentinelFile?: string;
   profile?: string;
+  /** Profile icon for the status widget; display only, absent in older records. */
+  icon?: string;
   task: string;
   startTime: number;
   cli: "pi" | "claude";

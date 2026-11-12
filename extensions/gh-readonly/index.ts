@@ -5,6 +5,7 @@
 import { spawn } from "node:child_process";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
+import { compactRenderers, quoteArg } from "../readonly-tool-ui/render.ts";
 
 const MAX_CAPTURE_BYTES = 256 * 1024;
 const MAX_RESULT_BYTES = 32 * 1024;
@@ -257,5 +258,10 @@ export default function (pi: ExtensionAPI) {
         details: { command: ["gh", ...args], ...metadata },
       };
     },
+    ...compactRenderers<{ args?: unknown }>({
+      title: "gh_readonly",
+      summarize: (params) => (Array.isArray(params?.args) ? params.args.join(" ") : ""),
+      describe: (params) => ["gh", ...(Array.isArray(params?.args) ? params.args.map(String) : [])].map(quoteArg).join(" "),
+    }),
   });
 }

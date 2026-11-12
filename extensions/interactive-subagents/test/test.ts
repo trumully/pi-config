@@ -10,6 +10,7 @@ import { convertToLlm } from "@earendil-works/pi-coding-agent";
 import { stripTerminalSequences, visibleWidth } from "@earendil-works/pi-tui";
 import * as subagentsModule from "../pi-extension/subagents/index.ts";
 import { buildPromptAgentArgs } from "../pi-extension/subagents/herdr.ts";
+import { herdrCore } from "../pi-extension/subagents/herdr-core.ts";
 import { bindMailbox, createFileDeliveryStore, unbindMailbox } from "../pi-extension/subagents/delivery.ts";
 import { finishRegisteredRun, readNameRegistry, readSubagentLoadout, registerName, summarizeSessionStats, writeSubagentLoadout, type SubagentLoadout } from "../pi-extension/subagents/session.ts";
 import { collectSubagentUsage, readRunUsage } from "../pi-extension/subagents/usage.ts";
@@ -28,7 +29,7 @@ import {
 } from "../pi-extension/subagents/activity.ts";
 import { registerSubagentProgress } from "../pi-extension/subagents/progress.ts";
 import { parseStatusConfig } from "../pi-extension/subagents/status.ts";
-import { renderCompactWidgetRows } from "../pi-extension/subagents/widget.ts";
+import { plainWidgetTheme, renderCompactWidgetRows } from "../pi-extension/subagents/widget.ts";
 
 function createMockExtensionApi() {
   const registeredTools: any[] = [];
@@ -53,6 +54,83 @@ function createMockExtensionApi() {
       getAllTools() { return []; },
     } as any,
   };
+}
+
+/**
+ * Route herdr-app calls to an in-memory hc. `run` reports a live terminal and
+ * starts nothing; `get`/`ls` answer from `terminals`. No model is called.
+ * Inherited subagent and terminal variables are cleared for the test, so a
+ * suite run inside a real subagent never reserves its parent's capacity.
+ */
+function useFakeHc(terminals: Map<string, Record<string, unknown>> = new Map()) {
+  const testApi = (subagentsModule as any).__test__;
+  const savedEnv = Object.fromEntries(Object.entries(process.env)
+    .filter(([key]) => /^(PI_SUBAGENT_|PI_CLAUDE_|HC_|HERDR_)/.test(key)));
+  for (const key of Object.keys(savedEnv)) delete process.env[key];
+  const savedCli = (herdrCore as any).cli;
+  const before = new Set(testApi.runningSubagents.keys());
+  const runs: string[][] = [];
+  const notFound = () => { throw { stderr: JSON.stringify({ error: { kind: "not_found", message: "not found" } }) }; };
+  const answer = (args: string[]): string => {
+    if (args[0] === "--version") return "hc 0.0.0-test";
+    if (args[0] === "get") return terminals.has(args[1]) ? JSON.stringify(terminals.get(args[1])) : notFound();
+    if (args[0] === "ls") return JSON.stringify({ terminals: [...terminals.values()] });
+    return notFound();
+  };
+  process.env.HC_TERMINAL_ID = "test-parent-terminal";
+  (herdrCore as any).cli = {
+    sync: answer,
+    async async(args: string[]) {
+      if (args[0] !== "run") return answer(args);
+      runs.push(args);
+      const name = args[args.indexOf("--name") + 1];
+      return JSON.stringify({ address: `t-${name}`, name, state: "live" });
+    },
+  };
+  return {
+    runs,
+    /** Runs this test registered, in insertion order. */
+    started: () => [...testApi.runningSubagents.values()].filter((r: any) => !before.has(r.id)),
+    restore() {
+      for (const running of [...testApi.runningSubagents.values()]) {
+        if (before.has(running.id)) continue;
+        running.abortController?.abort();
+        testApi.runningSubagents.delete(running.id);
+        // Removes the fake launch's private descriptor directory.
+        try { herdrCore.close(running.surface); } catch {}
+      }
+      for (const key of ["pi-subagents/widget-interval", "pi-subagents/status-interval"]) {
+        clearInterval((globalThis as any)[Symbol.for(key)]);
+      }
+      (herdrCore as any).cli = savedCli;
+      delete process.env.HC_TERMINAL_ID;
+      Object.assign(process.env, savedEnv);
+    },
+  };
+}
+
+/** A parent session context rooted in `directory`. */
+function parentContext(directory: string, sessionId = "parent-session") {
+  const sessionDir = join(directory, "sessions");
+  mkdirSync(sessionDir, { recursive: true });
+  return {
+    cwd: directory,
+    hasUI: false,
+    sessionManager: {
+      getSessionDir: () => sessionDir,
+      getSessionId: () => sessionId,
+      getSessionFile: () => join(sessionDir, `${sessionId}.jsonl`),
+    },
+    artifactDir: join(sessionDir, "artifacts", sessionId),
+  };
+}
+
+/** One row rendered with fixed settings, independent of the local config file. */
+function renderRunningRow(running: any): string {
+  const testApi = (subagentsModule as any).__test__;
+  const now = running.startTime + 5_000;
+  const row = testApi.toWidgetRow(running, now, { icons: "unicode", profileIcons: true, statusEnabled: false });
+  return renderCompactWidgetRows([row], 80, plainWidgetTheme, "unicode", now)[0];
 }
 
 function registerSubagents() {
@@ -217,12 +295,25 @@ describe("compact subagent progress", () => {
     }
   });
 
-  it("renders fresh indicators only when both fit without displacing status or identity", () => {
+  it("shows named children under their parent instead of a child count", () => {
     const testApi = (subagentsModule as any).__test__;
+    const directory = mkdtempSync(join(tmpdir(), "widget-tree-progress-"));
     const now = Date.now();
+    const parentSession = join(directory, "parent.jsonl");
+    const childSession = join(directory, "child.jsonl");
+    writeFileSync(parentSession, JSON.stringify({ type: "session", id: "parent-session" }));
+    writeFileSync(childSession, JSON.stringify({ type: "session", id: "child-session" }));
+    registerName(join(directory, "artifacts", "parent-session"), "find-docs", {
+      sessionFile: childSession, sessionId: "child-session", running: true, runId: "run-child",
+      runMetadata: {
+        version: 1, state: "running", parentSessionId: "parent-session", runId: "run-child",
+        herdrAgentName: "h", surface: "s", sessionFile: childSession, transcriptOffset: 1,
+        profile: "scout", task: "task", startTime: now - 5000, cli: "pi",
+      },
+    });
     const base = {
       id: "widget-progress", name: "WorkerName", agent: "worker", startTime: now - 1000,
-      startEntryCount: 0, sessionFile: "", statusState: {
+      startEntryCount: 0, sessionFile: parentSession, statusState: {
         source: "pi", startTimeMs: now - 1000, firstObservationAtMs: now - 1000,
         lastActivityAtMs: now - 1000, lastActivitySequence: 1, localOverrideAtMs: null,
         localOverrideSequence: null, activeNow: true, activeSinceMs: now - 1000,
@@ -230,18 +321,20 @@ describe("compact subagent progress", () => {
         activityLabel: null, snapshotState: "present", snapshotProblemSinceMs: null,
         snapshotError: null, currentKind: "active",
       },
-      activityRead: { ok: true }, activity: { phase: "active", progress: { updatedAt: now, activeChildren: 2 } },
+      activityRead: { ok: true }, activity: { phase: "active", progress: { updatedAt: now, activeChildren: 1 } },
     };
-    const wide = testApi.renderSubagentWidgetLines([base], 100, "full").join("\n");
-    assert.match(wide, /WorkerName/);
-    assert.match(wide, /↳ 2/);
-    assert.match(wide, /active/);
-    const narrow = testApi.renderSubagentWidgetLines([base], 60, "full").join("\n");
-    assert.match(narrow, /WorkerName/);
-    assert.match(narrow, /↳ 2/);
-    assert.match(narrow, /active/);
-    const stale = { ...base, activity: { phase: "active", progress: { updatedAt: now - 20_000, activeChildren: 2 } } };
-    assert.doesNotMatch(testApi.renderSubagentWidgetLines([stale], 100, "full").join("\n"), /↳/);
+    try {
+      testApi.refreshSubagentTree([base], now);
+      const lines = testApi.renderSubagentWidgetLines([base], 100, undefined, now);
+      assert.equal(lines.length, 2);
+      assert.match(lines[0], /WorkerName/);
+      // No activity file yet: the child shows as starting, not finished or hidden.
+      assert.match(lines[1], /^└─ .*scout.*find-docs.*starting/);
+      assert.doesNotMatch(lines.join("\n"), /↳/);
+    } finally {
+      testApi.refreshSubagentTree([], now);
+      rmSync(directory, { recursive: true, force: true });
+    }
   });
 });
 
@@ -309,6 +402,143 @@ describe("interactive subagents smoke tests", () => {
       PI_CLAUDE_PENDING_FILE: "/tmp/claude-done.pending",
       PI_CLAUDE_USAGE_FILE: "/tmp/claude-done.usage.json",
     });
+  });
+
+  it("reads an optional literal profile icon and drops unsafe ones", () => {
+    const testApi = (subagentsModule as any).__test__;
+    const parse = (icon: string) => testApi.parseAgentDefinition(`---\nname: x\nicon: ${icon}\n---\nBody.`, "x").icon;
+    assert.equal(parse("\u{F0AD}"), "\u{F0AD}");
+    assert.equal(parse('"✎"'), "✎");
+    assert.equal(parse("two"), undefined);
+    assert.equal(testApi.parseAgentDefinition("---\nname: x\n---\nBody.", "x").icon, undefined);
+  });
+
+  it("keeps the profile and icon when a finished Pi agent resumes", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "pi-resume-icon-"));
+    const hc = useFakeHc();
+    try {
+      const ctx = parentContext(directory);
+      const childSession = join(directory, "child.jsonl");
+      writeFileSync(childSession, `${JSON.stringify({ type: "session", id: "child-session" })}\n`);
+      writeSubagentLoadout(childSession, {
+        agent: "writer", toolAllowlist: "read", model: null, thinking: null, systemPromptMode: null,
+        identity: null, spawnable: null, autoExit: true, cwd: directory, agentDir: null,
+      });
+      registerName(ctx.artifactDir, "draft", {
+        sessionFile: childSession, sessionId: "child-session", running: false, runId: "r-old",
+        runMetadata: {
+          version: 1, state: "finished", parentSessionId: "parent-session", runId: "r-old",
+          herdrAgentName: "draft-r-old", surface: "draft-r-old", sessionFile: childSession,
+          transcriptOffset: 1, profile: "writer", icon: "✎", task: "Draft it.", startTime: 1, cli: "pi",
+        },
+      });
+
+      const tool = registerSubagents().registeredTools.find((t: any) => t.name === "subagent_message");
+      const result = await tool.execute("resume", { name: "draft", message: "Continue the draft." }, undefined, undefined, ctx);
+      assert.equal(result.details.status, "started", result.content[0].text);
+      assert.equal(hc.runs.length, 1, "one fake hc launch");
+
+      const [running] = hc.started();
+      assert.deepEqual({ agent: running.agent, icon: running.icon }, { agent: "writer", icon: "✎" });
+      assert.equal(readNameRegistry(ctx.artifactDir).draft.runMetadata?.icon, "✎");
+      assert.match(renderRunningRow(running), /^ ⟳ ✎ writer  draft running/);
+    } finally {
+      hc.restore();
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("carries a profile icon from Pi and Claude launches into the record, metadata and row", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "launch-icon-"));
+    const agentDir = join(directory, "agent");
+    mkdirSync(join(agentDir, "agents"), { recursive: true });
+    writeFileSync(join(agentDir, "agents", "icon-pi.md"), "---\nname: icon-pi\nicon: \"✎\"\ntools: read\n---\nPi body.\n");
+    writeFileSync(join(agentDir, "agents", "icon-cc.md"), "---\nname: icon-cc\ncli: claude\nicon: \"◆\"\n---\nClaude body.\n");
+    const savedAgentDir = process.env.PI_CODING_AGENT_DIR;
+    process.env.PI_CODING_AGENT_DIR = agentDir;
+    const hc = useFakeHc();
+    try {
+      const ctx = parentContext(directory);
+      const tool = registerSubagents().registeredTools.find((t: any) => t.name === "subagent");
+      for (const [agent, name, icon] of [["icon-pi", "pi-run", "✎"], ["icon-cc", "cc-run", "◆"]]) {
+        const result = await tool.execute(name, { agent, name, task: "Probe." }, undefined, undefined, ctx);
+        assert.ok(!result.isError, result.content[0].text);
+        const running = hc.started().find((r: any) => r.name === name);
+        assert.deepEqual({ agent: running.agent, icon: running.icon }, { agent, icon });
+        assert.equal(readNameRegistry(ctx.artifactDir)[name].runMetadata?.icon, icon);
+        assert.match(renderRunningRow(running), new RegExp(`^ ⟳ ${icon} ${agent}  ${name} running`));
+      }
+      assert.equal(hc.runs.length, 2);
+    } finally {
+      for (const running of hc.started()) if (running.sentinelFile) rmSync(running.sentinelFile, { force: true });
+      hc.restore();
+      if (savedAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+      else process.env.PI_CODING_AGENT_DIR = savedAgentDir;
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("keeps the profile and icon when a finished Claude agent resumes", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "claude-resume-icon-"));
+    const hc = useFakeHc();
+    try {
+      const ctx = parentContext(directory);
+      const transcript = join(directory, "claude-transcript.jsonl");
+      writeFileSync(transcript, "{}\n");
+      registerName(ctx.artifactDir, "review", {
+        sessionFile: transcript, sessionId: null, running: false, runId: "r-old",
+        runMetadata: {
+          version: 1, state: "finished", parentSessionId: "parent-session", runId: "r-old",
+          herdrAgentName: "review-r-old", surface: "review-r-old", sessionFile: transcript,
+          transcriptOffset: 0, profile: "cc-reviewer", icon: "◆", task: "Review it.", startTime: 1, cli: "claude",
+        },
+        claude: {
+          launch: { cwd: directory, model: null, effort: null, systemPromptFile: null, plugin: false },
+          sessionId: "claude-session", transcriptPath: transcript,
+        },
+      });
+      const tool = registerSubagents().registeredTools.find((t: any) => t.name === "subagent_message");
+      const result = await tool.execute("resume", { name: "review", message: "Check again." }, undefined, undefined, ctx);
+      assert.equal(result.details.status, "started", result.content[0].text);
+      const [running] = hc.started();
+      assert.deepEqual({ agent: running.agent, icon: running.icon, cli: running.cli }, { agent: "cc-reviewer", icon: "◆", cli: "claude" });
+      assert.equal(readNameRegistry(ctx.artifactDir).review.runMetadata?.icon, "◆");
+      assert.match(renderRunningRow(running), /^ ⟳ ◆ cc-reviewer  review running/);
+    } finally {
+      for (const running of hc.started()) if (running.sentinelFile) rmSync(running.sentinelFile, { force: true });
+      hc.restore();
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("restores the profile and icon of a live run after the parent reloads", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "restore-icon-"));
+    const childSession = join(directory, "child.jsonl");
+    writeFileSync(childSession, `${JSON.stringify({ type: "session", id: "child-session" })}\n`);
+    const hc = useFakeHc(new Map([["draft-r-live", {
+      address: "t-draft", name: "draft-r-live", state: "live",
+      labels: { "pi.subagent": "draft-r-live", "pi.session": childSession },
+    }]]));
+    try {
+      const ctx = parentContext(directory);
+      registerName(ctx.artifactDir, "draft", {
+        sessionFile: childSession, sessionId: "child-session", running: true, runId: "r-live",
+        runMetadata: {
+          version: 1, state: "running", launchConfirmed: true, parentSessionId: "parent-session", runId: "r-live",
+          herdrAgentName: "draft-r-live", surface: "draft-r-live", sessionFile: childSession,
+          transcriptOffset: 1, profile: "writer", icon: "✎", task: "Draft it.", startTime: Date.now() - 1000, cli: "pi",
+        },
+      });
+      const { api } = registerSubagents();
+      const testApi = (subagentsModule as any).__test__;
+      await testApi.reconcileParentRuns(api, ctx, "parent-session", ctx.artifactDir, () => true);
+      const [running] = hc.started();
+      assert.deepEqual({ id: running?.id, agent: running?.agent, icon: running?.icon }, { id: "r-live", agent: "writer", icon: "✎" });
+      assert.match(renderRunningRow(running), /^ ⟳ ✎ writer  draft running/);
+    } finally {
+      hc.restore();
+      rmSync(directory, { recursive: true, force: true });
+    }
   });
 
   it("forwards a Claude profile's effort to Claude Code launch arguments", () => {
@@ -1107,11 +1337,11 @@ describe("interactive subagents smoke tests", () => {
     try {
       const agent = widgetAgent({ name: "extension-readmes", sessionFile });
       testApi.refreshWidgetUsage(agent);
-      const lines = testApi.renderSubagentWidgetLines([agent], 120, "compact", ansiTheme());
+      const lines = testApi.renderSubagentWidgetLines([agent], 120, ansiTheme());
       assert.equal(lines.length, 1);
       assert.ok(visibleWidth(lines[0]) <= 120);
       const plain = stripTerminalSequences(lines[0]);
-      assert.match(plain, /^ worker  \S extension-readmes waiting +01:36  ↑12k ↓6\.8k  \$0\.1230$/);
+      assert.match(plain, /^ \S worker  extension-readmes waiting +01:36  ↑12k ↓6\.8k  \$0\.1230$/);
     } finally {
       rmSync(directory, { recursive: true, force: true });
     }
@@ -1375,17 +1605,17 @@ describe("compact widget layout", () => {
   };
 
   it("drops activity and metrics before profile, name, or status on narrow terminals", () => {
-    assert.match(plainRows([row()], 120)[0], /^ worker  ⟳ WorkerName active · reading files +01:36  ↑12k ↓6\.8k  \$0\.1230$/);
-    assert.match(plainRows([row()], 40)[0], /^ worker  ⟳ WorkerName active +01:36$/);
+    assert.match(plainRows([row()], 120)[0], /^ ⟳ worker  WorkerName active · reading files +01:36  ↑12k ↓6\.8k  \$0\.1230$/);
+    assert.match(plainRows([row()], 40)[0], /^ ⟳ worker  WorkerName active +01:36$/);
     const tiny = plainRows([row()], 24)[0];
-    assert.match(tiny, /^ worker  ⟳ Work\S*… active$/);
+    assert.match(tiny, /^ ⟳ worker  Work\S*… active$/);
     assert.doesNotMatch(tiny, /01:36|↑|\$/);
   });
 
   it("keeps the full state and a useful name ahead of a long profile badge", () => {
     const researcher = (overrides: Record<string, unknown> = {}) => row({ profile: "researcher", ...overrides });
     // Room to spare: full badge, glyph, name and state.
-    assert.match(plainRows([researcher()], 34)[0], /^ researcher  ⟳ WorkerName active/);
+    assert.match(plainRows([researcher()], 34)[0], /^ ⟳ researcher  WorkerName active/);
     for (const kind of ["active", "starting", "stalled", "waiting"]) {
       for (const width of [18, 20, 22, 24, 26]) {
         const line = plainRows([researcher({ kind })], width)[0];
@@ -1398,7 +1628,7 @@ describe("compact widget layout", () => {
     assert.match(plainRows([researcher()], 20)[0], /^⟳ WorkerName active/);
     assert.match(plainRows([researcher({ kind: "starting" })], 18)[0], /^○ Worker… starting$/);
     // Without room for the full badge, the name comes first and the badge is shortened.
-    assert.match(plainRows([researcher()], 25)[0], /^ re…  ⟳ WorkerName active$/);
+    assert.match(plainRows([researcher()], 25)[0], /^ ⟳ re…  WorkerName active$/);
     // Wide names keep a useful prefix.
     assert.match(plainRows([researcher({ name: "日本語の名前です" })], 18)[0], /^⟳ 日本語の… active$/);
     // Impossible widths degrade deterministically, state first.
@@ -1414,7 +1644,7 @@ describe("compact widget layout", () => {
       assert.ok(visibleWidth(raw) <= width, `width ${width}: ${JSON.stringify(raw)}`);
       assert.doesNotMatch(raw, /\x1b\]|\x1b\[31m|\x07|[\n\t]/);
     }
-    assert.match(stripTerminalSequences(renderCompactWidgetRows([hostile], 80, ansiTheme(), "unicode")[0]), /^ 日本語  ⟳ Evil Name active · tool call +01:36/);
+    assert.match(stripTerminalSequences(renderCompactWidgetRows([hostile], 80, ansiTheme(), "unicode")[0]), /^ ⟳ 日本語  Evil Name active · tool call +01:36/);
   });
 
   it("draws status glyphs from the configured icon set", () => {
@@ -1422,15 +1652,15 @@ describe("compact widget layout", () => {
     const privateUse = /[\u{F0000}-\u{FFFFD}\u{E000}-\u{F8FF}]/u;
 
     const unicode = plainRows(kinds, 120, "unicode");
-    assert.deepEqual(unicode.map((line) => line.split(" ")[3]), ["⟳", "⟳", "○", "○", "⟳"]);
+    assert.deepEqual(unicode.map((line) => line.split(" ")[1]), ["⟳", "⟳", "○", "○", "⟳"]);
     for (const line of unicode) assert.doesNotMatch(line, privateUse);
 
     const ascii = plainRows(kinds, 120, "ascii");
-    assert.deepEqual(ascii.map((line) => line.split(" ")[3]), ["*", "*", "o", ".", "!"]);
+    assert.deepEqual(ascii.map((line) => line.split(" ")[1]), ["*", "*", "o", ".", "!"]);
     assert.match(ascii[0], /active - tool call +01:36  in 12k out 6\.8k  \$0\.1230$/);
     for (const line of [...ascii, ...plainRows(kinds, 24, "ascii")]) assert.match(line, /^[\x20-\x7e]*$/);
 
-    const nerd = plainRows(kinds, 120, "nerd").map((line) => line.split(" ")[3].codePointAt(0)!);
+    const nerd = plainRows(kinds, 120, "nerd").map((line) => line.split(" ")[1].codePointAt(0)!);
     for (const active of nerd.slice(0, 2)) assert.ok(active >= 0xF0A9E && active <= 0xF0AA5, active.toString(16));
     assert.deepEqual(nerd.slice(2), [0xF03E5, 0xF0A9E, 0xF0159]);
   });
@@ -1443,17 +1673,15 @@ describe("compact widget layout", () => {
     assert.ok(component.render(100).length > 0);
     assert.ok(forwarded.calls.length > 0, "the factory theme was not used");
 
-    for (const mode of ["compact", "minimal", "full"]) {
-      const theme = ansiTheme();
-      const output = testApi.renderSubagentWidgetLines([agent], 100, mode, theme).join("\n");
-      assert.doesNotMatch(output, /\x1b\[38;2;/, `${mode} uses hard-coded colors`);
-      if (mode !== "minimal") assert.ok(theme.calls.length > 0, `${mode} ignored the theme`);
-    }
+    const direct = ansiTheme();
+    const output = testApi.renderSubagentWidgetLines([agent], 100, direct).join("\n");
+    assert.doesNotMatch(output, /\x1b\[38;2;/, "the widget uses hard-coded colors");
+    assert.ok(direct.calls.length > 0, "the widget ignored the theme");
 
     const theme = ansiTheme();
     renderCompactWidgetRows([row({ kind: "stalled" })], 100, theme, "unicode");
     const badge: any = theme.calls.find((call) => call.method === "style");
-    assert.equal(badge.text, " worker ");
+    assert.equal(badge.text, " ⟳ worker ");
     assert.equal(typeof badge.color.bg.token, "string", "badge background comes from theme.colors");
     assert.deepEqual(badge.color.fg, { kind: "rgb", r: 0, g: 0, b: 0 }, "dark text on a light badge");
     assert.equal(badge.color.bold, true);

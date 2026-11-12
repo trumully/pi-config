@@ -22,6 +22,10 @@ The tool allows selected repository, PR, issue, release, CI metadata, and search
 
 Result details include `status`, `exitCode` (null when unavailable), `truncated`, and `durationMs`. Execution failures are marked as tool errors, with separate statuses for cancellation, timeout, missing executable, authentication, capture overflow, and other command failures. Nonzero exit output is retained within the same display limits; for example, failed PR checks may still contain useful results. No startup probes or automatic retries run.
 
+## Display
+
+Each call shows as one row by default: the command, a ✓, ✗, or ⊘ mark, the line count or the first error line, a `truncated` flag, and the duration. Press Ctrl+O to expand it to the full command and the full output the model received. The display only changes how the terminal shows that result. It does not change what the model receives, run anything again, or change any limit below. Escape sequences and control characters are removed from the display only. The renderer lives in [`../readonly-tool-ui`](../readonly-tool-ui/render.ts), so keep that directory next to this one.
+
 ## Boundaries
 
 - No write commands, clones, checkouts, artifact downloads, log-cache downloads, login/config changes, browser opening, aliases/extensions, shell pipelines, or file input/output flags.

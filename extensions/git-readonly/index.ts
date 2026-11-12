@@ -4,6 +4,7 @@ import { accessSync, constants, realpathSync, statSync } from "node:fs";
 import { delimiter, isAbsolute, join, relative, resolve, sep } from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type, type Static } from "typebox";
+import { compactRenderers, quoteArg } from "../readonly-tool-ui/render.ts";
 
 const MAX_CAPTURE_BYTES = 256 * 1024;
 const MAX_RESULT_BYTES = 32 * 1024;
@@ -260,5 +261,28 @@ export default function (pi: ExtensionAPI) {
         details: { operation: params.operation, repo, commits: result.commits, status: result.status, exitCode: result.exitCode, truncated: output.truncated || result.status === "output_limit", durationMs: Date.now() - started },
       };
     },
+    ...compactRenderers<Partial<Params>>({
+      title: "git_readonly",
+      summarize: (params) => describeCall(params, false),
+      describe: (params) => describeCall(params, true),
+    }),
   });
+}
+
+/** Display text for a call, such as `diff main..HEAD stat -- src/a.ts +2 more`. Arguments may still be streaming. */
+function describeCall(params: Partial<Params> | undefined, full: boolean): string {
+  if (!params || typeof params.operation !== "string") return "";
+  const text = (value: unknown) => (typeof value === "string" || typeof value === "number" ? quoteArg(String(value)) : undefined);
+  const parts: Array<string | undefined> = [params.operation];
+  if (params.operation === "diff") {
+    parts.push(params.staged === true ? "--staged" : params.base ? `${text(params.base)}${params.target ? `..${text(params.target)}` : ""}` : undefined);
+  }
+  if (params.operation === "show" || params.operation === "log") parts.push(text(params.ref));
+  if (params.format) parts.push(text(params.format));
+  if (params.limit !== undefined) parts.push("limit", text(params.limit));
+  if (params.offset !== undefined) parts.push("offset", text(params.offset));
+  if (params.repo) parts.push("in", text(params.repo));
+  const paths = Array.isArray(params.paths) ? params.paths.map((path) => text(path) ?? "") : [];
+  if (paths.length > 0) parts.push("--", ...(full || paths.length === 1 ? paths : [paths[0], `+${paths.length - 1} more`]));
+  return parts.filter((part) => part !== undefined && part !== "").join(" ");
 }

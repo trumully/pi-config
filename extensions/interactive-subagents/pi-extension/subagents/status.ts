@@ -19,10 +19,14 @@ export type StatusActivityPhase = "starting" | "active" | "waiting" | "done";
 
 export interface StatusConfig {
   enabled: boolean;
-  mode: "compact" | "minimal" | "full";
   icons: StatusIconSet;
+  /** Show a role glyph in profile badges when the icon set can draw it. */
+  profileIcons: boolean;
   lineLimit: number;
 }
+
+/** Display modes from before the tree widget; accepted and ignored. */
+const LEGACY_STATUS_MODES = ["compact", "minimal", "full"];
 
 /** unicode: portable symbols; nerd: Nerd Font private-use glyphs; ascii: plain ASCII. */
 export type StatusIconSet = "unicode" | "nerd" | "ascii";
@@ -145,21 +149,28 @@ function activityLabel(snapshot: Pick<StatusSnapshot, "activityLabel" | "activeS
 export function parseStatusConfig(rawConfig: unknown, source = "config.json"): StatusConfig {
   const config = requireObject(rawConfig, source, "root");
   const status = requireObject(config.status, source, "status");
-  rejectUnsupportedKeys(status, ["enabled", "mode", "icons"], source, "status");
+  rejectUnsupportedKeys(status, ["enabled", "mode", "icons", "profileIcons"], source, "status");
   const enabled = requireBoolean(status.enabled, source, "status.enabled");
-  const mode = status.mode === undefined ? "compact" : status.mode;
-  if (mode !== "compact" && mode !== "minimal" && mode !== "full") {
-    invalidStatusConfig(source, 'status.mode must be "compact", "minimal", or "full"');
+  // Every mode now draws the same tree. Old values stay valid so existing
+  // configs keep loading; anything else is still a typo worth reporting.
+  if (status.mode !== undefined && !LEGACY_STATUS_MODES.includes(status.mode as string)) {
+    invalidStatusConfig(
+      source,
+      'status.mode is deprecated and ignored; remove it (old values "compact", "minimal" and "full" are still accepted)',
+    );
   }
   const icons = status.icons === undefined ? "unicode" : status.icons;
   if (icons !== "unicode" && icons !== "nerd" && icons !== "ascii") {
     invalidStatusConfig(source, 'status.icons must be "unicode", "nerd", or "ascii"');
   }
+  const profileIcons = status.profileIcons === undefined
+    ? true
+    : requireBoolean(status.profileIcons, source, "status.profileIcons");
 
   return {
     enabled,
-    mode,
     icons,
+    profileIcons,
     lineLimit: DEFAULT_STATUS_LINE_LIMIT,
   };
 }
