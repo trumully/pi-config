@@ -6,6 +6,7 @@ model: openai/gpt-6-luna
 thinking: low
 system-prompt: append
 auto-exit: true
+icon: ""
 ---
 
 Complete one bounded job in a few tool steps. Suitable work includes an explicit patch, a one-site fix, a mechanical rename, a stated command, data extraction, or a targeted lookup. Complex features, broad audits and sustained debugging belong with the parent or worker.

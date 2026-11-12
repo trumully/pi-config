@@ -32,9 +32,9 @@ describe("profile badge", () => {
   it("puts the progress glyph inside the badge and keeps name and state outside it", () => {
     const theme = ansiTheme();
     const [line] = plain([row()], 100, "unicode", theme);
-    assert.match(line, /^ ⟳ worker  WorkerName active · reading files +01:36  ↑12k ↓6\.8k  \$0\.1230$/);
+    assert.match(line, /^ ⠋ worker  WorkerName active · reading files +01:36  ↑12k ↓6\.8k  \$0\.1230$/);
     const badge = theme.calls.find((call) => call.method === "style");
-    assert.equal(badge?.text, " ⟳ worker ");
+    assert.equal(badge?.text, " ⠋ worker ");
   });
 
   it("shows the profile icon second, and only icons the configured set can draw", () => {
@@ -45,11 +45,11 @@ describe("profile badge", () => {
       return theme.calls.find((call) => call.method === "style")?.text;
     };
     assert.equal(badgeOf(nerdIcon, "nerd"), ` ${String.fromCodePoint(0xF0A9E)} ${nerdIcon} worker `);
-    assert.equal(badgeOf(nerdIcon, "unicode"), " ⟳ worker ");
-    assert.equal(badgeOf("⚙", "unicode"), " ⟳ ⚙ worker ");
+    assert.equal(badgeOf(nerdIcon, "unicode"), " ⠋ worker ");
+    assert.equal(badgeOf("⚙", "unicode"), " ⠋ ⚙ worker ");
     assert.equal(badgeOf("🤖", "nerd"), ` ${String.fromCodePoint(0xF0A9E)} 🤖 worker `);
-    assert.equal(badgeOf("⚙", "ascii"), " * worker ");
-    assert.equal(badgeOf("@", "ascii"), " * @ worker ");
+    assert.equal(badgeOf("⚙", "ascii"), " | worker ");
+    assert.equal(badgeOf("@", "ascii"), " | @ worker ");
   });
 
   it("omits unsafe icons but keeps the profile readable", () => {
@@ -68,9 +68,49 @@ describe("profile badge", () => {
 
   it("drops the decorative icon before elapsed time, tokens or cost", () => {
     const nested = row({ name: "Impl", activity: null, profileIcon: "⚙", treePrefix: "├─ " });
-    assert.equal(plain([nested], 44)[0], "├─  ⟳ worker  Impl active  01:36  ↑12k ↓6.8k");
-    assert.match(plain([nested], 60)[0], /^├─  ⟳ ⚙ worker  Impl active +01:36  ↑12k ↓6\.8k  \$0\.1230$/);
+    assert.equal(plain([nested], 44)[0], "├─  ⠋ worker  Impl active  01:36  ↑12k ↓6.8k");
+    assert.match(plain([nested], 60)[0], /^├─  ⠋ ⚙ worker  Impl active +01:36  ↑12k ↓6\.8k  \$0\.1230$/);
     assert.equal(displayableProfileIcon("👩‍💻", "unicode"), "👩‍💻");
+  });
+});
+
+describe("in-progress spinner", () => {
+  const nerdSlice = (n: number) => String.fromCodePoint(0xF0A9E + n);
+  // Three consecutive frames per icon set, at that set's frame interval.
+  const spinners = {
+    unicode: { times: [0, 120, 240], frames: ["⠋", "⠙", "⠹"] },
+    ascii: { times: [0, 150, 300], frames: ["|", "/", "-"] },
+    nerd: { times: [0, 180, 360], frames: [nerdSlice(0), nerdSlice(1), nerdSlice(2)] },
+  } as const;
+  const badgeAt = (kind: string, icons: string, now: number) => {
+    const theme = ansiTheme();
+    const [line] = renderCompactWidgetRows([row({ kind })], 100, theme, icons as any, now);
+    return { badge: theme.calls.find((call) => call.method === "style")?.text, width: visibleWidth(line) };
+  };
+
+  it("steps the badge glyph for active, running and starting agents on a fixed clock", () => {
+    for (const [icons, { times, frames }] of Object.entries(spinners)) {
+      for (const kind of ["active", "running", "starting"]) {
+        const shown = times.map((now) => badgeAt(kind, icons, now));
+        assert.deepEqual(shown.map((s) => s.badge), frames.map((frame) => ` ${frame} worker `), `${icons} ${kind}`);
+        assert.equal(new Set(shown.map((s) => s.width)).size, 1, `${icons} ${kind}: width changes between frames`);
+      }
+    }
+  });
+
+  it("keeps waiting, stalled and finished glyphs still and distinct from the spinner", () => {
+    const still = {
+      unicode: { waiting: "○", stalled: "⟳", finished: "✓" },
+      ascii: { waiting: "o", stalled: "!", finished: "-" },
+      nerd: { waiting: "\u{F03E5}", stalled: "\u{F0159}", finished: "\u{F05E0}" },
+    } as const;
+    for (const [icons, { times }] of Object.entries(spinners)) {
+      for (const [kind, glyph] of Object.entries(still[icons as keyof typeof still])) {
+        for (const now of [...times, 1_000_000_007]) {
+          assert.equal(badgeAt(kind, icons, now).badge, ` ${glyph} worker `, `${icons} ${kind} at ${now}`);
+        }
+      }
+    }
   });
 });
 
@@ -82,8 +122,8 @@ describe("nested agent rows", () => {
       row({ name: "Child", treePrefix: "├─ " }),
       row({ name: "Grandchild", kind: "waiting", treePrefix: "│  └─" }),
     ], 100, "unicode", theme);
-    assert.match(root, /^ ⟳ worker  WorkerName active · reading files +01:36  ↑12k ↓6\.8k  \$0\.1230$/);
-    assert.match(child, /^├─  ⟳ worker  Child active · reading files +01:36  ↑12k ↓6\.8k  \$0\.1230$/);
+    assert.match(root, /^ ⠋ worker  WorkerName active · reading files +01:36  ↑12k ↓6\.8k  \$0\.1230$/);
+    assert.match(child, /^├─  ⠋ worker  Child active · reading files +01:36  ↑12k ↓6\.8k  \$0\.1230$/);
     assert.match(grandchild, /^│  └─  ○ worker  Grandchild waiting · reading files +01:36  ↑12k ↓6\.8k  \$0\.1230$/);
     assert.ok(theme.calls.every((call) => !/[├└│]/.test(call.text) || call.method === "fg"), "tree prefix is outside the badge");
   });
@@ -116,13 +156,13 @@ describe("nested agent rows", () => {
         assert.doesNotMatch(raw, /\x1b\]|\x1b\[31m|\x07|[\n\t‮]/, `${icons} width ${width}`);
       }
     }
-    assert.match(plain([hostile], 80)[0], /^│ └─  ⟳ 日本語  名前Evil active/);
+    assert.match(plain([hostile], 80)[0], /^│ └─  ⠋ 日本語  名前Evil active/);
   });
 
   it("keeps the glyph in a colored badge for agents without a profile", () => {
     const theme = ansiTheme();
-    assert.match(plain([row({ profile: undefined, treePrefix: "└─" })], 60, "unicode", theme)[0], /^└─  ⟳  WorkerName active/);
-    assert.equal(theme.calls.find((call) => call.method === "style")?.text, " ⟳ ");
+    assert.match(plain([row({ profile: undefined, treePrefix: "└─" })], 60, "unicode", theme)[0], /^└─  ⠋  WorkerName active/);
+    assert.equal(theme.calls.find((call) => call.method === "style")?.text, " ⠋ ");
   });
 
   it("shows a finished ancestor as a muted, still row without metrics", () => {
@@ -131,7 +171,7 @@ describe("nested agent rows", () => {
     const theme = ansiTheme();
     const [ancestor, live] = plain([finished, child], 80, "unicode", theme);
     assert.equal(ancestor, " ✓ worker  WorkerName finished");
-    assert.match(live, /^└─  ⟳ worker  Child active · reading files +01:36  ↑12k ↓6\.8k  \$0\.1230$/);
+    assert.match(live, /^└─  ⠋ worker  Child active · reading files +01:36  ↑12k ↓6\.8k  \$0\.1230$/);
     assert.ok(theme.calls.some((call) => call.method === "fg" && call.color === "muted" && call.text === "finished"));
     assert.equal(plain([finished], 60, "ascii")[0], " - worker  WorkerName finished");
     for (const now of [0, 180, 360]) {

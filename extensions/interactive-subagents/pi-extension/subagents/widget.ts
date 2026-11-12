@@ -74,20 +74,29 @@ export function formatWidgetTokens(n: number): string {
   return `${(n / 1_000_000).toFixed(1)}M`;
 }
 
+/** Agents still at work: their glyph is an animated spinner. */
+export function isAnimatedWidgetKind(kind: WidgetStatusKind): boolean {
+  return kind === "active" || kind === "running" || kind === "starting";
+}
+
 interface GlyphSet {
-  status(kind: WidgetStatusKind, now: number): string;
+  /** Spinner frames for animated kinds, one-column glyphs shown in order. */
+  spinner: readonly string[];
+  /** Milliseconds each spinner frame shows. */
+  frameMs: number;
+  /** Still glyphs for the kinds that do not animate. */
+  still: Record<Exclude<WidgetStatusKind, "active" | "running" | "starting">, string>;
   input: string;
   output: string;
   separator: string;
   ellipsis: string;
 }
 
-// Nerd Font Material Design circle slices 1-8, stepped every 180 ms, plus
-// pause-circle and close-circle icons. These choices follow pi-subagent-manager
-// (MIT); see THIRD-PARTY-NOTICES.md.
+// Nerd Font Material Design circle slices 1-8, plus pause-circle and
+// close-circle icons. These choices follow pi-subagent-manager (MIT); see
+// THIRD-PARTY-NOTICES.md.
 const NERD_LOADER_START = 0xf0a9e;
 const NERD_LOADER_FRAMES = 8;
-const NERD_FRAME_MS = 180;
 const NERD_WAITING = "\u{F03E5}";
 const NERD_STALLED = "\u{F0159}";
 // Material Design check-circle-outline.
@@ -95,36 +104,46 @@ const NERD_FINISHED = "\u{F05E0}";
 
 const GLYPHS: Record<StatusIconSet, GlyphSet> = {
   unicode: {
-    status(kind) {
-      if (kind === "finished") return "✓";
-      return kind === "waiting" || kind === "starting" ? "○" : "⟳";
-    },
+    spinner: ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"],
+    frameMs: 120,
+    still: { waiting: "○", stalled: "⟳", finished: "✓" },
     input: "↑",
     output: "↓",
     separator: " · ",
     ellipsis: "…",
   },
   nerd: {
-    status(kind, now) {
-      if (kind === "waiting") return NERD_WAITING;
-      if (kind === "stalled") return NERD_STALLED;
-      if (kind === "finished") return NERD_FINISHED;
-      if (kind === "starting") return String.fromCodePoint(NERD_LOADER_START);
-      return String.fromCodePoint(NERD_LOADER_START + (Math.floor(now / NERD_FRAME_MS) % NERD_LOADER_FRAMES));
-    },
+    spinner: Array.from({ length: NERD_LOADER_FRAMES }, (_, i) => String.fromCodePoint(NERD_LOADER_START + i)),
+    frameMs: 180,
+    still: { waiting: NERD_WAITING, stalled: NERD_STALLED, finished: NERD_FINISHED },
     input: "↑",
     output: "↓",
     separator: " · ",
     ellipsis: "…",
   },
   ascii: {
-    status: (kind) => ({ active: "*", running: "*", waiting: "o", starting: ".", stalled: "!", finished: "-" })[kind],
+    spinner: ["|", "/", "-", "\\"],
+    frameMs: 150,
+    still: { waiting: "o", stalled: "!", finished: "-" },
     input: "in ",
     output: "out ",
     separator: " - ",
     ellipsis: "...",
   },
 };
+
+/** The status glyph at time `now`. Spinner frames depend only on the clock. */
+function statusGlyph(glyphs: GlyphSet, kind: WidgetStatusKind, now: number): string {
+  if (!isAnimatedWidgetKind(kind)) return glyphs.still[kind as keyof GlyphSet["still"]];
+  const frames = glyphs.spinner;
+  const step = Math.floor(now / glyphs.frameMs) % frames.length;
+  return frames[(step + frames.length) % frames.length];
+}
+
+/** Milliseconds between spinner frames for an icon set. */
+export function widgetSpinnerFrameMs(icons: StatusIconSet): number {
+  return GLYPHS[icons].frameMs;
+}
 
 function usageParts(usage: RunUsage | null, glyphs: GlyphSet): string[] {
   if (!usage) return [];
@@ -255,9 +274,9 @@ function fitIdentity(
     return { tree: "", badgeText: "", glyph: "", name: "", state: truncatePlain(state, fullWidth, glyphs.ellipsis) };
   }
 
-  const statusGlyph = glyphs.status(row.kind, now);
+  const kindGlyph = statusGlyph(glyphs, row.kind, now);
   // The glyph alone, outside any badge, plus the gap after it.
-  const glyphWidth = visibleWidth(statusGlyph) + 1;
+  const glyphWidth = visibleWidth(kindGlyph) + 1;
 
   // The tree connector comes next, then the glyph, then the indentation
   // before the connector. Widths include the gap after the prefix.
@@ -269,13 +288,13 @@ function fitIdentity(
   if (tree && base + treeWidth(row.treePrefix) + glyphRoom <= fullWidth) tree = row.treePrefix;
   const width = fullWidth - treeWidth(tree);
 
-  let glyph = nameAndState(minName) + glyphWidth <= width ? statusGlyph : "";
+  let glyph = nameAndState(minName) + glyphWidth <= width ? kindGlyph : "";
 
   // The badge holds the glyph first, then the profile. Its width counts the
   // gap after it.
   let badgeText = "";
   if (glyph) {
-    const badgeFor = (label: string) => ` ${[statusGlyph, label].filter(Boolean).join(" ")} `;
+    const badgeFor = (label: string) => ` ${[kindGlyph, label].filter(Boolean).join(" ")} `;
     const fits = (text: string, nameWidth: number) => visibleWidth(text) + 1 + nameAndState(nameWidth) <= width;
     const iconBadge = badgeFor([row.profileIcon, row.profile].filter(Boolean).join(" "));
     const fullBadge = badgeFor(row.profile);
@@ -382,5 +401,5 @@ export function widgetStatusIcon(
   icons: StatusIconSet,
   now: number,
 ): string {
-  return theme.fg(kindColor(kind), GLYPHS[icons].status(kind, now));
+  return theme.fg(kindColor(kind), statusGlyph(GLYPHS[icons], kind, now));
 }

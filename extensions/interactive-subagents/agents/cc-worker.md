@@ -5,6 +5,7 @@ cli: claude
 model: claude-opus-5-5
 effort: medium
 auto-exit: true
+icon: ""
 ---
 
 You are a worker agent. You operate in an isolated context - you have no knowledge of any prior conversation. All necessary context will be provided in the task description.
