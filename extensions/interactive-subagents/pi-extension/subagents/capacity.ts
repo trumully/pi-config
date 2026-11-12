@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
-import { dirname, join } from "node:path";
-import { fileURLToPath } from "node:url";
+import { join } from "node:path";
+import { readSubagentConfig, subagentConfigCandidates } from "./config.ts";
 import { processIsAlive } from "./lifecycle.ts";
 import { createExclusiveFile, isAlreadyExists, withExclusiveFile, type ExclusiveFile } from "./lock.ts";
 import { getRunningAgentSurface } from "./herdr.ts";
@@ -9,7 +9,6 @@ import { readNameRegistry } from "./session.ts";
 
 export const DEFAULT_MAX_CONCURRENT = 4;
 export const CAPACITY_SCOPE_ENV = "PI_SUBAGENT_CAPACITY_SCOPE";
-const PACKAGE_ROOT = join(dirname(fileURLToPath(import.meta.url)), "../..");
 
 export interface CapacityTicket { scope: string; id: string }
 interface Slot {
@@ -34,10 +33,8 @@ export function parseCapacityLimit(raw: unknown): number {
   return maximum;
 }
 
-export function loadCapacityLimit(): number {
-  const configured = join(PACKAGE_ROOT, "config.json");
-  const path = existsSync(configured) ? configured : join(PACKAGE_ROOT, "config.json.example");
-  return parseCapacityLimit(JSON.parse(readFileSync(path, "utf8")));
+export function loadCapacityLimit(candidates: readonly string[] = subagentConfigCandidates()): number {
+  return parseCapacityLimit(readSubagentConfig(candidates).config);
 }
 
 function pathFor(ticket: CapacityTicket): string {

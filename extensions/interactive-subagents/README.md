@@ -109,7 +109,19 @@ Claude Code children can receive `subagent_message` steers and return results. T
 
 ## Configuration
 
-Copy `config.json.example` to `config.json` in this extension directory. It is gitignored. The supported options are:
+Put your settings in `subagents.json` in Pi's agent directory: `~/.pi/agent/subagents.json` by default, or `$PI_CODING_AGENT_DIR/subagents.json` when that variable is set. The file lives outside the package, so it survives package updates and reinstalls. Start from a copy of `config.json.example`, which holds the bundled defaults and is replaced on update.
+
+The extension reads the first of these files that exists and uses it whole; sections are not merged across files:
+
+1. `<agent-dir>/subagents.json`
+2. `config.json` in this extension directory (legacy, gitignored; still read when no user file exists)
+3. `config.json.example` in this extension directory
+
+A selected file that is unreadable or holds invalid JSON is reported as an error; the extension does not fall back to the next file. If you still have a legacy `config.json`, move it to `<agent-dir>/subagents.json`. Restart Pi after editing.
+
+Pi children use the file the root session selected. Each launch or resume passes that file's absolute path to the child in the internal `PI_SUBAGENT_CONFIG_FILE` variable, and nested children pass it on unchanged. A child started in a project with its own `.pi/agent` still takes profiles and resources from there, but not settings: a `subagents.json` in that directory is ignored. If the inherited file is later deleted or broken, the child reports an error rather than reading another file. Edits to the file reach children launched or resumed afterward. Claude Code children do not read this file.
+
+The supported options are:
 
 ```json
 {

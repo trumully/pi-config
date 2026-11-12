@@ -7,14 +7,10 @@ import {
   writeFileSync,
 } from "node:fs";
 import { dirname, join } from "node:path";
-import { fileURLToPath } from "node:url";
+import { readSubagentConfig, subagentConfigCandidates } from "./config.ts";
 
 export const DEFAULT_PROACTIVE_COMPACTION_THRESHOLD_PERCENT = 70;
 export const PROACTIVE_COMPACTION_REARM_HYSTERESIS_PERCENT = 5;
-
-const PACKAGE_ROOT = join(dirname(fileURLToPath(import.meta.url)), "../..");
-const CONFIG_PATH = join(PACKAGE_ROOT, "config.json");
-const EXAMPLE_CONFIG_PATH = join(PACKAGE_ROOT, "config.json.example");
 
 export interface ProactiveCompactionConfig {
   enabled: boolean;
@@ -111,23 +107,11 @@ export function parseProactiveCompactionConfig(
   return { enabled, thresholdPercent };
 }
 
-export function loadProactiveCompactionConfig(): ProactiveCompactionConfig {
-  let raw: string;
-  try {
-    raw = readFileSync(CONFIG_PATH, "utf8");
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-    raw = readFileSync(EXAMPLE_CONFIG_PATH, "utf8");
-  }
-
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(raw);
-  } catch (error) {
-    const detail = error instanceof Error ? error.message : String(error);
-    throw new Error(`Invalid JSON in subagent config: ${detail}`);
-  }
-  return parseProactiveCompactionConfig(parsed, CONFIG_PATH);
+export function loadProactiveCompactionConfig(
+  candidates: readonly string[] = subagentConfigCandidates(),
+): ProactiveCompactionConfig {
+  const { sourcePath, config } = readSubagentConfig(candidates);
+  return parseProactiveCompactionConfig(config, sourcePath);
 }
 
 /** Latch once at threshold; rearm only after usage drops below threshold with hysteresis. */

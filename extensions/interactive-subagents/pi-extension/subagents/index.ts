@@ -119,6 +119,7 @@ import {
   loadProactiveCompactionConfig,
   readHandoffState,
 } from "./proactive-compaction.ts";
+import { SUBAGENT_CONFIG_FILE_ENV, selectedSubagentConfigFile } from "./config.ts";
 
 /** Absolute path to `pi-extension/subagents`. https://github.com/nodejs/node/issues/37845 */
 const SUBAGENTS_DIR = dirname(fileURLToPath(import.meta.url));
@@ -1680,6 +1681,9 @@ async function launchReservedSubagent(
   const effectiveSkills = agentDefs?.skills;
   const effectiveThinking = agentDefs?.cli === "claude" ? undefined : effectiveEffort;
   const effectiveInteractive = resolveEffectiveInteractive(params, agentDefs);
+  // Pi children read settings from the root session's file. Resolve it before
+  // any session, loadout or activity file is written, so a broken file leaves none.
+  const piChildConfigFile = agentDefs?.cli === "claude" ? null : selectedSubagentConfigFile();
 
   const sessionFile = ctx.sessionManager.getSessionFile();
   if (!sessionFile) throw new Error("No session file");
@@ -1870,6 +1874,8 @@ async function launchReservedSubagent(
   // Build env prefix: subagent identity + config dir propagation + spawn allowlist
   const childEnv: Record<string, string> = {};
   if (resolvedAgentDir) childEnv.PI_CODING_AGENT_DIR = resolvedAgentDir;
+  // Settings follow the root session, not a project-local agent dir.
+  if (piChildConfigFile) childEnv[SUBAGENT_CONFIG_FILE_ENV] = piChildConfigFile;
   if (grantSpawning && agentDefs?.subagentAgents) {
     childEnv.PI_SUBAGENT_ALLOWED = agentDefs.subagentAgents.join(",");
   }
@@ -3328,6 +3334,8 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         const childEnv: Record<string, string> = {};
         const resumeAgentDir = loadout.agentDir ?? process.env.PI_CODING_AGENT_DIR;
         if (resumeAgentDir) childEnv.PI_CODING_AGENT_DIR = resumeAgentDir;
+        // Settings follow the root session, not the saved agent dir.
+        childEnv[SUBAGENT_CONFIG_FILE_ENV] = selectedSubagentConfigFile();
         if (loadout.spawnable?.length) {
           childEnv.PI_SUBAGENT_ALLOWED = loadout.spawnable.join(",");
         }

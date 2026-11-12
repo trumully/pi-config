@@ -1,8 +1,9 @@
+import "./isolated-agent-dir.ts";
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync, spawn } from "node:child_process";
 import { once } from "node:events";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -28,7 +29,9 @@ import {
   type SubagentActivityState,
 } from "../pi-extension/subagents/activity.ts";
 import { registerSubagentProgress } from "../pi-extension/subagents/progress.ts";
-import { parseStatusConfig } from "../pi-extension/subagents/status.ts";
+import { loadStatusConfig, parseStatusConfig } from "../pi-extension/subagents/status.ts";
+import { loadCapacityLimit } from "../pi-extension/subagents/capacity.ts";
+import { loadProactiveCompactionConfig } from "../pi-extension/subagents/proactive-compaction.ts";
 import { plainWidgetTheme, renderCompactWidgetRows } from "../pi-extension/subagents/widget.ts";
 
 function createMockExtensionApi() {
@@ -124,6 +127,61 @@ function parentContext(directory: string, sessionId = "parent-session") {
     artifactDir: join(sessionDir, "artifacts", sessionId),
   };
 }
+
+/** The environment a fake hc launch hands the child, read from its private descriptor. */
+function launchEnv(runArgs: string[]): Record<string, string> {
+  return JSON.parse(readFileSync(runArgs.at(-1)!, "utf8")).env;
+}
+
+/** Run with these environment values (undefined deletes), then restore the previous ones. */
+async function withEnv<T>(values: Record<string, string | undefined>, run: () => T | Promise<T>): Promise<T> {
+  const saved = Object.fromEntries(Object.keys(values).map((key) => [key, process.env[key]]));
+  const apply = (next: Record<string, string | undefined>) => {
+    for (const [key, value] of Object.entries(next)) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+  };
+  apply(values);
+  try { return await run(); } finally { apply(saved); }
+}
+
+/**
+ * A root user config with non-default values, and a target project whose
+ * `.pi/agent` holds a conflicting subagents.json a child would otherwise read.
+ */
+function configInheritanceFixture(directory: string) {
+  const parentAgentDir = join(directory, "parent-agent");
+  const project = join(directory, "project");
+  const projectAgentDir = join(project, ".pi", "agent");
+  mkdirSync(parentAgentDir, { recursive: true });
+  mkdirSync(projectAgentDir, { recursive: true });
+  const parentConfig = join(parentAgentDir, "subagents.json");
+  writeFileSync(parentConfig, JSON.stringify({
+    status: { enabled: true, icons: "nerd", profileIcons: false },
+    limits: { maxConcurrent: 3 },
+    proactiveCompaction: { enabled: false, thresholdPercent: 55 },
+  }));
+  writeFileSync(join(projectAgentDir, "subagents.json"), JSON.stringify({
+    status: { enabled: false, icons: "ascii" },
+    limits: { maxConcurrent: 9 },
+    proactiveCompaction: { enabled: true, thresholdPercent: 90 },
+  }));
+  return { parentAgentDir, project, projectAgentDir, parentConfig };
+}
+
+/** What the child's three config loaders return under the env it was launched with. */
+function childLoadedConfig(env: Record<string, string>): Promise<unknown> {
+  return withEnv({ PI_CODING_AGENT_DIR: env.PI_CODING_AGENT_DIR, PI_SUBAGENT_CONFIG_FILE: env.PI_SUBAGENT_CONFIG_FILE }, () => ({
+    status: loadStatusConfig(), limit: loadCapacityLimit(), compaction: loadProactiveCompactionConfig(),
+  }));
+}
+
+const PARENT_SELECTED_CONFIG = {
+  status: { enabled: true, icons: "nerd", profileIcons: false, lineLimit: 4 },
+  limit: 3,
+  compaction: { enabled: false, thresholdPercent: 55 },
+};
 
 /** One row rendered with fixed settings, independent of the local config file. */
 function renderRunningRow(running: any): string {
@@ -474,6 +532,124 @@ describe("interactive subagents smoke tests", () => {
       hc.restore();
       if (savedAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
       else process.env.PI_CODING_AGENT_DIR = savedAgentDir;
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("pins a Pi child to the parent's config file when its project has its own agent directory", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "config-pin-launch-"));
+    const fixture = configInheritanceFixture(directory);
+    const hc = useFakeHc();
+    try {
+      await withEnv({ PI_CODING_AGENT_DIR: fixture.parentAgentDir, PI_SUBAGENT_CONFIG_FILE: undefined }, async () => {
+        const tool = registerSubagents().registeredTools.find((t: any) => t.name === "subagent");
+        const result = await tool.execute("pin", { agent: "scout", name: "pinned", task: "Probe.", cwd: fixture.project }, undefined, undefined, parentContext(directory));
+        assert.ok(!result.isError, result.content[0].text);
+      });
+      assert.equal(hc.runs.length, 1, "one fake hc launch");
+      const env = launchEnv(hc.runs[0]);
+      assert.equal(env.PI_CODING_AGENT_DIR, fixture.projectAgentDir, "profiles and resources still come from the project agent dir");
+      assert.equal(env.PI_SUBAGENT_CONFIG_FILE, fixture.parentConfig);
+      assert.deepEqual(await childLoadedConfig(env), PARENT_SELECTED_CONFIG);
+    } finally {
+      hc.restore();
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("refuses a seeded Pi launch with a broken selected config before writing any child files", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "config-pin-broken-"));
+    const agentDir = join(directory, "agent");
+    mkdirSync(join(agentDir, "agents"), { recursive: true });
+    writeFileSync(join(agentDir, "agents", "seeded.md"), "---\nname: seeded\nsession-mode: lineage-only\ntools: read\n---\nBody.\n");
+    const project = join(directory, "project");
+    mkdirSync(project);
+    const ctx = parentContext(directory);
+    writeFileSync(ctx.sessionManager.getSessionFile(), `${JSON.stringify({ type: "session", id: "parent-session" })}\n`);
+    const filesUnder = (root: string): string[] => existsSync(root)
+      ? readdirSync(root, { recursive: true, withFileTypes: true }).filter((e) => e.isFile()).map((e) => join(e.parentPath, e.name))
+      : [];
+    const hc = useFakeHc();
+    try {
+      for (const [label, pinned, write] of [
+        ["missing", join(directory, "gone.json"), null],
+        ["malformed", join(directory, "broken.json"), "{ not json"],
+      ] as const) {
+        if (write) writeFileSync(pinned, write);
+        const before = filesUnder(ctx.artifactDir);
+        await withEnv({ PI_CODING_AGENT_DIR: agentDir, PI_SUBAGENT_CONFIG_FILE: pinned }, async () => {
+          const tool = registerSubagents().registeredTools.find((t: any) => t.name === "subagent");
+          await assert.rejects(
+            tool.execute("pin", { agent: "seeded", name: `seeded-${label}`, task: "Probe.", cwd: project }, undefined, undefined, ctx),
+            (error: Error) => error.message.includes(pinned),
+            label,
+          );
+        });
+        assert.deepEqual(filesUnder(join(agentDir, "sessions")), [], `${label}: no child transcript or loadout`);
+        assert.deepEqual(filesUnder(ctx.artifactDir).filter((f) => !before.includes(f) && !/limit\.json$/.test(f)), [],
+          `${label}: no activity file or capacity slot left behind`);
+      }
+      assert.equal(hc.runs.length, 0, "no pane started");
+    } finally {
+      hc.restore();
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("passes an inherited config pin on to a nested child unchanged", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "config-pin-nested-"));
+    const fixture = configInheritanceFixture(directory);
+    const otherAgentDir = join(directory, "other-agent");
+    mkdirSync(otherAgentDir);
+    writeFileSync(join(otherAgentDir, "subagents.json"), JSON.stringify({ limits: { maxConcurrent: 8 } }));
+    const hc = useFakeHc();
+    try {
+      await withEnv({ PI_CODING_AGENT_DIR: otherAgentDir, PI_SUBAGENT_CONFIG_FILE: fixture.parentConfig }, async () => {
+        const tool = registerSubagents().registeredTools.find((t: any) => t.name === "subagent");
+        const result = await tool.execute("pin", { agent: "scout", name: "grandchild", task: "Probe.", cwd: fixture.project }, undefined, undefined, parentContext(directory));
+        assert.ok(!result.isError, result.content[0].text);
+      });
+      const env = launchEnv(hc.runs[0]);
+      assert.equal(env.PI_SUBAGENT_CONFIG_FILE, fixture.parentConfig);
+      assert.deepEqual(await childLoadedConfig(env), PARENT_SELECTED_CONFIG);
+    } finally {
+      hc.restore();
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("pins a resumed Pi child to the parent's config file despite its saved project agent directory", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "config-pin-resume-"));
+    const fixture = configInheritanceFixture(directory);
+    const hc = useFakeHc();
+    try {
+      const ctx = parentContext(directory);
+      const childSession = join(directory, "child.jsonl");
+      writeFileSync(childSession, `${JSON.stringify({ type: "session", id: "child-session" })}\n`);
+      writeSubagentLoadout(childSession, {
+        agent: null, toolAllowlist: null, model: null, thinking: null, systemPromptMode: null,
+        identity: null, spawnable: null, autoExit: true, cwd: fixture.project, agentDir: fixture.projectAgentDir,
+      });
+      registerName(ctx.artifactDir, "draft", {
+        sessionFile: childSession, sessionId: "child-session", running: false, runId: "r-old",
+        runMetadata: {
+          version: 1, state: "finished", parentSessionId: "parent-session", runId: "r-old",
+          herdrAgentName: "draft-r-old", surface: "draft-r-old", sessionFile: childSession,
+          transcriptOffset: 1, task: "Draft it.", startTime: 1, cli: "pi",
+        },
+      });
+      await withEnv({ PI_CODING_AGENT_DIR: fixture.parentAgentDir, PI_SUBAGENT_CONFIG_FILE: undefined }, async () => {
+        const tool = registerSubagents().registeredTools.find((t: any) => t.name === "subagent_message");
+        const result = await tool.execute("resume", { name: "draft", message: "Continue." }, undefined, undefined, ctx);
+        assert.equal(result.details.status, "started", result.content[0].text);
+      });
+      assert.equal(hc.runs.length, 1, "one fake hc launch");
+      const env = launchEnv(hc.runs[0]);
+      assert.equal(env.PI_CODING_AGENT_DIR, fixture.projectAgentDir, "resume keeps the saved agent dir");
+      assert.equal(env.PI_SUBAGENT_CONFIG_FILE, fixture.parentConfig);
+      assert.deepEqual(await childLoadedConfig(env), PARENT_SELECTED_CONFIG);
+    } finally {
+      hc.restore();
       rmSync(directory, { recursive: true, force: true });
     }
   });
