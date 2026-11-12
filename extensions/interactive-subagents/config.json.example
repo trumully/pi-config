@@ -1,8 +1,8 @@
 {
   "status": {
     "enabled": true,
-    "mode": "compact",
-    "icons": "unicode"
+    "icons": "unicode",
+    "profileIcons": true
   },
   "limits": { "maxConcurrent": 4 },
   "proactiveCompaction": {

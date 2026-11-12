@@ -1,7 +1,7 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { keyHint } from "@earendil-works/pi-coding-agent";
 import { Type, type Static } from "typebox";
-import { Box, Text, truncateToWidth, visibleWidth, type AutocompleteItem } from "@earendil-works/pi-tui";
+import { Box, Text, truncateToWidth, type AutocompleteItem } from "@earendil-works/pi-tui";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
@@ -42,11 +42,19 @@ import { captureSubagentUsage, readRunUsage, type RunUsageSnapshot } from "./usa
 import {
   plainWidgetTheme,
   renderCompactWidgetRows,
-  sanitizeDisplayText,
-  widgetStatusIcon,
   type WidgetRow,
   type WidgetTheme,
 } from "./widget.ts";
+import {
+  formatElapsedClock,
+  parseProfileIcon,
+  resolveProfileIcon,
+  statusObservationFromActivity,
+  statusRowFields,
+  SubagentTreeCollector,
+  TREE_USAGE_REFRESH_MS,
+  type TreeRowOptions,
+} from "./widget-tree.ts";
 import {
   isHerdrAvailable,
   herdrSetupHint,
@@ -84,11 +92,9 @@ import {
   type SubagentLoadout,
 } from "./session.ts";
 import {
-  type StatusSnapshot,
   type SubagentStatusState,
   advanceStatusState,
   capStatusLines,
-  classifyStatus,
   createStatusState,
   forceStatusAfterInterrupt,
   forceStatusAfterSteer,
@@ -99,7 +105,6 @@ import {
 } from "./status.ts";
 import {
   getSubagentActivityFile,
-  progressIndicators,
   readSubagentActivityFile,
   type ActivityReadResult,
   type SubagentActivityState,
@@ -194,6 +199,8 @@ interface AgentDefaults {
   sessionMode?: SubagentSessionMode;
   cwd?: string;
   cli?: string;
+  /** Literal glyph shown in the widget badge; display only. */
+  icon?: string;
   body?: string;
   disableModelInvocation?: boolean;
 }
@@ -426,6 +433,7 @@ function parseAgentDefinition(content: string, fallbackName: string): AgentDefin
     sessionMode: parseSessionMode(getFrontmatterValue(frontmatter, "session-mode")),
     cwd: getFrontmatterValue(frontmatter, "cwd"),
     cli: getFrontmatterValue(frontmatter, "cli"),
+    icon: parseProfileIcon(getFrontmatterValue(frontmatter, "icon")),
     body: body || undefined,
     disableModelInvocation:
       getFrontmatterValue(frontmatter, "disable-model-invocation")?.toLowerCase() === "true",
@@ -602,11 +610,6 @@ function formatUsageSegments(stats: SessionStats): string[] {
   return segs;
 }
 
-/** Map a live status kind to a themed icon from the configured icon set. */
-function widgetIcon(kind: StatusSnapshot["kind"], theme: WidgetTheme = plainWidgetTheme): string {
-  return widgetStatusIcon(kind, theme, statusConfig.icons, Date.now());
-}
-
 function herdrUnavailableResult() {
   return {
     content: [
@@ -638,25 +641,6 @@ const proactiveCompactionEnabled = (() => {
     return false;
   }
 })();
-
-function formatWidgetRightLabel(snapshot: StatusSnapshot): string {
-  if (snapshot.kind === "starting") return " starting… ";
-  if (snapshot.kind === "running") return ` running ${snapshot.elapsedText} `;
-  if (snapshot.kind === "active") {
-    const label = snapshot.activityLabel ?? snapshot.activeScope;
-    const duration = snapshot.activeDurationText ? ` ${snapshot.activeDurationText}` : "";
-    return label ? ` active · ${label}${duration} ` : " active ";
-  }
-  if (snapshot.kind === "waiting") {
-    const duration = snapshot.waitingDurationText ? ` ${snapshot.waitingDurationText}` : "";
-    const detail = snapshot.statusLabel ? ` · ${snapshot.statusLabel}` : "";
-    return ` waiting${duration}${detail} `;
-  }
-
-  const detail = snapshot.statusLabel ? ` · ${snapshot.statusLabel}` : "";
-  const duration = snapshot.snapshotProblemText ? ` ${snapshot.snapshotProblemText}` : "";
-  return ` stalled${detail}${duration} `;
-}
 
 function sendSubagentResult(
   pi: Pick<ExtensionAPI, "sendMessage">,
@@ -846,6 +830,8 @@ interface RunningSubagent {
   usage?: RunUsageSnapshot;
   usageCheckedAt?: number;
   statusState: SubagentStatusState;
+  /** Profile icon from the agent definition, for the widget badge. */
+  icon?: string;
   /**
    * When true, status transitions (stalled/recovered) do not wake the parent
    * session via a steer message. The widget still updates locally. Used for
@@ -884,91 +870,8 @@ let widgetInterval: ReturnType<typeof setInterval> | null = null;
 /** Interval timer for status transition checks. */
 let statusInterval: ReturnType<typeof setInterval> | null = null;
 
-function formatElapsedMMSS(startTime: number): string {
-  const seconds = Math.floor((Date.now() - startTime) / 1000);
-  const m = Math.floor(seconds / 60);
-  const s = seconds % 60;
-  return `${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")}`;
-}
-
-const BORDER_COLOR = "borderAccent";
-
-/**
- * Build a bordered content line: │left          right│
- * Left content is truncated if needed, right is preserved, padded to fill width.
- */
-function borderLine(left: string, right: string, width: number, theme: WidgetTheme = plainWidgetTheme): string {
-  const edge = theme.fg(BORDER_COLOR, "│");
-  if (width <= 0) return "";
-  if (width === 1) return edge;
-
-  // width = total visible chars for the whole line including │ and │
-  const contentWidth = Math.max(0, width - 2); // space inside the two │ chars
-  const rightVis = visibleWidth(right);
-
-  // If the status chunk alone is too wide, prefer preserving it in compact form
-  // rather than overflowing the terminal.
-  if (rightVis >= contentWidth) {
-    const truncRight = truncateToWidth(right, contentWidth);
-    const rightPad = Math.max(0, contentWidth - visibleWidth(truncRight));
-    return `${edge}${truncRight}${" ".repeat(rightPad)}${edge}`;
-  }
-
-  const maxLeft = Math.max(0, contentWidth - rightVis);
-  const truncLeft = truncateToWidth(left, maxLeft);
-  const leftVis = visibleWidth(truncLeft);
-  const pad = Math.max(0, contentWidth - leftVis - rightVis);
-  return `${edge}${truncLeft}${" ".repeat(pad)}${right}${edge}`;
-}
-
-/**
- * Build the bordered top line: ╭─ Title ──── info ─╮
- * All chars are accounted for within `width`.
- */
-function borderTop(title: string, info: string, width: number, theme: WidgetTheme = plainWidgetTheme): string {
-  if (width <= 0) return "";
-  if (width === 1) return theme.fg(BORDER_COLOR, "╭");
-
-  // ╭─ Title ───...─── info ─╮
-  // overhead: ╭─ (2) + space around title (2) + space around info (2) + ─╮ (2) = but we simplify
-  const inner = Math.max(0, width - 2); // inside ╭ and ╮
-  const titlePart = `─ ${title} `;
-  const infoPart = ` ${info} ─`;
-  const fillLen = Math.max(0, inner - titlePart.length - infoPart.length);
-  const fill = "─".repeat(fillLen);
-  const content = `${titlePart}${fill}${infoPart}`.slice(0, inner).padEnd(inner, "─");
-  return theme.fg(BORDER_COLOR, `╭${content}╮`);
-}
-
-/**
- * Build the bordered bottom line: ╰──────────────────╯
- */
-function borderBottom(width: number, theme: WidgetTheme = plainWidgetTheme): string {
-  if (width <= 0) return "";
-  if (width === 1) return theme.fg(BORDER_COLOR, "╰");
-
-  const inner = Math.max(0, width - 2);
-  return theme.fg(BORDER_COLOR, `╰${"─".repeat(inner)}╯`);
-}
-
-function renderMinimalSubagentWidgetLine(agents: RunningSubagent[], width: number): string[] {
-  const counts = new Map<string, number>();
-  for (const agent of agents) {
-    const kind = statusConfig.enabled ? classifyStatus(agent.statusState, Date.now()).kind : "running";
-    counts.set(kind, (counts.get(kind) ?? 0) + 1);
-  }
-  const labels = statusConfig.enabled
-    ? ["active", "waiting", "starting", "stalled", "running"]
-    : ["running"];
-  const summary = labels
-    .filter((label) => (counts.get(label) ?? 0) > 0)
-    .map((label) => `${counts.get(label)} ${label}`)
-    .join(" · ");
-  return [truncateToWidth(`↳ ${agents.length} subagents · ${summary}`, width)];
-}
-
 /** Busy transcripts change every second; parsing them that often is wasteful. */
-const WIDGET_USAGE_REFRESH_MS = 5000;
+const WIDGET_USAGE_REFRESH_MS = TREE_USAGE_REFRESH_MS;
 
 /**
  * Re-read this run's usage when its transcript or Claude sidecar changed,
@@ -987,63 +890,49 @@ function refreshWidgetUsage(agent: RunningSubagent, now = Date.now()): void {
   }, agent.usage);
 }
 
-function toWidgetRow(agent: RunningSubagent, now: number): WidgetRow {
-  const snapshot = classifyStatus(agent.statusState, now);
-  const kind = statusConfig.enabled ? snapshot.kind : "running";
-  const activity = !statusConfig.enabled
-    ? null
-    : kind === "active"
-      ? snapshot.activityLabel ?? snapshot.activeScope
-      : snapshot.statusLabel;
+/** Named descendants of the running direct agents, read on the widget timer. */
+const subagentTree = new SubagentTreeCollector();
+
+/** Re-read descendant registries, activity and usage. Never called from render. */
+function refreshSubagentTree(agents: RunningSubagent[], now = Date.now()): void {
+  try {
+    const selfSessionFile = latestCtx?.sessionManager?.getSessionFile?.() ?? undefined;
+    subagentTree.refresh(
+      agents.map((agent) => ({ id: agent.id, sessionFile: agent.sessionFile, cli: agent.cli })),
+      now,
+      selfSessionFile,
+    );
+  } catch {
+    // Descendant rows are best effort; the direct agents still render.
+  }
+}
+
+function treeRowOptions(): TreeRowOptions {
+  return { icons: statusConfig.icons, profileIcons: statusConfig.profileIcons, statusEnabled: statusConfig.enabled };
+}
+
+function toWidgetRow(agent: RunningSubagent, now: number, options = treeRowOptions()): WidgetRow {
   return {
     profile: agent.agent,
     name: agent.name,
-    kind,
-    activity,
-    elapsed: formatElapsedMMSS(agent.startTime),
+    ...statusRowFields(agent.statusState, now, options.statusEnabled),
+    elapsed: formatElapsedClock(agent.startTime, now),
     usage: agent.usage?.usage ?? null,
+    profileIcon: resolveProfileIcon(agent.agent, agent.icon, options.icons, options.profileIcons),
+    treePrefix: "",
   };
 }
 
+/** One row per direct agent, each followed by its live named descendants. */
 function renderSubagentWidgetLines(
   agents: RunningSubagent[],
   width: number,
-  mode: "compact" | "minimal" | "full" = statusConfig.mode,
   theme: WidgetTheme = plainWidgetTheme,
+  now = Date.now(),
 ): string[] {
-  if (mode === "compact") {
-    const now = Date.now();
-    return renderCompactWidgetRows(agents.map((agent) => toWidgetRow(agent, now)), width, theme, statusConfig.icons);
-  }
-  if (mode === "minimal") return renderMinimalSubagentWidgetLine(agents, width);
-  const count = agents.length;
-  const title = "Subagents";
-  const info = `${count} running`;
-  const lines: string[] = [borderTop(title, info, width, theme)];
-
-  for (const agent of agents) {
-    const elapsed = formatElapsedMMSS(agent.startTime);
-    const agentTag = agent.agent ? ` (${sanitizeDisplayText(agent.agent)})` : "";
-    const snapshot = classifyStatus(agent.statusState, Date.now());
-    const icon = widgetIcon(snapshot.kind, theme);
-    let left = ` ${icon} ${elapsed}  ${sanitizeDisplayText(agent.name)}${agentTag} `;
-    const right = statusConfig.enabled
-      ? ` ${sanitizeDisplayText(formatWidgetRightLabel(snapshot))} `
-      : agent.cli === "claude"
-        ? " running… "
-        : " starting… ";
-    // Optional counts never displace the name/profile or lifecycle status.
-    const progress = agent.activityRead?.ok && agent.activity?.phase !== "done"
-      ? agent.activity?.progress : undefined;
-    for (const indicator of progressIndicators(progress, Date.now())) {
-      const extra = `${indicator} `;
-      if (visibleWidth(left) + visibleWidth(extra) + visibleWidth(right) + 2 <= width) left += extra;
-    }
-    lines.push(borderLine(left, right, width, theme));
-  }
-
-  lines.push(borderBottom(width, theme));
-  return lines;
+  const options = treeRowOptions();
+  const rows = agents.flatMap((agent) => [toWidgetRow(agent, now, options), ...subagentTree.rowsFor(agent.id, now, options)]);
+  return renderCompactWidgetRows(rows, width, theme, statusConfig.icons, now);
 }
 
 /** Widget factory for setWidget; Pi supplies the current theme on each mount. */
@@ -1051,7 +940,7 @@ function subagentWidgetFactory(getAgents: () => RunningSubagent[]) {
   return (_tui: unknown, theme: WidgetTheme) => ({
     invalidate() {},
     render(width: number) {
-      return renderSubagentWidgetLines(getAgents(), width, statusConfig.mode, theme);
+      return renderSubagentWidgetLines(getAgents(), width, theme);
     },
   });
 }
@@ -1222,14 +1111,6 @@ function buildPiPromptArgs(params: { effectiveSkills?: string; taskArg: string }
   return [...skillPrompts, params.taskArg];
 }
 
-function activityLabel(activity: SubagentActivityState): string | undefined {
-  if (activity.phase !== "active") return undefined;
-  if (activity.activeScope === "tool") return activity.toolName ?? "tool";
-  if (activity.activeScope === "provider") return "provider";
-  if (activity.activeScope === "streaming") return "streaming";
-  return activity.activeScope;
-}
-
 function observeRunningSubagent(running: RunningSubagent, observedAt = Date.now()) {
   if (running.cli === "claude") return;
 
@@ -1241,28 +1122,8 @@ function observeRunningSubagent(running: RunningSubagent, observedAt = Date.now(
   running.activityRead = read.ok
     ? { ok: true }
     : { ok: false, reason: read.reason, error: read.error };
-
-  if (read.ok) {
-    running.activity = read.activity;
-    running.statusState = observeStatus(running.statusState, {
-      snapshot: "present",
-      updatedAt: read.activity.updatedAt,
-      sequence: read.activity.sequence,
-      phase: read.activity.phase,
-      active: read.activity.phase === "active",
-      activeScope: read.activity.activeScope,
-      activeSince: read.activity.activeSince,
-      waitingSince: read.activity.waitingSince,
-      latestEvent: read.activity.latestEvent,
-      activityLabel: activityLabel(read.activity),
-    }, observedAt);
-    return;
-  }
-
-  running.statusState = observeStatus(running.statusState, {
-    snapshot: read.reason,
-    snapshotError: read.error,
-  }, observedAt);
+  if (read.ok) running.activity = read.activity;
+  running.statusState = observeStatus(running.statusState, statusObservationFromActivity(read), observedAt);
 }
 
 /**
@@ -1605,7 +1466,6 @@ function formatSubagentMessage(
 }
 
 export const __test__ = {
-  borderLine,
   renderSubagentWidgetLines,
   proactiveCompactionEnabled,
   loadAgentDefaults,
@@ -1624,7 +1484,6 @@ export const __test__ = {
   handleClaudeLaunchError,
   buildPiPromptArgs,
   formatResumeTaskPrompt,
-  formatWidgetRightLabel,
   observeRunningSubagent,
   getToolExtensionPath,
   resolveBundledOrGlobalPath,
@@ -1653,11 +1512,13 @@ export const __test__ = {
   formatContextUsage,
   contextWindowFor,
   formatUsageSegments,
-  renderMinimalSubagentWidgetLine,
   reconcileParentRuns,
-  widgetIcon,
   refreshWidgetUsage,
   subagentWidgetFactory,
+  refreshSubagentTree,
+  subagentTree,
+  parseAgentDefinition,
+  toWidgetRow,
 };
 
 function writeClaudeSystemPromptFile(artifactDir: string, id: string, systemPrompt: string): string {
@@ -1709,16 +1570,16 @@ function buildClaudeCliArgs(options: {
 
 function startWidgetRefresh() {
   if (widgetInterval) return;
+  refreshSubagentTree(Array.from(runningSubagents.values()));
   updateWidget(); // immediate first render
   widgetInterval = setInterval(() => {
-    // Counts remain available when lifecycle status notifications are disabled.
+    // Keep activity current when lifecycle status notifications are disabled.
     if (!statusConfig.enabled) {
       for (const running of runningSubagents.values()) observeRunningSubagent(running);
     }
-    // Only compact rows show usage; other modes skip the reads.
-    if (statusConfig.mode === "compact") {
-      for (const running of runningSubagents.values()) refreshWidgetUsage(running);
-    }
+    const now = Date.now();
+    for (const running of runningSubagents.values()) refreshWidgetUsage(running, now);
+    refreshSubagentTree(Array.from(runningSubagents.values()), now);
     updateWidget();
   }, 1000);
   (globalThis as any)[WIDGET_INTERVAL_KEY] = widgetInterval;
@@ -1864,6 +1725,7 @@ async function launchReservedSubagent(
       usageFile: `${sentinelFile}.usage.json`, askFile: `${sentinelFile}.ask`,
       pendingFile: `${sentinelFile}.pending`, sentinelFile, profile: params.agent, task: params.task,
       startTime, cli: "claude", interactive: effectiveInteractive, capacity,
+      ...(agentDefs?.icon ? { icon: agentDefs.icon } : {}),
     };
     const attempt = new LaunchAttempt({
       parentArtifactDir, name: params.name, runId: id, sessionFile: subagentSessionFile, capacity, prior: null,
@@ -1891,6 +1753,7 @@ async function launchReservedSubagent(
       name: params.name,
       task: params.task,
       agent: params.agent,
+      icon: agentDefs?.icon,
       surface,
       herdrTabId: tabId,
       herdrAgentName,
@@ -2002,6 +1865,7 @@ async function launchReservedSubagent(
       transcriptOffset: startEntryCount, ownerToken, activityFile,
       askFile: `${subagentSessionFile}.ask`, pendingFile: `${subagentSessionFile}.pending`, profile: params.agent,
       task: params.task, startTime, cli: "pi", interactive: effectiveInteractive, capacity,
+      ...(agentDefs?.icon ? { icon: agentDefs.icon } : {}),
     };
     attempt.claim({
       sessionFile: subagentSessionFile, sessionId: getSessionId(subagentSessionFile),
@@ -2024,6 +1888,7 @@ async function launchReservedSubagent(
     name: params.name,
     task: params.task,
     agent: params.agent,
+    icon: agentDefs?.icon,
     surface,
     herdrTabId: tabId,
     herdrAgentName,
@@ -2206,7 +2071,8 @@ async function resumeClaudeSubagent(
     version: 1, state: "launching", parentSessionId, runId: id, herdrAgentName, surface,
     ...(tabId ? { herdrTabId: tabId } : {}), sessionFile: entry.sessionFile, transcriptOffset: 0,
     usageFile, askFile: `${sentinelFile}.ask`, pendingFile: `${sentinelFile}.pending`, sentinelFile,
-    ...(prior.profile ? { profile: prior.profile } : {}), task: message, startTime, cli: "claude", interactive, capacity,
+    ...(prior.profile ? { profile: prior.profile } : {}), ...(prior.icon ? { icon: prior.icon } : {}),
+    task: message, startTime, cli: "claude", interactive, capacity,
   };
   const taskBrief = params.intent === "task" ? message : entry.taskBrief;
   const attempt = new LaunchAttempt({
@@ -2225,7 +2091,7 @@ async function resumeClaudeSubagent(
   await attempt.recordConfirmed({ usageFile, running: true, taskBrief, runMetadata });
 
   const running: RunningSubagent = {
-    id, name, task: message, agent: prior.profile, surface, herdrTabId: tabId, herdrAgentName, startTime,
+    id, name, task: message, agent: prior.profile, icon: prior.icon, surface, herdrTabId: tabId, herdrAgentName, startTime,
     startEntryCount: 0, sessionFile: entry.sessionFile, cli: "claude", sentinelFile,
     askFile: `${sentinelFile}.ask`, pendingFile: `${sentinelFile}.pending`, usageFile, interactive,
     parentSessionId, parentArtifactDir, runMetadata,
@@ -2675,7 +2541,7 @@ async function reconcileParentRuns(pi: ExtensionAPI, ctx: ExtensionContext, pare
     const current = resolveNameInRegistry(artifactDir, name);
     if (current?.runId !== meta.runId || !current.running || !isCurrent()) continue;
     const running: RunningSubagent = {
-      id: meta.runId, name, task: current.taskBrief ?? meta.task, agent: meta.profile, surface: meta.surface,
+      id: meta.runId, name, task: current.taskBrief ?? meta.task, agent: meta.profile, icon: meta.icon, surface: meta.surface,
       herdrTabId: meta.herdrTabId, herdrAgentName: meta.herdrAgentName, startTime: meta.startTime,
       startEntryCount: meta.transcriptOffset, sessionFile: meta.sessionFile,
       activityFile: meta.activityFile, askFile: meta.askFile, pendingFile: meta.pendingFile,
@@ -3466,6 +3332,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
             transcriptOffset: entryCountBefore, ownerToken, activityFile,
             askFile: `${sessionPath}.ask`, pendingFile: `${sessionPath}.pending`, profile: loadout.agent ?? undefined,
             task: message, startTime, cli: "pi", interactive, capacity,
+            ...(priorRun?.icon && priorRun.profile === (loadout.agent ?? undefined) ? { icon: priorRun.icon } : {}),
           };
           attempt.claim({ ...entry, running: true, runId: id, runMetadata });
           attempt.archiveSignals();
@@ -3483,6 +3350,8 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           id,
           name,
           task: message,
+          agent: loadout.agent ?? undefined,
+          icon: runMetadata.icon,
           surface,
           herdrTabId: tabId,
           herdrAgentName,

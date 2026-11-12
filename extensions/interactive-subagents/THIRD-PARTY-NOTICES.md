@@ -2,7 +2,7 @@
 
 The tasker, architect and writer roles, plus targeted lookup and review guidance, are adapted from [pi-subagent-manager](https://github.com/championswimmer/pi-subagent-manager). Tool names, permissions and delivery behavior follow this repository's Herdr setup.
 
-The compact status widget's row style (profile badge, state, activity, right-aligned duration, tokens and cost) and its Nerd Font glyph choices (circle slices U+F0A9E–U+F0AA5 at 180 ms per frame, U+F03E5 and U+F0159) follow the same project. The layout code is this repository's own; it keeps identity and status ahead of metrics on narrow terminals.
+The status widget's row style (profile badge, state, activity, right-aligned duration, tokens and cost), its nested tree of descendant agents, and its Nerd Font glyph choices follow the same project. Status glyphs: circle slices U+F0A9E–U+F0AA5 at 180 ms per frame, U+F03E5 (waiting), U+F0159 (stalled) and U+F05E0 (finished). Default profile glyphs: U+F0AD (worker, cc-worker), U+F002 (scout), U+F09B (gh-scout), U+F0AC (researcher), U+F040 (writer), U+F0E8 (architect), U+F0AE (tasker) and U+F06E (reviewer, cc-reviewer). The layout code is this repository's own; it keeps identity and status ahead of metrics on narrow terminals.
 
 MIT License
 
