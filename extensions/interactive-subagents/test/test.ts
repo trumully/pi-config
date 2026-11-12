@@ -326,7 +326,7 @@ describe("compact subagent progress", () => {
     try {
       testApi.refreshSubagentTree([base], now);
       const lines = testApi.renderSubagentWidgetLines([base], 100, undefined, now);
-      assert.equal(lines.length, 2);
+      assert.deepEqual([lines.length, lines.at(-1)], [3, ""]); // two rows and the bottom spacer
       assert.match(lines[0], /WorkerName/);
       // No activity file yet: the child shows as starting, not finished or hidden.
       assert.match(lines[1], /^└─ .*scout.*find-docs.*starting/);
@@ -441,7 +441,7 @@ describe("interactive subagents smoke tests", () => {
       const [running] = hc.started();
       assert.deepEqual({ agent: running.agent, icon: running.icon }, { agent: "writer", icon: "✎" });
       assert.equal(readNameRegistry(ctx.artifactDir).draft.runMetadata?.icon, "✎");
-      assert.match(renderRunningRow(running), /^ [⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏] ✎ writer  draft running/);
+      assert.match(renderRunningRow(running), /^ [⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏] ✎ writer  draft \[running\]/);
     } finally {
       hc.restore();
       rmSync(directory, { recursive: true, force: true });
@@ -466,7 +466,7 @@ describe("interactive subagents smoke tests", () => {
         const running = hc.started().find((r: any) => r.name === name);
         assert.deepEqual({ agent: running.agent, icon: running.icon }, { agent, icon });
         assert.equal(readNameRegistry(ctx.artifactDir)[name].runMetadata?.icon, icon);
-        assert.match(renderRunningRow(running), new RegExp(`^ [⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏] ${icon} ${agent}  ${name} running`));
+        assert.match(renderRunningRow(running), new RegExp(`^ [⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏] ${icon} ${agent}  ${name} \\[running\\]`));
       }
       assert.equal(hc.runs.length, 2);
     } finally {
@@ -503,7 +503,7 @@ describe("interactive subagents smoke tests", () => {
       const [running] = hc.started();
       assert.deepEqual({ agent: running.agent, icon: running.icon, cli: running.cli }, { agent: "cc-reviewer", icon: "◆", cli: "claude" });
       assert.equal(readNameRegistry(ctx.artifactDir).review.runMetadata?.icon, "◆");
-      assert.match(renderRunningRow(running), /^ [⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏] ◆ cc-reviewer  review running/);
+      assert.match(renderRunningRow(running), /^ [⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏] ◆ cc-reviewer  review \[running\]/);
     } finally {
       for (const running of hc.started()) if (running.sentinelFile) rmSync(running.sentinelFile, { force: true });
       hc.restore();
@@ -534,7 +534,7 @@ describe("interactive subagents smoke tests", () => {
       await testApi.reconcileParentRuns(api, ctx, "parent-session", ctx.artifactDir, () => true);
       const [running] = hc.started();
       assert.deepEqual({ id: running?.id, agent: running?.agent, icon: running?.icon }, { id: "r-live", agent: "writer", icon: "✎" });
-      assert.match(renderRunningRow(running), /^ [⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏] ✎ writer  draft running/);
+      assert.match(renderRunningRow(running), /^ [⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏] ✎ writer  draft \[running\]/);
     } finally {
       hc.restore();
       rmSync(directory, { recursive: true, force: true });
@@ -1338,10 +1338,10 @@ describe("interactive subagents smoke tests", () => {
       const agent = widgetAgent({ name: "extension-readmes", sessionFile });
       testApi.refreshWidgetUsage(agent);
       const lines = testApi.renderSubagentWidgetLines([agent], 120, ansiTheme());
-      assert.equal(lines.length, 1);
+      assert.deepEqual([lines.length, lines.at(-1)], [2, ""]); // one row and the bottom spacer
       assert.ok(visibleWidth(lines[0]) <= 120);
       const plain = stripTerminalSequences(lines[0]);
-      assert.match(plain, /^ \S worker  extension-readmes waiting +01:36  ↑12k ↓6\.8k  \$0\.1230$/);
+      assert.match(plain, /^ \S worker  extension-readmes \[waiting\] +01:36  ↑12k ↓6\.8k  \$0\.1230$/);
     } finally {
       rmSync(directory, { recursive: true, force: true });
     }
@@ -1605,36 +1605,36 @@ describe("compact widget layout", () => {
   };
 
   it("drops activity and metrics before profile, name, or status on narrow terminals", () => {
-    assert.match(plainRows([row()], 120)[0], /^ ⠋ worker  WorkerName active · reading files +01:36  ↑12k ↓6\.8k  \$0\.1230$/);
-    assert.match(plainRows([row()], 40)[0], /^ ⠋ worker  WorkerName active +01:36$/);
-    const tiny = plainRows([row()], 24)[0];
-    assert.match(tiny, /^ ⠋ worker  Work\S*… active$/);
+    assert.match(plainRows([row()], 120)[0], /^ ⠋ worker  WorkerName · reading files +01:36  ↑12k ↓6\.8k  \$0\.1230$/);
+    assert.match(plainRows([row()], 40)[0], /^ ⠋ worker  WorkerName \[active\] +01:36$/);
+    const tiny = plainRows([row()], 26)[0];
+    assert.match(tiny, /^ ⠋ worker  Wor\.\.\. \[active\]$/);
     assert.doesNotMatch(tiny, /01:36|↑|\$/);
   });
 
   it("keeps the full state and a useful name ahead of a long profile badge", () => {
     const researcher = (overrides: Record<string, unknown> = {}) => row({ profile: "researcher", ...overrides });
     // Room to spare: full badge, glyph, name and state.
-    assert.match(plainRows([researcher()], 34)[0], /^ ⠋ researcher  WorkerName active/);
+    assert.match(plainRows([researcher()], 34)[0], /^ ⠋ researcher  WorkerName \[active\]/);
     for (const kind of ["active", "starting", "stalled", "waiting"]) {
-      for (const width of [18, 20, 22, 24, 26]) {
+      for (const width of [20, 22, 24, 26, 28]) {
         const line = plainRows([researcher({ kind })], width)[0];
-        assert.ok(line.endsWith(` ${kind}`), `width ${width} ${kind}: ${JSON.stringify(line)}`);
+        assert.ok(line.endsWith(` [${kind}]`), `width ${width} ${kind}: ${JSON.stringify(line)}`);
         const name = line.match(/(\S+) \S+$/)![1];
         assert.ok(visibleWidth(name) >= 6, `width ${width} ${kind}: name ${JSON.stringify(name)}`);
       }
     }
-    assert.match(plainRows([researcher()], 18)[0], /^⠋ WorkerNa… active$/);
-    assert.match(plainRows([researcher()], 20)[0], /^⠋ WorkerName active/);
-    assert.match(plainRows([researcher({ kind: "starting" })], 18)[0], /^⠋ Worker… starting$/);
+    assert.match(plainRows([researcher()], 20)[0], /^⠋ Worker\.\.\. \[active\]$/);
+    assert.match(plainRows([researcher()], 22)[0], /^⠋ WorkerName \[active\]/);
+    assert.match(plainRows([researcher({ kind: "starting" })], 20)[0], /^⠋ Work\.\.\. \[starting\]$/);
     // Without room for the full badge, the name comes first and the badge is shortened.
-    assert.match(plainRows([researcher()], 25)[0], /^ ⠋ re…  WorkerName active$/);
+    assert.match(plainRows([researcher()], 29)[0], /^ ⠋ re\.\.\.  WorkerName \[active\]$/);
     // Wide names keep a useful prefix.
-    assert.match(plainRows([researcher({ name: "日本語の名前です" })], 18)[0], /^⠋ 日本語の… active$/);
+    assert.match(plainRows([researcher({ name: "日本語の名前です" })], 20)[0], /^⠋ 日本語\.\.\. \[active\]$/);
     // Impossible widths degrade deterministically, state first.
-    assert.equal(plainRows([researcher({ kind: "starting" })], 12)[0], "Wo… starting");
-    assert.equal(plainRows([researcher({ kind: "starting" })], 8)[0], "starting");
-    assert.equal(plainRows([researcher({ kind: "starting" })], 5)[0], "star…");
+    assert.equal(plainRows([researcher({ kind: "starting" })], 15)[0], "W... [starting]");
+    assert.equal(plainRows([researcher({ kind: "starting" })], 10)[0], "[starting]");
+    assert.equal(plainRows([researcher({ kind: "starting" })], 5)[0], "[s...");
   });
 
   it("strips terminal controls from agent text and keeps wide text within the width", () => {
@@ -1644,7 +1644,7 @@ describe("compact widget layout", () => {
       assert.ok(visibleWidth(raw) <= width, `width ${width}: ${JSON.stringify(raw)}`);
       assert.doesNotMatch(raw, /\x1b\]|\x1b\[31m|\x07|[\n\t]/);
     }
-    assert.match(stripTerminalSequences(renderCompactWidgetRows([hostile], 80, ansiTheme(), "unicode", 0)[0]), /^ ⠋ 日本語  Evil Name active · tool call +01:36/);
+    assert.match(stripTerminalSequences(renderCompactWidgetRows([hostile], 80, ansiTheme(), "unicode", 0)[0]), /^ ⠋ 日本語  Evil Name · tool call +01:36/);
   });
 
   it("draws status glyphs from the configured icon set", () => {
@@ -1657,7 +1657,8 @@ describe("compact widget layout", () => {
 
     const ascii = plainRows(kinds, 120, "ascii");
     assert.deepEqual(ascii.map((line) => line.split(" ")[1]), ["|", "|", "o", "|", "!"]);
-    assert.match(ascii[0], /active - tool call +01:36  in 12k out 6\.8k  \$0\.1230$/);
+    assert.match(ascii[0], /WorkerName - tool call +01:36  in 12k out 6\.8k  \$0\.1230$/);
+    assert.match(ascii[1], /WorkerName \[running\] - tool call +01:36/);
     for (const line of [...ascii, ...plainRows(kinds, 24, "ascii")]) assert.match(line, /^[\x20-\x7e]*$/);
 
     const nerd = plainRows(kinds, 120, "nerd").map((line) => line.split(" ")[1].codePointAt(0)!);
@@ -1685,7 +1686,29 @@ describe("compact widget layout", () => {
     assert.equal(typeof badge.color.bg.token, "string", "badge background comes from theme.colors");
     assert.deepEqual(badge.color.fg, { kind: "rgb", r: 0, g: 0, b: 0 }, "dark text on a light badge");
     assert.equal(badge.color.bold, true);
-    assert.ok(theme.calls.some((call) => call.method === "fg" && call.color === "error" && call.text === "stalled"));
+    assert.ok(theme.calls.some((call) => call.method === "fg" && call.color === "error" && call.text === "[stalled]"));
+  });
+
+  it("leaves one blank line below a nonempty widget, and none otherwise", () => {
+    const testApi = (subagentsModule as any).__test__;
+    const agents = [widgetAgent(), widgetAgent({ id: "agent-2", name: "Second" })];
+    const direct = (list: any[], width: number) => testApi.renderSubagentWidgetLines(list, width, ansiTheme());
+    const mounted = (list: any[], width: number) => {
+      const component = testApi.subagentWidgetFactory(() => list)(undefined, ansiTheme());
+      try { return component.render(width); } finally { component.dispose?.(); }
+    };
+    for (const [label, render] of [["wrapper", direct], ["mounted factory", mounted]] as const) {
+      for (const list of [agents.slice(0, 1), agents]) {
+        const lines = render(list, 100);
+        assert.equal(lines.length, list.length + 1, `${label}: ${JSON.stringify(lines)}`);
+        assert.equal(lines.at(-1), "", `${label}: last line is not blank`);
+        for (const line of lines.slice(0, -1)) assert.match(stripTerminalSequences(line), /\S/, `${label}: blank data row`);
+      }
+      assert.deepEqual(render([], 100), [], `${label}: phantom spacer without agents`);
+      assert.deepEqual(render(agents, 0), [], `${label}: spacer at zero width`);
+      assert.deepEqual(render(agents, -5), [], `${label}: spacer at negative width`);
+    }
+    assert.equal(renderCompactWidgetRows([row()], 100, ansiTheme(), "unicode").length, 1, "data rows stay free of the spacer");
   });
 
   describe("spinner animation in the mounted widget", () => {
@@ -1798,7 +1821,7 @@ describe("compact widget layout", () => {
       const theme = ansiTheme();
       const long = row({ name: "a-very-long-agent-name", activity: "editing a long file name", usage: null });
       renderCompactWidgetRows([long], 30, theme, icons); // name truncated
-      renderCompactWidgetRows([long], 70, theme, icons); // activity truncated
+      renderCompactWidgetRows([long], 64, theme, icons); // activity truncated
       const truncated = theme.calls.filter((call) => call.method === "fg" && /…|\.\.\./.test(call.text));
       assert.equal(truncated.length, 2, icons);
       for (const call of truncated) assert.doesNotMatch(call.text, /\x1b/, `${icons}: ${JSON.stringify(call.text)}`);
