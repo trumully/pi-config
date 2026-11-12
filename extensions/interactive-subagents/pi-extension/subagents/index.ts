@@ -937,7 +937,12 @@ function renderSubagentWidgetLines(
   theme: WidgetTheme = plainWidgetTheme,
   now = Date.now(),
 ): string[] {
-  return renderCompactWidgetRows(subagentWidgetRows(agents, now), width, theme, statusConfig.icons, now);
+  return withBottomSpacer(renderCompactWidgetRows(subagentWidgetRows(agents, now), width, theme, statusConfig.icons, now));
+}
+
+/** One blank line below a nonempty widget keeps it clear of Pi's input separator. */
+function withBottomSpacer(lines: string[]): string[] {
+  return lines.length > 0 ? [...lines, ""] : lines;
 }
 
 /** The part of Pi's TUI the widget uses. Absent when a caller mounts the widget without one. */
@@ -973,7 +978,7 @@ function subagentWidgetFactory(getAgents: () => RunningSubagent[]) {
         const now = Date.now();
         const rows = subagentWidgetRows(getAgents(), now);
         if (rows.some((row) => isAnimatedWidgetKind(row.kind))) scheduleFrame(now);
-        return renderCompactWidgetRows(rows, width, theme, statusConfig.icons, now);
+        return withBottomSpacer(renderCompactWidgetRows(rows, width, theme, statusConfig.icons, now));
       },
       dispose() {
         disposed = true;

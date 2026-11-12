@@ -89,8 +89,10 @@ interface GlyphSet {
   input: string;
   output: string;
   separator: string;
-  ellipsis: string;
 }
+
+/** The mark the widget adds where it cuts text, in every icon set. */
+const ELLIPSIS = "...";
 
 // Nerd Font Material Design circle slices 1-8, plus pause-circle and
 // close-circle icons. These choices follow pi-subagent-manager (MIT); see
@@ -110,7 +112,6 @@ const GLYPHS: Record<StatusIconSet, GlyphSet> = {
     input: "↑",
     output: "↓",
     separator: " · ",
-    ellipsis: "…",
   },
   nerd: {
     spinner: Array.from({ length: NERD_LOADER_FRAMES }, (_, i) => String.fromCodePoint(NERD_LOADER_START + i)),
@@ -119,7 +120,6 @@ const GLYPHS: Record<StatusIconSet, GlyphSet> = {
     input: "↑",
     output: "↓",
     separator: " · ",
-    ellipsis: "…",
   },
   ascii: {
     spinner: ["|", "/", "-", "\\"],
@@ -128,7 +128,6 @@ const GLYPHS: Record<StatusIconSet, GlyphSet> = {
     input: "in ",
     output: "out ",
     separator: " - ",
-    ellipsis: "...",
   },
 };
 
@@ -226,12 +225,22 @@ function truncatePlain(text: string, width: number, ellipsis: string): string {
 }
 
 const GAP = "  ";
+// Each minimum keeps a few real characters ahead of the ellipsis.
 /** Show activity only when at least this many of its columns fit. */
-const MIN_ACTIVITY_WIDTH = 4;
+const MIN_ACTIVITY_WIDTH = 6;
 /** Columns of name kept before the glyph or badge get space. */
 const MIN_NAME_WIDTH = 6;
 /** Shortest profile text worth showing in a shortened badge. */
-const MIN_BADGE_LABEL_WIDTH = 3;
+const MIN_BADGE_LABEL_WIDTH = 5;
+
+/**
+ * The lifecycle label, bracketed so it reads as a status rather than part of
+ * the name. Claude agents report less detail than Pi agents, so "[running]"
+ * marks a state the widget knows only coarsely.
+ */
+function lifecycleLabel(kind: WidgetStatusKind): string {
+  return `[${kind}]`;
+}
 
 interface Identity {
   tree: string;
@@ -257,21 +266,21 @@ function fitIdentity(
   glyphs: GlyphSet,
   now: number,
 ): Identity {
-  const state = row.kind;
+  const state = lifecycleLabel(row.kind);
   const stateWidth = visibleWidth(state);
   const fullNameWidth = visibleWidth(row.name);
   const minName = Math.min(fullNameWidth, MIN_NAME_WIDTH);
   const nameAndState = (nameWidth: number) => nameWidth + (nameWidth > 0 ? 1 : 0) + stateWidth;
   const shortName = (room: number) =>
-    room >= fullNameWidth ? row.name : truncatePlain(row.name, room, glyphs.ellipsis);
+    room >= fullNameWidth ? row.name : truncatePlain(row.name, room, ELLIPSIS);
 
   if (nameAndState(minName) > fullWidth) {
     const room = fullWidth - stateWidth - 1;
     // A name narrower than one character plus the ellipsis says nothing.
-    if (row.name && room >= 1 + visibleWidth(glyphs.ellipsis)) {
+    if (row.name && room >= 1 + visibleWidth(ELLIPSIS)) {
       return { tree: "", badgeText: "", glyph: "", name: shortName(room), state };
     }
-    return { tree: "", badgeText: "", glyph: "", name: "", state: truncatePlain(state, fullWidth, glyphs.ellipsis) };
+    return { tree: "", badgeText: "", glyph: "", name: "", state: truncatePlain(state, fullWidth, ELLIPSIS) };
   }
 
   const kindGlyph = statusGlyph(glyphs, row.kind, now);
@@ -307,7 +316,7 @@ function fitIdentity(
       // Glyph badge without a label, plus one space before the label.
       const labelRoom = width - visibleWidth(badgeFor("")) - 2 - nameAndState(fullNameWidth);
       const minLabel = Math.min(visibleWidth(row.profile), MIN_BADGE_LABEL_WIDTH);
-      if (labelRoom >= minLabel) badgeText = badgeFor(truncatePlain(row.profile, labelRoom, glyphs.ellipsis));
+      if (labelRoom >= minLabel) badgeText = badgeFor(truncatePlain(row.profile, labelRoom, ELLIPSIS));
     }
     if (!badgeText && fits(badgeFor(""), fullNameWidth)) badgeText = badgeFor("");
     if (badgeText) glyph = "";
@@ -367,14 +376,25 @@ function renderCompactRow(
     const withoutIcon = layout(fitIdentity({ ...row, profileIcon: "" }, width, glyphs, now));
     if (withoutIcon.shown > fitted.shown) fitted = withoutIcon;
   }
-  const { identity: { tree, badgeText, glyph, name, state }, leftWidth, right } = fitted;
+  const { identity: { tree, badgeText, glyph, name }, right } = fitted;
+  let { identity: { state }, leftWidth } = fitted;
   const rightWidth = right ? GAP.length + visibleWidth(right) : 0;
 
   let activity = "";
   const separatorWidth = visibleWidth(glyphs.separator);
-  const activityRoom = width - leftWidth - rightWidth - separatorWidth;
-  if (row.activity && activityRoom >= MIN_ACTIVITY_WIDTH) {
-    activity = truncatePlain(row.activity, activityRoom, glyphs.ellipsis);
+  let activityRoom = width - leftWidth - rightWidth - separatorWidth;
+  const hasActivity = visibleWidth(row.activity) > 0;
+  if (hasActivity && activityRoom >= MIN_ACTIVITY_WIDTH) {
+    // The spinner already says "active"; the activity says what it is doing.
+    // The layout above reserved the label, so the activity shows exactly when
+    // the label would have fit beside it, and it takes the label's columns.
+    if (row.kind === "active" && state === lifecycleLabel("active") && name) {
+      const labelWidth = visibleWidth(state) + 1;
+      state = "";
+      leftWidth -= labelWidth;
+      activityRoom += labelWidth;
+    }
+    activity = truncatePlain(row.activity, activityRoom, ELLIPSIS);
   }
   const activityWidth = activity ? separatorWidth + visibleWidth(activity) : 0;
 
@@ -391,7 +411,7 @@ function renderCompactRow(
     right ? theme.fg("muted", right) : "",
   ].join("");
   // Guards widths too small for the profile badge and status together.
-  return visibleWidth(line) > width ? truncateToWidth(line, width) : line;
+  return visibleWidth(line) > width ? truncateToWidth(line, width, ELLIPSIS) : line;
 }
 
 /** A themed status glyph for the full widget mode. */
